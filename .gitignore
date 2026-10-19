@@ -1,0 +1,45 @@
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Video and Media files (large binary assets)
+*.mp4
+*.webm
+*.avi
+*.mov
+*.mkv
+data/videos/*
+!data/videos/.gitkeep
+
+# Evidence snapshots & crops generated at runtime
+data/evidence/*
+!data/evidence/.gitkeep
+data/autozone/*
+data/zone_refs/*
+violations_out/
+
+# Database files
+data/*.db
+data/*.db-shm
+data/*.db-wal
+*.sqlite3
+
+# Local test outputs & run logs
+test_tracks.csv
+tracks.csv
+out*.mp4
+speeds.csv

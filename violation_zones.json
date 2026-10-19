@@ -1,0 +1,167 @@
+{
+  "frame_size": [
+    2560,
+    1440
+  ],
+  "peak_hours": [
+    [
+      "07:00",
+      "10:30"
+    ],
+    [
+      "16:00",
+      "20:30"
+    ]
+  ],
+  "rules": {},
+  "zones": [
+    {
+      "type": "road",
+      "name": "East carriageway (toward camera)",
+      "points": [
+        [
+          1340.0,
+          200.0
+        ],
+        [
+          1552.8,
+          194.8
+        ],
+        [
+          3490.2,
+          1319.6
+        ],
+        [
+          1512.0,
+          1232.2
+        ]
+      ],
+      "width_m": 13.5,
+      "length_m": 95.0,
+      "road_category": "city",
+      "allowed_direction": "toward_camera",
+      "speed_limit_kph": null,
+      "banned_classes": [],
+      "stopping_allowed": false
+    },
+    {
+      "type": "road",
+      "name": "West carriageway (away from camera)",
+      "points": [
+        [
+          1067.2,
+          168.1
+        ],
+        [
+          1312.0,
+          196.0
+        ],
+        [
+          1244.4,
+          1196.6
+        ],
+        [
+          -325.4,
+          946.8
+        ]
+      ],
+      "width_m": 17.0,
+      "length_m": 95.0,
+      "road_category": "city",
+      "allowed_direction": "away_from_camera",
+      "speed_limit_kph": null,
+      "banned_classes": [],
+      "stopping_allowed": false
+    },
+    {
+      "type": "no_parking",
+      "name": "East kerb (crowd side)",
+      "points": [
+        [
+          1489.1,
+          196.4
+        ],
+        [
+          1552.8,
+          194.8
+        ],
+        [
+          3490.2,
+          1319.6
+        ],
+        [
+          2852.1,
+          1291.4
+        ]
+      ]
+    },
+    {
+      "type": "no_parking",
+      "name": "West kerb",
+      "points": [
+        [
+          1067.2,
+          168.1
+        ],
+        [
+          1124.3,
+          174.6
+        ],
+        [
+          23.8,
+          1002.4
+        ],
+        [
+          -325.4,
+          946.8
+        ]
+      ]
+    },
+    {
+      "type": "intersection",
+      "name": "Side-road junction (west)",
+      "points": [
+        [
+          883.2,
+          271.0
+        ],
+        [
+          1103.8,
+          297.4
+        ],
+        [
+          965.8,
+          468.4
+        ],
+        [
+          611.3,
+          423.0
+        ]
+      ]
+    },
+    {
+      "type": "bus_stop",
+      "name": "West bus stop after junction",
+      "points": [
+        [
+          1004.9,
+          203.0
+        ],
+        [
+          1066.8,
+          210.1
+        ],
+        [
+          993.7,
+          262.9
+        ],
+        [
+          914.4,
+          253.5
+        ]
+      ],
+      "approved": false
+    }
+  ],
+  "lane_lines": []
+}

@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Traffic Surveillance</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%233987e5'/%3E%3Cpath d='M6 9h9l3-2v10l-3-2H6z' fill='white'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><path d="M3 9h11l4-3v12l-4-3H3z"/><circle cx="8" cy="12" r="1.5" fill="#fff"/></svg></div>
+        <div><b>Traffic Surveillance</b><span>Dhaka traffic enforcement</span></div>
+      </div>
+      <nav class="nav" id="nav">
+        <a href="#/" data-route="dashboard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>Dashboard</a>
+        <a href="#/cameras" data-route="cameras"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 8h12l4-3v14l-4-3H3z"/></svg>Cameras</a>
+        <a href="#/review" data-route="review"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3 8-8"/><path d="M20 12v7a2 2 0 01-2 2H6a2 2 0 01-2-2V5a2 2 0 012-2h9"/></svg>Review<span class="count hidden" id="pending-count"></span></a>
+        <a href="#/stats" data-route="stats"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>Statistics</a>
+      </nav>
+      <div class="sidebar-foot">
+        <div><span class="sse-dot" id="sse-dot"></span><span id="sse-text">Connecting...</span></div>
+        <div id="lan-url"></div>
+        <button class="btn small ghost" id="theme-btn" type="button">Toggle light / dark</button>
+      </div>
+    </aside>
+    <div class="content">
+      <header class="topbar">
+        <span id="online" class="online"><span class="dot"></span>…</span>
+        <span class="spacer"></span>
+        <input id="plate-search" type="search" placeholder="Find a plate… (Enter)" aria-label="Search number plate">
+        <span id="clock" class="clock mono"></span>
+      </header>
+      <main id="main"></main>
+    </div>
+  </div>
+  <div class="toasts" id="toasts"></div>
+  <script src="/static/charts.js"></script>
+  <script src="/static/app.js"></script>
+  <script src="/static/editor.js"></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+# Tested on macOS 26 / Apple M5 / Python 3.13 (October 2026).
+ultralytics==8.4.177
+torch==2.14.1
+torchvision==0.29.1
+opencv-python==5.0.0.93
+numpy==2.3.5
+PyYAML==6.0.3
+lap==0.5.13                      # ByteTrack / BoT-SORT assignment
+onnxruntime==1.31.0              # number-plate detector (ONNX)
+onnx==1.23.2
+coremltools==9.0; sys_platform == "darwin"   # export to CoreML: runs on the Apple Neural Engine
+imageio-ffmpeg==0.6.0            # bundled ffmpeg: VideoToolbox hardware decoding + H.264 evidence clips
+fastapi==0.143.2
+uvicorn[standard]==0.54.0
+python-multipart==0.0.32         # video uploads
+pydantic==2.14.1
