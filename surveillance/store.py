@@ -66,11 +66,37 @@ CREATE TABLE IF NOT EXISTS violations (
     plate_conf REAL,
     plate_img TEXT,
     evidence TEXT DEFAULT '[]',     -- extra photos: [{"label", "time_s", "wall_time", "path"}]
+    vlm_status TEXT DEFAULT '',     -- '' (never asked) / pending / done / failed
+    vlm TEXT DEFAULT '',            -- surveillance.vlm.Explanation as JSON: the reasoning over this case
     status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed', 'rejected')),
     note TEXT DEFAULT '',
     reviewed_at TEXT,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tracklets (
+    id INTEGER PRIMARY KEY,
+    camera_id INTEGER NOT NULL REFERENCES cameras(id) ON DELETE CASCADE,
+    run_id INTEGER REFERENCES runs(id) ON DELETE CASCADE,
+    track_id INTEGER NOT NULL,      -- the tracker's own id: only unique within one run of one camera
+    cls TEXT,
+    class_conf REAL,
+    zone TEXT DEFAULT '',
+    t_cross REAL,                   -- wall clock (epoch seconds) at the zone's reference line
+    video_t REAL,                   -- the same moment as an offset into the video
+    lateral REAL,                   -- metres across the carriageway
+    speed REAL,                     -- m/s
+    width REAL,                     -- physical width in metres
+    direction TEXT DEFAULT 'unknown',
+    extrap_m REAL DEFAULT 0,
+    hist BLOB,                      -- HSV colour histogram  (float32)
+    lab BLOB,                       -- CIELAB mean/spread    (float32)
+    global_id INTEGER,              -- the vehicle this is an observation of, across all cameras
+    link_source TEXT DEFAULT '',    -- how it got that id: online / batch
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_track_cam ON tracklets(camera_id, t_cross);
+CREATE INDEX IF NOT EXISTS ix_track_global ON tracklets(global_id);
+CREATE INDEX IF NOT EXISTS ix_track_run ON tracklets(run_id);
 CREATE INDEX IF NOT EXISTS ix_viol_cam ON violations(camera_id, created_at);
 CREATE INDEX IF NOT EXISTS ix_viol_status ON violations(status);
 """
@@ -85,6 +111,7 @@ DEFAULT_SETTINGS = {
     "realtime": False,            # files: play at real speed, like a live camera
     "auto_roi": True,
     "anpr": True,                 # read number plates of violating vehicles (needs the plate models)
+    "reid": True,                 # summarise each vehicle's pass so it can be linked across cameras
     "helmet": True,               # V6 no-helmet detection (needs the helmet model)
     "clip_pre_sec": 5,
     "clip_post_sec": 5,
@@ -109,7 +136,8 @@ class Store:
             have = {r[1] for r in self.db.execute("PRAGMA table_info(violations)")}
             for col, decl in (("plate_status", "TEXT DEFAULT ''"), ("plate_text", "TEXT DEFAULT ''"),
                               ("plate_text_en", "TEXT DEFAULT ''"), ("plate_conf", "REAL"), ("plate_img", "TEXT"),
-                              ("evidence", "TEXT DEFAULT '[]'")):
+                              ("evidence", "TEXT DEFAULT '[]'"), ("vlm_status", "TEXT DEFAULT ''"),
+                              ("vlm", "TEXT DEFAULT ''")):
                 if col not in have:
                     self.db.execute(f"ALTER TABLE violations ADD COLUMN {col} {decl}")
             self.db.commit()
@@ -201,6 +229,69 @@ class Store:
              rec["areas"], rec["kph"], json.dumps(rec["details"]), snapshot, crop, clip, plate_status,
              json.dumps(list(evidence)), now()))
 
+    # ------------------------------------------------------------ tracklets (cross-camera Re-ID)
+    def add_tracklet(self, camera_id, run_id, t):
+        """Store one vehicle's pass through one camera. `t` is a surveillance.reid.Tracklet."""
+        return self.x(
+            "INSERT INTO tracklets (camera_id, run_id, track_id, cls, class_conf, zone, t_cross, video_t,"
+            " lateral, speed, width, direction, extrap_m, hist, lab, global_id, link_source, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (camera_id, run_id, t.track_id, t.cls, getattr(t, "class_conf", None), t.zone, t.t_cross,
+             getattr(t, "video_t", None), t.lateral, t.speed, t.width, t.direction, t.extrap_m,
+             None if t.hist is None else t.hist.astype("float32").tobytes(),
+             None if t.lab is None else t.lab.astype("float32").tobytes(),
+             t.global_id, getattr(t, "link_source", ""), now()))
+
+    def tracklets(self, camera_id=None, run_id=None, global_id=None, since=None, until=None, limit=100000):
+        where, args = [], []
+        for col, val in (("camera_id", camera_id), ("run_id", run_id), ("global_id", global_id)):
+            if val is not None:
+                where.append(f"{col}=?")
+                args.append(val)
+        if since is not None:
+            where.append("t_cross >= ?")
+            args.append(since)
+        if until is not None:
+            where.append("t_cross <= ?")
+            args.append(until)
+        sql = "SELECT * FROM tracklets" + (" WHERE " + " AND ".join(where) if where else "")
+        return self.q(sql + " ORDER BY t_cross LIMIT ?", (*args, limit))
+
+    def set_global_ids(self, assignments, source="batch"):
+        """assignments: [(tracklet id, global id)], written in one transaction."""
+        with self.lock:
+            self.db.executemany("UPDATE tracklets SET global_id=?, link_source=? WHERE id=?",
+                                [(g, source, i) for i, g in assignments])
+            self.db.commit()
+
+    def next_global_id(self):
+        return (self.q("SELECT COALESCE(MAX(global_id), 0) AS g FROM tracklets")[0]["g"] or 0) + 1
+
+    def vehicles(self, limit=50, min_cameras=2):
+        """Vehicles seen by at least `min_cameras` cameras, most recent first."""
+        return self.q(
+            "SELECT global_id, COUNT(*) AS passes, COUNT(DISTINCT camera_id) AS cameras,"
+            " MIN(t_cross) AS first_seen, MAX(t_cross) AS last_seen,"
+            " GROUP_CONCAT(DISTINCT cls) AS classes FROM tracklets WHERE global_id IS NOT NULL"
+            " GROUP BY global_id HAVING cameras >= ? ORDER BY last_seen DESC LIMIT ?", (min_cameras, limit))
+
+    def journey(self, global_id):
+        """Every camera this vehicle passed, in order."""
+        return self.q(
+            "SELECT t.*, c.name AS camera_name, c.location AS camera_location FROM tracklets t"
+            " JOIN cameras c ON c.id=t.camera_id WHERE t.global_id=? ORDER BY t.t_cross", (global_id,))
+
+    def clear_tracklets(self, camera_id=None):
+        if camera_id is None:
+            self.x("DELETE FROM tracklets")
+        else:
+            self.x("DELETE FROM tracklets WHERE camera_id=?", (camera_id,))
+
+    def set_vlm(self, vid, status, explanation=None):
+        """status: pending (queued) / done / failed. `explanation` is a surveillance.vlm.Explanation dict."""
+        self.x("UPDATE violations SET vlm_status=?, vlm=? WHERE id=?",
+               (status, json.dumps(explanation) if explanation else "", vid))
+
     def set_plate(self, vid, status, text="", text_en="", conf=None, img=None):
         self.x("UPDATE violations SET plate_status=?, plate_text=?, plate_text_en=?, plate_conf=?, plate_img=? "
                "WHERE id=?", (status, text, text_en, conf, img, vid))
@@ -240,6 +331,7 @@ class Store:
         for r in rows:
             r["details"] = json.loads(r["details"] or "{}")
             r["evidence"] = json.loads(r.get("evidence") or "[]")
+            r["vlm"] = json.loads(r["vlm"]) if r.get("vlm") else None
         return rows
 
     def count_violations(self, **filters):
@@ -256,6 +348,7 @@ class Store:
 
     def clear_violations(self, cid):
         self.x("DELETE FROM violations WHERE camera_id=?", (cid,))
+        self.x("DELETE FROM tracklets WHERE camera_id=?", (cid,))
         self.x("DELETE FROM runs WHERE camera_id=?", (cid,))
 
     def stats(self, camera_id=None, include_rejected=False, days=30, basis="event"):

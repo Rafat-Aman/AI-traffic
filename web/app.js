@@ -41,6 +41,7 @@
     auto: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l1.8 4.7L18.5 9.5l-4.7 1.8L12 16l-1.8-4.7L5.5 9.5l4.7-1.8z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></svg>',
     pin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21s-6-5.5-6-11a6 6 0 0112 0c0 5.5-6 11-6 11z"/><circle cx="12" cy="10" r="2"/></svg>',
     expand: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>',
+    brain: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 4a3 3 0 00-3 3 3 3 0 00-1 5.8V15a3 3 0 003 3 2 2 0 004 0V6a2 2 0 00-3-2z"/><path d="M15 4a3 3 0 013 3 3 3 0 011 5.8V15a3 3 0 01-3 3 2 2 0 01-4 0"/></svg>',
   };
   // Short names for the violation types (the full titles come from the server).
   const VSHORT = { V1: "Bus stopping", V2: "Speeding", V3: "Kerb parking", V4: "Wrong side", V5: "Solid line", V6: "No helmet", V7: "Lane blocking", V8: "Banned vehicle" };
@@ -211,6 +212,7 @@
       else if (name === "camera" && parts[2] === "zones") await window.Editor.render(main, +parts[1], App);
       else if (name === "camera") await pageCamera(main, +parts[1]);
       else if (name === "review") await pageReview(main, parts[1] ? +parts[1] : null);
+      else if (name === "vehicles") await pageVehicles(main, parts[1] ? +parts[1] : null);
       else if (name === "stats") await pageStats(main);
       else main.innerHTML = `<div class="empty">Page not found</div>`;
     } catch (e) {
@@ -854,6 +856,45 @@
       return `<div class="plate-box">${img}<div>${body}</div></div>`;
     }
 
+    // The vision-language model's reading of the case: what happened, why, and whether the photos back the
+    // rule up. "Insufficient evidence" is a real answer and is shown as such, never as agreement.
+    const VERDICT = {
+      supported: { label: "Evidence supports the finding", cls: "ok" },
+      insufficient: { label: "Not enough evidence to judge", cls: "warn" },
+      contradicted: { label: "Evidence contradicts the finding", cls: "bad" },
+    };
+
+    function vlmBlock(v) {
+      const st = v.vlm_status || "";
+      if (st === "pending") {
+        return `<div class="vlm-box pending"><div class="vlm-head">${ICON.brain}<b>Reading the evidence…</b></div>
+          <div class="small muted">The model is looking at the photographs. On the local CPU model this takes
+          roughly 20–60 seconds; the answer appears here by itself.</div></div>`;
+      }
+      const x = v.vlm;
+      if (!x) return "";
+      if (!x.ok) {
+        return `<div class="vlm-box bad"><div class="vlm-head">${ICON.brain}<b>Could not explain this case</b></div>
+          <div class="small muted">${esc(x.error || "unknown error")}</div></div>`;
+      }
+      const verdict = VERDICT[x.assessment] || VERDICT.insufficient;
+      const part = (label, text) => text ? `<div class="vlm-part"><span>${label}</span><p>${esc(text)}</p></div>` : "";
+      return `<div class="vlm-box ${verdict.cls}">
+        <div class="vlm-head">${ICON.brain}<b>${esc(verdict.label)}</b>
+          <span class="vlm-conf">confidence ${Math.round((x.confidence || 0) * 100)}%</span>
+          <span class="spacer"></span>
+          <button class="btn small" id="vlm-again" title="Ask again">${ICON.auto}Again</button></div>
+        ${x.downgraded ? `<div class="vlm-overruled">${esc(x.downgraded)}</div>` : ""}
+        <div class="vlm-summary">${esc(x.summary || "")}</div>
+        ${part("In the photos", x.visible)}
+        ${part("Before", x.pre_event)}${part("The event", x.event)}
+        ${part("After", x.aftermath)}${part("Probable cause", x.cause)}
+        <div class="small muted vlm-foot">${esc(x.model || "model")} · ${esc(x.backend || "")} ·
+          ${esc(String(x.seconds || 0))} s · ${esc(String(x.images || 0))} photo(s).
+          Written by a language model from the photographs and the measurements above. Check it against the
+          evidence before relying on it; it is not itself evidence.</div></div>`;
+    }
+
     function select(id) {
       sel = items.find((v) => v.id === id) || null;
       $$(".rv-item").forEach((el) => el.classList.toggle("sel", +el.dataset.vid === id));
@@ -895,6 +936,8 @@
       d.innerHTML = `<div class="card stack">
         <div class="row">${vcode(v.code)}<h2>${esc(v.title)}</h2>${statusBadge(v.status)}<span class="spacer"></span>
           <span class="small muted">Case TV-${v.id}</span>
+          ${!v.vlm && v.vlm_status !== "pending"
+            ? `<button class="btn small" id="explain">${ICON.brain}Explain</button>` : ""}
           <a class="btn small" href="/notice/${v.id}" target="_blank" rel="noopener">${ICON.print}Notice</a></div>
         <div class="small secondary">${esc(summary(v))}</div>
         <div class="evidence">
@@ -905,6 +948,7 @@
           <div class="small muted" id="clip-note"></div>
         </div>
         ${timeline(v)}
+        <div id="vlm-block">${vlmBlock(v)}</div>
         <div id="plate-block">${plateBlock(v)}</div>
         <div class="grid2"><table class="kv">
             <tr><th>Vehicle</th><td>${esc(v.cls)} #${v.track_id} <span class="muted">(class ${Math.round(v.class_conf * 100)}% consistent)</span></td></tr>
@@ -933,6 +977,33 @@
       $("#ok").onclick = () => decide("confirmed");
       $("#no").onclick = () => decide("rejected");
       if ($("#undo")) $("#undo").onclick = () => decide("pending");
+      if ($("#explain")) $("#explain").onclick = () => explain(false);
+      if ($("#vlm-again")) $("#vlm-again").onclick = () => explain(true);
+    }
+
+    async function explain(force) {
+      if (!sel) return;
+      const id = sel.id;
+      try {
+        const r = await api(`/api/violations/${id}/explain`, { method: "POST", body: { force } });
+        patch(r.violation);
+      } catch (e) { fail(e); }
+    }
+
+    // Merge a server copy of a case into the list and the open detail pane, without losing the reviewer's
+    // unsaved note or overwriting a review decision made while the model was thinking.
+    function patch(v) {
+      const i = items.findIndex((x) => x.id === v.id);
+      if (i < 0) return;
+      items[i] = { ...items[i], ...v, status: items[i].status, note: items[i].note };
+      if (sel && sel.id === v.id) {
+        sel = items[i];
+        const box = $("#vlm-block");
+        if (box) box.innerHTML = vlmBlock(sel);
+        const btn = $("#explain");
+        if (btn && (sel.vlm || sel.vlm_status === "pending")) btn.remove();
+        if ($("#vlm-again")) $("#vlm-again").onclick = () => explain(true);
+      }
     }
 
     async function decide(status) {
@@ -981,6 +1052,7 @@
         if (chip) chip.innerHTML = plateChip(v);
         if (sel && sel.id === v.id) { sel = items[i]; $("#plate-block").innerHTML = plateBlock(sel); }
       }
+      if (msg.type === "explanation") patch(msg.violation);
     });
     listeners.add((msg) => {
       if (msg.type === "violation" && (!f.status || f.status === "pending") && (!f.camera_id || +f.camera_id === msg.camera_id)) {
@@ -995,6 +1067,78 @@
   }
 
   // ------------------------------------------------------------------ statistics
+  // ---------------------------------------------------------------- vehicles across cameras
+  async function pageVehicles(root, selected) {
+    const fmtTime = (t) => t ? new Date(t * 1000).toLocaleString() : "-";
+    root.innerHTML = `<div class="row page-head"><h1>Vehicles across cameras</h1><span class="spacer"></span>
+        <span class="small muted" id="v-routes"></span>
+        <button class="btn primary" id="v-link">${ICON.auto}Match vehicles across cameras</button></div>
+      <div class="card" id="v-status" hidden></div>
+      <div class="card"><div class="small secondary">A vehicle is recognised on a second camera from where
+        and when it crossed, how fast it was going, how wide it is, its class, and the colour of its body -
+        or of the rider's clothing on a two-wheeler. Matching happens in metres on the road, so it is the
+        same test at every camera. Where two vehicles cannot be told apart, nothing is linked.</div></div>
+      <div id="v-body"></div>`;
+
+    async function refreshStatus() {
+      const st = await api("/api/link");
+      $("#v-routes").textContent = st.routes_known ? `${st.routes_known} route(s) learned` : "";
+      const box = $("#v-status");
+      if (st.state === "running") {
+        box.hidden = false;
+        box.innerHTML = `<div class="row"><b>Matching…</b><span class="muted small">${esc(st.message || "")}</span></div>
+          <pre class="small muted vlog">${esc((st.log || []).slice(-8).join("\n"))}</pre>`;
+        setTimeout(refreshStatus, 1200);
+      } else if (st.result) {
+        const r = st.result;
+        box.hidden = false;
+        box.innerHTML = `<div class="small"><b>${esc(st.message || "")}</b></div>
+          <div class="small muted">${r.tracklets} vehicle passes · ${r.linked} links · ${r.multi_camera || 0} seen by more than one camera${st.seconds ? ` · ${st.seconds}s` : ""}</div>
+          ${(r.flows || []).map((f) => `<div class="small muted">route ${esc(f.name)}: camera ${f.from_camera} (${esc(f.from_direction)}) → camera ${f.to_camera} (${esc(f.to_direction)}), ${f.gap_m} m apart${f.refused && f.refused.length ? ` · ${esc(f.refused.join(", "))} too alike to link` : ""}</div>`).join("")}`;
+      } else { box.hidden = true; }
+    }
+
+    async function load() {
+      const r = await api("/api/vehicles?min_cameras=2&limit=100");
+      const body = $("#v-body");
+      if (!r.items.length) {
+        body.innerHTML = `<div class="card empty">No vehicle has been matched across cameras yet.<br>
+          <span class="small muted">${r.tracklets} vehicle pass(es) recorded. Analyse at least two cameras,
+          then press <b>Match vehicles across cameras</b>.</span></div>`;
+        return;
+      }
+      body.innerHTML = `<div class="card"><table class="kv wide"><tr><th>Vehicle</th><th>Class</th>
+        <th>Cameras</th><th>Passes</th><th>First seen</th><th>Last seen</th></tr>
+        ${r.items.map((v) => `<tr class="vrow" data-gid="${v.global_id}"><td><b>V-${v.global_id}</b></td>
+          <td>${esc((v.classes || "").split(",")[0])}</td><td>${v.cameras}</td><td>${v.passes}</td>
+          <td class="small">${esc(fmtTime(v.first_seen))}</td><td class="small">${esc(fmtTime(v.last_seen))}</td></tr>`).join("")}
+        </table></div><div id="v-journey"></div>`;
+      $$(".vrow").forEach((el) => el.onclick = () => go(`#/vehicles/${el.dataset.gid}`));
+      if (selected) showJourney(selected);
+    }
+
+    async function showJourney(gid) {
+      const j = await api(`/api/vehicles/${gid}`);
+      $("#v-journey").innerHTML = `<div class="card"><div class="card-head"><h2>Vehicle V-${gid}</h2>
+        <span class="spacer"></span><span class="small muted">${j.passes.length} camera(s), in order</span></div>
+        <div class="timeline">${j.passes.map((p, i) => `<div><span class="tl-dot${i ? "" : " hot"}"></span>
+          <b>${esc(p.camera_name)}</b>
+          <span class="muted small">${esc(p.camera_location || "")} · ${esc(fmtTime(p.t_cross))} ·
+          ${Math.round((p.speed || 0) * 3.6)} km/h · ${esc(p.cls || "")}${p.seconds_from_previous !== undefined
+            ? ` · ${p.seconds_from_previous}s after the previous camera` : ""}
+          ${p.link_source ? ` · linked ${esc(p.link_source)}` : ""}</span></div>`).join("")}</div></div>`;
+      $("#v-journey").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+
+    $("#v-link").onclick = async () => {
+      try { await api("/api/link", { method: "POST", body: {} }); refreshStatus();
+            setTimeout(load, 2500); } catch (e) { fail(e); }
+    };
+    listeners.add((msg) => { if (msg.type === "link") { refreshStatus(); load(); } });
+    await refreshStatus();
+    await load();
+  }
+
   async function pageStats(main) {
     const cams = await api("/api/cameras");
     const f = { camera_id: "", days: 30, include_rejected: false };

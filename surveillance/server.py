@@ -5,6 +5,7 @@ import csv
 from html import escape
 import io
 import json
+import os
 import shutil
 import socket
 from contextlib import asynccontextmanager
@@ -24,6 +25,8 @@ from violations.engine import RULES, ViolationEngine
 from violations.zones import (AREA_TYPES, DEFAULT_SPEED_LIMITS, DIRECTIONS, ROAD_CATEGORIES, RoadZone,
                               camera_config_from_dict)
 
+from . import vlm as vlm_mod
+from .link import LinkJob, OnlineLinker, run_linking
 from .anpr import find_models
 from .camera_motion import save_reference
 from .detector import MODELS_DIR, find_helmet_model
@@ -54,7 +57,28 @@ def notify(msg):
         loop.call_soon_threadsafe(q.put_nowait, data)
 
 
-manager = WorkerManager(store, DATA, notify)
+linker = OnlineLinker(store)
+manager = WorkerManager(store, DATA, notify, linker)
+link_jobs = {}        # "current" -> the running / last LinkJob
+
+
+def vlm_settings(backend=None):
+    """VLM options: defaults, overridden by the environment, then by one request."""
+    s = dict(vlm_mod.DEFAULTS)
+    s["vlm_backend"] = backend or os.environ.get("VLM_BACKEND") or s["vlm_backend"]
+    if os.environ.get("VLM_URL"):
+        s["vlm_local_url"] = os.environ["VLM_URL"]
+    return s
+
+
+def vlm_done(vid, explanation):
+    """Called from the reasoning thread when a case has been explained."""
+    store.set_vlm(vid, "done" if explanation.ok else "failed", explanation.as_dict())
+    v = store.violation(vid)
+    notify({"type": "explanation", "camera_id": v["camera_id"] if v else None, "violation": v})
+
+
+explainer = vlm_mod.Explainer(DATA, vlm_settings(), vlm_done)
 
 
 @asynccontextmanager
@@ -120,7 +144,9 @@ def meta(request: Request):
         "speed_limits": DEFAULT_SPEED_LIMITS, "default_settings": DEFAULT_SETTINGS,
         "rules": {key: {"code": cls.code, "title": cls.title, "defaults": cls.DEFAULTS} for key, cls in RULES.items()},
         "lan_url": lan_url(request.url.port or 80),
-        "features": {"anpr": all(find_models(MODELS_DIR)), "helmet": find_helmet_model() is not None},
+        "features": {"anpr": all(find_models(MODELS_DIR)), "helmet": find_helmet_model() is not None,
+                     "vlm": vlm_mod.backend_status(vlm_settings())["enabled"],
+                     "reid": True},
     }
 
 
@@ -544,17 +570,111 @@ def review_violation(vid: int, body: ReviewIn):
     return store.violation(vid)
 
 
+class ExplainIn(BaseModel):
+    backend: Optional[str] = None   # auto (default) / local / cloud; one case only
+    force: bool = False             # explain again even though an explanation is stored
+
+
+@app.post("/api/violations/{vid}/explain")
+def explain_violation(vid: int, body: ExplainIn = ExplainIn()):
+    """Ask the vision-language model to explain this case. Returns at once: the answer takes seconds to a
+    minute on the local backend and arrives over /api/events as an "explanation" message."""
+    v = store.violation(vid)
+    if not v:
+        raise HTTPException(404, "Violation not found")
+    settings = vlm_settings(body.backend)
+    if vlm_mod.resolve_backend(settings) is None:
+        raise HTTPException(503, "No reasoning model available. Start it with ./tools/vlm_server.sh, "
+                                 "or set ANTHROPIC_API_KEY for the cloud backend.")
+    if v.get("vlm_status") == "pending":
+        return {"queued": False, "already": "pending", "violation": v}
+    if v.get("vlm") and not body.force:
+        return {"queued": False, "already": "done", "violation": v}
+    # Mark it pending before queueing, never after: a fast backend can finish and write its answer while
+    # this request is still running, and a "pending" written afterwards would erase it.
+    store.set_vlm(vid, "pending")
+    if not explainer.request(v, settings):
+        store.set_vlm(vid, "")
+        raise HTTPException(429, "The reasoning queue is full; try again shortly")
+    return {"queued": True, "violation": store.violation(vid)}
+
+
+@app.get("/api/vlm")
+def vlm_status():
+    """Which reasoning backend could answer right now (shown in the dashboard)."""
+    return {**vlm_mod.backend_status(vlm_settings()), "busy": explainer.busy()}
+
+
+class LinkIn(BaseModel):
+    since: Optional[float] = None    # epoch seconds; default: everything stored
+    until: Optional[float] = None
+
+
+@app.post("/api/link")
+def start_linking(body: LinkIn = LinkIn()):
+    """Match vehicles across every camera and assign global vehicle ids."""
+    job = link_jobs.get("current")
+    if job and job.is_alive():
+        return {"started": False, "status": job.status}
+
+    def done(msg):
+        notify(msg)
+        linker.learn_from()          # the online path picks up the routes this run just learned
+
+    job = LinkJob(store, body.since, body.until, notify=done)
+    link_jobs["current"] = job
+    job.start()
+    return {"started": True, "status": job.status}
+
+
+@app.get("/api/link")
+def linking_status():
+    job = link_jobs.get("current")
+    if not job:
+        return {"state": "idle", "routes_known": len(linker.params)}
+    st = dict(job.status)
+    st["routes_known"] = len(linker.params)
+    if job.result:
+        st["result"] = job.result
+    return st
+
+
+@app.get("/api/vehicles")
+def list_vehicles(min_cameras: int = 2, limit: int = 100):
+    """Vehicles recognised on more than one camera."""
+    return {"items": store.vehicles(limit=min(limit, 500), min_cameras=min_cameras),
+            "tracklets": store.q("SELECT COUNT(*) AS n FROM tracklets")[0]["n"]}
+
+
+@app.get("/api/vehicles/{gid}")
+def vehicle_journey(gid: int):
+    """Every camera one vehicle passed, in order, with how long it took between them."""
+    rows = store.journey(gid)
+    if not rows:
+        raise HTTPException(404, "No such vehicle")
+    for a, b in zip(rows, rows[1:]):
+        gap = (b["t_cross"] or 0) - (a["t_cross"] or 0)
+        b["seconds_from_previous"] = round(gap, 1)
+        b["kmh_between"] = round(3.6 * (a["speed"] or 0), 1) if gap > 0 else None
+    return {"global_id": gid, "passes": rows}
+
+
 @app.get("/api/export.csv")
 def export_csv(camera_id: Optional[int] = None, status: Optional[str] = None):
     rows = store.violations(camera_id, status=status, limit=1_000_000, order="ASC")
     buf = io.StringIO()
     cols = ["id", "camera_name", "camera_location", "code", "title", "cls", "class_conf", "wall_time",
             "video_time_s", "zone", "kph", "plate_status", "plate_text", "plate_text_en", "plate_conf", "details",
+            "vlm_assessment", "vlm_confidence", "vlm_summary", "vlm_cause", "vlm_model",
             "status", "note", "snapshot", "crop", "clip", "plate_img", "evidence", "created_at"]
     w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
     w.writeheader()
     for r in rows:
+        x = r.get("vlm") or {}
         w.writerow({**r, "details": json.dumps(r["details"]),
+                    "vlm_assessment": x.get("assessment", ""), "vlm_confidence": x.get("confidence", ""),
+                    "vlm_summary": x.get("summary", ""), "vlm_cause": x.get("cause", ""),
+                    "vlm_model": x.get("model", ""),
                     "evidence": " | ".join(f"{e['label']}: {e['path']}" for e in r.get("evidence") or [])})
     return Response("\ufeff" + buf.getvalue(), media_type="text/csv; charset=utf-8",  # BOM: Excel shows Bangla
                     headers={"Content-Disposition": "attachment; filename=violations.csv"})

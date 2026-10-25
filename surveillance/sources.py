@@ -13,6 +13,8 @@ Phone cameras:
     Any RTSP app / CCTV:       rtsp://user:pass@IP:554/...
 """
 
+import collections
+import platform
 import re
 import subprocess
 import threading
@@ -28,6 +30,11 @@ try:
     FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 except Exception:  # pragma: no cover - ffmpeg is optional; OpenCV decoding is the fallback
     FFMPEG = None
+
+# Hardware decoding is per-platform and asking for the wrong one is fatal, not a fallback: ffmpeg exits with
+# "No device available for decoder" and produces no frames at all. VideoToolbox exists only on macOS, so on
+# anything else decode in software - these are 1-2 Mpx frames at 15-30 fps, which any modern CPU manages.
+HWACCEL = ["-hwaccel", "videotoolbox"] if platform.system() == "Darwin" else []
 
 
 def is_live_source(source):
@@ -127,22 +134,51 @@ class FileSource:
         self.proc = None
         self.cap = None
         self.t_wall0 = None
+        self.errors = collections.deque(maxlen=20)
 
     def open(self):
         if FFMPEG:
-            cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-hwaccel", "videotoolbox"]
+            cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", *HWACCEL]
             if self.start_sec:
                 cmd += ["-ss", str(self.start_sec)]
             cmd += ["-i", self.path, "-an", "-vf", f"fps={self.fps},scale={self.width}:{self.height}",
                     "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
-            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            # Keep ffmpeg's errors instead of discarding them: a codec or hardware problem here used to end
+            # up as a silent stream of zero frames, which surfaces much later as a meaningless complaint
+            # about there being no traffic in the video. They are drained on a thread because a damaged file
+            # can produce an error per frame, and a full stderr pipe would otherwise block the decoder.
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                          bufsize=self.width * self.height * 3 * 4)
+            self.errors = collections.deque(maxlen=20)
+            threading.Thread(target=self._drain, args=(self.proc.stderr, self.errors),
+                             daemon=True).start()
         else:
-            self.cap = cv2.VideoCapture(self.path)
-            self.cap.set(cv2.CAP_PROP_POS_MSEC, self.start_sec * 1000)
-            self.stride = max(1, round(self.native_fps / self.fps))
-            self.fps = self.native_fps / self.stride
+            self._open_opencv()
         return self
+
+    def _open_opencv(self):
+        self.proc = None
+        self.cap = cv2.VideoCapture(self.path)
+        self.cap.set(cv2.CAP_PROP_POS_MSEC, self.start_sec * 1000)
+        self.stride = max(1, round(self.native_fps / self.fps))
+        self.fps = self.native_fps / self.stride
+
+    @staticmethod
+    def _drain(stderr, into):
+        """Keeps ffmpeg's last few complaints and keeps its stderr pipe empty."""
+        for line in iter(stderr.readline, b""):
+            text = line.decode(errors="replace").strip()
+            if text:
+                into.append(text)
+
+    def _ffmpeg_failed(self):
+        """ffmpeg stopped before producing a single frame: its complaint, or None if it simply ended."""
+        if self.index:
+            return None
+        self.proc.wait(timeout=5)
+        if self.proc.returncode == 0:
+            return None
+        return (self.errors[-1] if self.errors else f"ffmpeg exited with code {self.proc.returncode}")
 
     def read(self):
         """(frame, t_seconds) or None at the end."""
@@ -150,7 +186,16 @@ class FileSource:
             size = self.width * self.height * 3
             buf = self.proc.stdout.read(size)
             if len(buf) < size:
-                return None
+                # Nothing at all decoded: this video defeated ffmpeg rather than being finished. Fall back
+                # to OpenCV, which reads some files ffmpeg refuses, and only give up if that fails too.
+                failure = self._ffmpeg_failed()
+                if failure is None:
+                    return None
+                self.close()
+                self._open_opencv()
+                if not (self.cap and self.cap.isOpened()):
+                    raise IOError(f"Could not decode {Path(self.path).name}: {failure}")
+                return self.read()
             frame = np.frombuffer(buf, np.uint8).reshape(self.height, self.width, 3)
         else:
             for _ in range(self.stride - 1):
@@ -183,6 +228,9 @@ class FileSource:
         if self.proc:
             self.proc.kill()
             self.proc.wait()
+            for pipe in (self.proc.stdout, self.proc.stderr):
+                if pipe:
+                    pipe.close()
             self.proc = None
         if self.cap:
             self.cap.release()

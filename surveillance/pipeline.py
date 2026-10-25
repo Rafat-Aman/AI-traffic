@@ -93,12 +93,14 @@ class FrameResult:
 class Pipeline:
     def __init__(self, detector, camera, frame_size, start_time=None, is_live=False, helmet=None,
                  overrides=None, only=None, min_frames=3, auto_roi=True, display_width=1280, min_speed_fps=6.0,
-                 plates=None, reference=None, stabilize=True):
+                 plates=None, reference=None, stabilize=True, tracklets=None):
         """plates: optional surveillance.anpr.PlateCollector - keeps each motor vehicle's best full-resolution
         crops so the plates of violating vehicles can be read.
+        tracklets: optional surveillance.reid.TrackletCollector - summarises each vehicle's pass in road-plane
+        metres so it can be recognised on another camera.
         reference: the clean frame the zones were drawn on (BGR); without it the first frame is taken as the view
         the zones belong to. stabilize: follow camera movement (surveillance/camera_motion.py)."""
-        self.det, self.camera, self.plates = detector, camera, plates
+        self.det, self.camera, self.plates, self.tracklets = detector, camera, plates, tracklets
         self.W, self.H = frame_size
         self.roi_ref = zones_roi(camera, self.W, self.H) if auto_roi else (0, 0, self.W, self.H)
         self.roi = self.roi_ref   # detection area in the current view (follows the camera when it moves)
@@ -164,7 +166,7 @@ class Pipeline:
         moved = self.motion is not None and not self.motion.identity
 
         t1 = time.perf_counter()
-        observations, shown = [], []
+        observations, shown, tracklet_rows = [], [], []
         hidden_foot = bottom_occluded([b for b, _, _ in tracks])
         for k, ((bx1, by1, bx2, by2), tid, cname) in enumerate(tracks):
             bx1, bx2, by1, by2 = bx1 + x0, bx2 + x0, by1 + y0, by2 + y0
@@ -208,6 +210,11 @@ class Pipeline:
             shown.append((tid, major, n, box, kph))
             if self.plates is not None and road is not None and major in MOTORISED and by2 < y1 - 2:
                 self.plates.observe(tid, frame, box, t)
+            if self.tracklets is not None and road is not None:
+                # the reference line each vehicle's crossing is timed at: the middle of the stretch of this
+                # zone where positions are reliable, so every vehicle is measured at the same place
+                y_ref = 0.5 * (self.reliable_y[id(road)] + road.length_m)
+                tracklet_rows.append((tid, box, major, road, xy, kph, heading, y_ref))
             if n >= self.min_frames:
                 observations.append(Observation(
                     tid=tid, frame_idx=self.frames, time_s=t, cls=major, purity=n_major / n, n_frames=n,
@@ -215,6 +222,13 @@ class Pipeline:
                     areas=frozenset() if view_lost else self.camera.areas_at(point), heading=heading,
                     xy_coarse=coarse))
         self._boxes = [b for _, _, _, b, _ in shown]
+        if self.tracklets is not None:
+            # after the loop, so every box of this frame is known: a crop is only worth keeping for colour
+            # when no other vehicle overlaps it
+            wall_t = wall.timestamp() if wall else None
+            for tid, box, major, road, xy, kph, heading, y_ref in tracklet_rows:
+                self.tracklets.observe(tid, frame, box, major, road, xy, kph, heading, t, wall_t, y_ref,
+                                       self._boxes)
         events = self.engine.process(observations, frame, self.frames, t, wall)
         for ev in events:
             if ev.frame is None:  # evidence is this frame: add where the vehicle came from
@@ -225,6 +239,8 @@ class Pipeline:
                 ev.details["camera_view"] = self.motion.describe()
         if self.plates is not None:
             self.plates.tick(t, {tid for tid, *_ in shown})
+        if self.tracklets is not None:
+            self.tracklets.tick(t, {tid for tid, *_ in shown})
         for tid in [k for k, s in self.last_seen.items() if t - s > FORGET_SEC]:
             del self.last_seen[tid]
             self.votes.pop(tid, None)

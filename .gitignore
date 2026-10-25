@@ -43,3 +43,10 @@ test_tracks.csv
 tracks.csv
 out*.mp4
 speeds.csv
+
+# Vision-language reasoner: multi-GB weights and the llama.cpp binaries (./tools/setup_vlm.sh fetches them)
+models/vlm/*.gguf
+vendor/
+
+side1_1.mp4
+side2_1.mp4

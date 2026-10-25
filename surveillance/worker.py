@@ -18,15 +18,17 @@ from .camera_motion import load_reference
 from .clips import ClipRecorder
 from .detector import MODELS_DIR, Detector, HelmetDetector, find_helmet_model
 from .pipeline import Pipeline
+from .reid import TrackletCollector
 from .sources import FileSource, LiveSource
 
 JPEG_QUALITY = 80
 
 
 class CameraWorker(threading.Thread):
-    def __init__(self, store, camera, data_dir, notify=None, start_sec=0.0):
+    def __init__(self, store, camera, data_dir, notify=None, start_sec=0.0, linker=None):
         super().__init__(daemon=True, name=f"camera-{camera['id']}")
         self.store, self.cam, self.data_dir = store, camera, Path(data_dir)
+        self.linker = linker
         self.notify = notify or (lambda msg: None)
         self.start_sec = start_sec
         self.stop_event = threading.Event()
@@ -36,6 +38,8 @@ class CameraWorker(threading.Thread):
                        "inactive": {}, "speed_paused": False, "backend": "", "video_time": 0.0}
         self.pipeline = None
         self.plates = None
+        self.tracklets = None
+        self.run_id = None
         self.out_dir = None
 
     def stop(self):
@@ -72,13 +76,16 @@ class CameraWorker(threading.Thread):
             start_time = None
             if cam["kind"] == "file" and cam.get("start_time"):
                 start_time = datetime.fromisoformat(cam["start_time"])
+            if s.get("reid", True):
+                self.tracklets = TrackletCollector(cam["id"], self._tracklet_done)
             self.pipeline = Pipeline(detector, camera_cfg, frame_size, start_time, source.is_live, helmet,
                                      auto_roi=s["auto_roi"], plates=self.plates,
                                      reference=load_reference(self.data_dir, cam["id"], zones["version"]),
-                                     stabilize=s.get("stabilize", True))
+                                     stabilize=s.get("stabilize", True), tracklets=self.tracklets)
             clips = ClipRecorder(s["clip_pre_sec"], s["clip_post_sec"])
             run_id = self.store.start_run(cam["id"], zones["id"], "live" if source.is_live else
                                           ("realtime" if s["realtime"] else "full"))
+            self.run_id = run_id
             out_dir = self.out_dir = self.data_dir / "evidence" / f"cam{cam['id']}" / f"run{run_id}"
             self._set(state="running", message="", backend=f"{detector.backend.upper()} {detector.imgsz}px",
                       features={"anpr": self.plates is not None, "helmet": helmet is not None},
@@ -132,6 +139,8 @@ class CameraWorker(threading.Thread):
             self._set(state="error", error=str(e), message=str(e))
             status = "error"
         finally:
+            if self.tracklets:
+                self.tracklets.finish_all()
             if self.plates:
                 self._set(message="Reading the last number plates...")
                 self.plates.flush()
@@ -180,6 +189,26 @@ class CameraWorker(threading.Thread):
         self.status["violations"] += 1
         self.notify({"type": "violation", "camera_id": self.cam["id"], "violation": self.store.violation(vid)})
 
+    def _tracklet_done(self, tl):
+        """A vehicle has left this camera: store its pass, and link it straight away if another camera
+        already saw it and the routes are known. The batch run revisits every link later."""
+        try:
+            tl.id = self.store.add_tracklet(self.cam["id"], self.run_id, tl)
+            self.status["tracklets"] = self.status.get("tracklets", 0) + 1
+        except Exception as e:          # storing a tracklet must never stop the analysis
+            print(f"tracklet not stored: {e}")
+            return
+        if self.linker is None:
+            return
+        try:
+            gid = self.linker.link(tl)
+            if gid:
+                self.status["linked"] = self.status.get("linked", 0) + 1
+                self.notify({"type": "vehicle_linked", "camera_id": self.cam["id"], "global_id": gid,
+                             "tracklet_id": tl.id, "cls": tl.cls})
+        except Exception as e:
+            print(f"online link failed: {e}")
+
     def _plate_result(self, vid, result):
         """Called from the plate-reading thread."""
         img = None
@@ -197,8 +226,9 @@ class CameraWorker(threading.Thread):
 
 
 class WorkerManager:
-    def __init__(self, store, data_dir, notify=None):
+    def __init__(self, store, data_dir, notify=None, linker=None):
         self.store, self.data_dir, self.notify = store, data_dir, notify
+        self.linker = linker
         self.workers = {}
         self.autozone = {}   # cid -> AutoZoneJob (learning the zones automatically)
 
@@ -248,7 +278,7 @@ class WorkerManager:
         cam = self.store.camera(cid)
         if cam is None:
             raise KeyError(cid)
-        w = CameraWorker(self.store, cam, self.data_dir, self.notify, start_sec)
+        w = CameraWorker(self.store, cam, self.data_dir, self.notify, start_sec, self.linker)
         self.workers[cid] = w
         w.start()
         return w

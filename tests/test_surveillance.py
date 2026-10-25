@@ -1,6 +1,7 @@
 """Tests for the time-based speed estimator, recording-time detection and the measurement-reliability gate."""
 
 import sys
+import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -145,3 +146,82 @@ class AutoZoneStartTests(unittest.TestCase):
             W.CameraWorker = orig
         self.assertIsNone(j.error)
         self.assertEqual(started, [7])
+
+
+class FileSourceDecodeTests(unittest.TestCase):
+    """Decoding a recorded video must not depend on the machine it was developed on.
+
+    Regression: FileSource always asked ffmpeg for `-hwaccel videotoolbox`, which exists only on macOS. On
+    Linux ffmpeg exited immediately with "No device available for decoder", stderr went to DEVNULL, and
+    read() returned None forever - so a perfectly good video looked like a video containing no traffic, and
+    automatic zone setup failed with "Only 0 moving vehicles seen".
+    """
+
+    def setUp(self):
+        import cv2
+        import numpy as np
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = str(Path(self.dir.name) / "clip.mp4")
+        w = cv2.VideoWriter(self.path, cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (160, 120))
+        self.assertTrue(w.isOpened(), "no mp4 writer available in this OpenCV build")
+        for i in range(30):
+            f = np.zeros((120, 160, 3), np.uint8)
+            f[:, :] = (i * 8 % 255, 40, 90)
+            w.write(f)
+        w.release()
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def frames_from(self, src, limit=40):
+        got = []
+        while len(got) < limit:
+            r = src.read()
+            if r is None:
+                break
+            got.append(r)
+        return got
+
+    def test_hwaccel_is_only_requested_on_macos(self):
+        from surveillance.sources import HWACCEL
+        import platform
+        if platform.system() == "Darwin":
+            self.assertIn("videotoolbox", HWACCEL)
+        else:
+            self.assertEqual(HWACCEL, [], "asking for VideoToolbox off macOS makes ffmpeg produce no frames")
+
+    def test_a_recorded_video_actually_yields_frames(self):
+        from surveillance.sources import FileSource
+        src = FileSource(self.path, 10, 0, False).open()
+        try:
+            got = self.frames_from(src)
+        finally:
+            src.close()
+        self.assertGreater(len(got), 5, "no frames decoded from a readable video")
+        self.assertEqual(got[0][0].shape[:2], (120, 160))
+        self.assertLess(got[0][1], got[-1][1])        # timestamps advance
+
+    def test_it_falls_back_to_opencv_when_ffmpeg_cannot_decode(self):
+        """An ffmpeg that refuses the file must not end the run: OpenCV reads it instead."""
+        from surveillance import sources
+        orig = sources.HWACCEL
+        sources.HWACCEL = ["-hwaccel", "no_such_accelerator"]   # makes ffmpeg exit at once
+        try:
+            src = sources.FileSource(self.path, 10, 0, False).open()
+            try:
+                got = self.frames_from(src)
+                self.assertGreater(len(got), 5, "fallback did not produce frames")
+                self.assertIsNone(src.proc, "should have switched to the OpenCV reader")
+            finally:
+                src.close()
+        finally:
+            sources.HWACCEL = orig
+
+    def test_an_undecodable_file_raises_instead_of_looking_empty(self):
+        from surveillance.sources import FileSource
+        import cv2
+        import numpy as np
+        broken = Path(self.dir.name) / "broken.mp4"
+        broken.write_bytes(b"\x00\x01\x02not a video at all" * 64)
+        with self.assertRaises(IOError):
+            FileSource(str(broken), 10, 0, False).open().read()

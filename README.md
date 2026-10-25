@@ -158,6 +158,187 @@ suggestion to check on the image: the training plates only cover Dhaka, Khulna a
 35-100 px wide and blurred, so every plate is (correctly) reported unreadable. To read plates, use a camera that
 sees 1-2 lanes so plates are at least 120 px wide.
 
+## The same vehicle on another camera
+
+Each camera's tracker numbers vehicles independently, so track 7 here has nothing to do with track 7 two
+junctions away. **Vehicles** in the dashboard links them into one identity, so a journey across the city is
+a query rather than a pile of separate per-camera logs.
+
+Every vehicle that passes a camera is summarised as a *tracklet*: when and where it crossed the zone's
+reference line, in metres across the carriageway and seconds on the wall clock, with its speed, physical
+width, class, and a colour signature taken from its clearest frames. Matching then happens **in metres on
+the road plane**, which is the whole trick - it is the same physics at every camera, so nothing has to be
+hand-configured per site:
+
+| Evidence | Where it comes from |
+|---|---|
+| Class must be **identical** | majority vote over the track; never Car↔Pickup or Motorbike↔Bicycle |
+| Transit time = gap ÷ speed | the gap between two cameras is **learned from the traffic**, not measured |
+| Lateral position maps linearly | learned per route, mirrored when cameras face opposite ways |
+| Speed and physical width agree | the homography this project already uses for speed |
+| Colour | HSV histogram + CIELAB of the body — or of the **rider's clothing** on a two-wheeler |
+
+Each cue becomes a log-likelihood ratio **fitted from the confident matches themselves**, so no threshold is
+guessed, and the assignment is one-to-one: leaving a vehicle unmatched has a cost, because most traffic at a
+junction never reaches the next camera, and forcing pairs is how a matcher invents journeys.
+
+Routes are discovered automatically — nobody describes the camera layout. Press **Match vehicles across
+cameras** once two cameras have been analysed.
+
+### Two paths, as a deployment needs
+
+* **online** — a tracklet is linked the moment its vehicle leaves view, using routes already learned. It
+  only answers when the best candidate clearly beats the next, because a wrong link on a dashboard is worse
+  than a blank.
+* **batch** — the *Match vehicles* button reconsiders every tracklet at once. More accurate, because a
+  vehicle's speed, width and colour are only final once it has left. It corrects the online guesses, and is
+  the result to quote. `link_source` on each pass records which path set it.
+
+### When it refuses, and why that matters
+
+Dhaka's fleet includes a great many near-identical green CNG auto-rickshaws, and appearance is close to
+useless for them. Three safeguards exist because the matcher **failed these cases in testing**, not because
+they were anticipated:
+
+1. **A flow is never taken in both directions.** A dense stream of look-alikes produces a reverse peak too;
+   accepting it linked every vehicle backwards.
+2. **Routes are ranked by how much traffic a fixed distance explains**, not by how sharp the peak is. A
+   spurious backwards peak scored 12.5σ against the true route's 8.6σ while explaining 88 pairs against its
+   232 — ranking by sharpness picked the wrong one.
+3. **A class is refused outright** when colour carries no information *and* its vehicles arrive closer
+   together than the timing can resolve. Then vehicle *k* and *k+1* explain the same arrival equally well,
+   and the matcher can be confidently, systematically wrong.
+
+Measured on synthetic traffic with known pairings (`tests/test_reid.py`; synthetic traffic flatters a
+matcher, so read these as a floor, not a result):
+
+| Traffic | Linked | Precision | Recall |
+|---|---:|---:|---:|
+| Mixed classes, 1.2 s headway | 99 | **99.3%** | 98.7% |
+| Half near-identical CNGs | 66 | **99.0%** | 65.3% |
+| All CNGs, normal and dense | 0 | — | *refuses* |
+| **Identical fleet, any density** | **0** | — | *refuses* |
+| Single class, distinct colours, jam | 100 | **100%** | 100% |
+
+Recall falls before precision does, which is the intended trade: an unlinked vehicle is a gap, a wrongly
+linked one is a false journey attached to a plate.
+
+**Not validated on real footage yet.** There is no hand-labelled cross-camera ground truth for this project,
+so the figures above are synthetic. The team's own two-camera footbridge study is the dataset to check this
+against.
+
+## Explaining a case (vision-language model)
+
+The rules decide **whether** a rule was broken. They cannot say what the scene was doing, why the driver
+behaved that way, or whether the photographs really back the finding up. **Explain**, on any case in Review,
+asks a vision-language model those three questions and writes the answer onto the case.
+
+It is deliberately **on demand**, not automatic: the model is the most expensive thing in the system, and an
+officer only needs it on the cases they are actually deciding. Nothing runs until the button is pressed, so
+it never competes with the detector.
+
+The answer is split the way an officer reads a case - **before, the event, after, probable cause** - plus a
+one-line summary for the notice, and a verdict on the evidence itself:
+
+| Verdict | Meaning |
+|---|---|
+| Evidence supports the finding | the photographs show what the rule decided |
+| Evidence contradicts the finding | they show the innocent explanation instead - a likely false positive |
+| **Not enough evidence to judge** | they cannot settle it: too blurred, too far, or the innocent explanation fits equally well |
+
+The third is the important one. For each rule the model is told both what the engine decided *and* the
+specific innocent explanation that would overturn it - for a stopped bus, that the whole road is stopped at a
+red light - and it is required to decline rather than invent a cause. A wrong explanation on an enforcement
+notice is worse than no explanation, so an unparsable or unrecognised answer degrades to "not enough
+evidence", never to agreement.
+
+The model never detects anything. Detection, tracking, speed and the rule decision are done already and are
+handed to it as given facts; it reads the evidence photographs and judges. That is also why a 3B model is
+enough: it is not being asked to find vehicles, only to explain them.
+
+### Setting it up
+
+```bash
+./tools/setup_vlm.sh        # once: llama.cpp + Qwen2.5-VL-3B (~3.1 GB into models/vlm/)
+./tools/vlm_server.sh       # leave running while you use Explain
+```
+
+Then press **Explain** on any case. On a laptop CPU an answer takes **about one to two minutes**; it
+appears by itself when it is ready, so you can carry on reviewing other cases meanwhile. Check what it will
+cost on *your* machine first:
+
+```bash
+.venv/bin/python tools/vlm_check.py            # cores, memory, disk, and whether it fits
+.venv/bin/python tools/vlm_check.py --case 12  # explain a real case and measure the time and memory
+```
+
+For better reasoning - and for comparing the two in the report - set a key and the cloud backend is used
+instead. No key is ever stored in the database or shown in the dashboard:
+
+```bash
+export ANTHROPIC_API_KEY=...      # or OPENAI_API_KEY (+ OPENAI_BASE_URL for a compatible endpoint)
+export VLM_BACKEND=cloud          # default "auto": the local server if it is up, otherwise the key
+```
+
+`auto` prefers whichever is actually available, so the dashboard keeps working with no model at all - the
+button simply reports that none is configured.
+
+### What it costs
+
+Measured on the development machine (Intel i5-11400H, 6 cores, AVX-512/VNNI, no usable GPU) — measured,
+not estimated:
+
+| | |
+|---|---|
+| Resident memory | **4.7 GB** while the server runs, freed when `vlm_server.sh` is stopped |
+| One photograph | 15-60 s |
+| Two photographs (the default) | **~110 s** |
+| Disk | 3.1 GB of weights in `models/vlm/` (git-ignored) |
+
+Image size dominates the cost on a CPU backend, because every extra pixel becomes vision tokens that must be
+encoded before a single word is produced. Two photographs at 768 px is the default because the close-up
+identifies the vehicle and the wide shot shows whether the rest of the traffic was moving - which is the
+question that separates an illegal stop from a red light. Trade accuracy for speed with `--images 1`, or the
+other way with `--max-side`, in `vlm_check.py`.
+
+### Does it actually check, or just agree?
+
+A model that agrees with whatever the rule engine says is worse than no model: it turns a false positive into
+a confident paragraph on a notice. `tools/vlm_probe.py` tests exactly that, by handing the model cases whose
+photographs cannot support the finding:
+
+```bash
+.venv/bin/python tools/vlm_probe.py        # needs the server running
+```
+
+Qwen2.5-VL-3B **failed this on the first attempt** - shown a photograph with no bus in it and told a bus had
+stopped illegally, it answered "supported, 90% confident" and invented a cause. Two changes fixed it, and
+both are worth knowing about:
+
+1. **The prompt asks what is visible before it mentions the finding.** Writing down what it can see, first,
+   makes the model much harder to lead.
+2. **The system overrules the model.** If it votes "supported" but says it could not identify the vehicle, or
+   describes a photograph without ever mentioning that kind of vehicle, the verdict is forced to "not enough
+   evidence" and the case says so. The guard can only ever weaken a verdict, never strengthen one.
+
+It now passes 3/3. Re-run the probe after changing the prompt, the model or the backend - and treat a failure
+as a reason not to trust that model's explanations.
+
+### What the local 3B model is and is not good for
+
+Its **verdict is noisy**. The same case, run twice, came back "supports the finding, 90%" and then
+"contradicts it, 0%". The guards above stop it agreeing with the impossible, but they cannot make a 3B model
+decide consistently. So:
+
+- Use the **narrative** - what is in the photographs, before, during, after - which is steady and genuinely
+  useful for writing up a case.
+- Treat the **verdict as a prompt to look again**, not as a second opinion worth quoting.
+- Use `VLM_BACKEND=cloud` for anything that goes in front of a person as a judgement, and for any figure
+  that goes in the report.
+
+None of this output is evidence. The photographs, the trajectory and the measurements are the evidence; the
+model only describes them, and the dashboard says so under every explanation.
+
 ## Performance (MacBook Air M5, Banani Kakoli 4K/60 fps footage)
 
 | | |
@@ -184,8 +365,13 @@ app.py                  dashboard server (FastAPI) - start here
 violation_tracker.py    command-line runner + OpenCV zone calibration
 violations/             the rules (V1-V8), zone geometry, evidence images
 models/                 detector exports, helmet classifier, plate models (+ README with sources and accuracy)
+models/vlm/             vision-language weights (git-ignored; ./tools/setup_vlm.sh fetches them)
 training/               scripts and labels to rebuild / re-measure the helmet and plate models
 surveillance/           video sources, detector, per-frame pipeline, clips, SQLite store, workers, web API
+surveillance/vlm.py       the reasoner: prompts, backends, the decline rule, the background queue
+surveillance/reid.py      cross-camera Re-ID: tracklets, colour signatures, route discovery, matching
+surveillance/link.py      batch and online linking into global vehicle ids
+tools/                  setup_vlm.sh, vlm_server.sh, vlm_check.py (hardware + cost check)
 web/                    dashboard (HTML/CSS/JS, no build step)
 tests/                  unit tests:  .venv/bin/python -m unittest discover -s tests
 data/                   database, uploaded videos, evidence (created at runtime)

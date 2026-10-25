@@ -372,6 +372,36 @@ kbd { font: 11px var(--font); border: 1px solid var(--border-strong); border-bot
 .plate-box .plate-img { height: 64px; width: auto; max-width: 240px; object-fit: contain; border-radius: 4px; background: #000; image-rendering: auto; }
 .plate-text { font-size: 22px; font-weight: 700; letter-spacing: 0.3px; }
 
+/* ---------- vision-language explanation of a case */
+.vlm-box { border: 1px solid var(--border-strong); border-left-width: 3px; border-radius: 8px;
+           padding: 11px 13px; background: var(--surface-2); display: flex; flex-direction: column; gap: 7px; }
+.vlm-box.ok { border-left-color: var(--good-ink); }
+.vlm-box.warn { border-left-color: var(--warning-ink); }
+.vlm-box.bad { border-left-color: var(--critical-ink); }
+.vlm-box.pending { border-left-color: var(--accent); }
+.vlm-head { display: flex; align-items: center; gap: 8px; font-size: 13.5px; }
+.vlm-head svg { width: 17px; height: 17px; flex: none; }
+.vlm-box.ok .vlm-head { color: var(--good-ink); }
+.vlm-box.warn .vlm-head { color: var(--warning-ink); }
+.vlm-box.bad .vlm-head { color: var(--critical-ink); }
+.vlm-box.pending .vlm-head { color: var(--accent); }
+.vlm-box.pending .vlm-head svg { animation: pulse 1.4s infinite; }
+.vlm-conf { font-size: 12px; color: var(--text-muted); font-weight: 400; }
+.vlm-summary { font-size: 14.5px; line-height: 1.5; color: var(--text-primary); }
+.vlm-part { display: grid; grid-template-columns: 112px 1fr; gap: 10px; align-items: baseline; }
+.vlm-part span { font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--text-muted); }
+.vlm-part p { margin: 0; font-size: 13px; line-height: 1.5; color: var(--text-secondary); }
+.vlm-foot { border-top: 1px solid var(--border); padding-top: 6px; line-height: 1.45; }
+table.kv.wide { width: 100%; }
+table.kv.wide th { text-align: left; font-weight: 600; color: var(--text-muted); font-size: 12px; }
+tr.vrow { cursor: pointer; }
+tr.vrow:hover td { background: var(--surface-2); }
+pre.vlog { margin: 6px 0 0; white-space: pre-wrap; max-height: 150px; overflow: auto; }
+
+.vlm-overruled { font-size: 12.5px; line-height: 1.45; padding: 7px 9px; border-radius: 6px;
+                 background: var(--surface-3); color: var(--text-secondary); border-left: 2px solid var(--warning-ink); }
+@media (max-width: 640px) { .vlm-part { grid-template-columns: 1fr; gap: 1px; } }
+
 /* ---------- automatic zones */
 .modes { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 4px; }
 .mode { display: flex; flex-direction: column; gap: 4px; padding: 12px 14px; border: 1px solid var(--border-strong); border-radius: 10px;
