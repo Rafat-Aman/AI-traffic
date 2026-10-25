@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import socket
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -15,8 +16,9 @@ from typing import Optional
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+from fastapi import Cookie, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse, RedirectResponse,
+                               Response, StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -25,8 +27,10 @@ from violations.engine import RULES, ViolationEngine
 from violations.zones import (AREA_TYPES, DEFAULT_SPEED_LIMITS, DIRECTIONS, ROAD_CATEGORIES, RoadZone,
                               camera_config_from_dict)
 
+from . import auth as auth_mod
 from . import vlm as vlm_mod
-from .link import LinkJob, OnlineLinker, run_linking
+from . import webauth
+from .link import LinkJob, OnlineLinker, SiteRun, run_linking
 from .anpr import find_models
 from .camera_motion import save_reference
 from .detector import MODELS_DIR, find_helmet_model
@@ -58,6 +62,7 @@ def notify(msg):
 
 
 linker = OnlineLinker(store)
+sites = {}            # site name -> SiteRun
 manager = WorkerManager(store, DATA, notify, linker)
 link_jobs = {}        # "current" -> the running / last LinkJob
 
@@ -81,10 +86,16 @@ def vlm_done(vid, explanation):
 explainer = vlm_mod.Explainer(DATA, vlm_settings(), vlm_done)
 
 
+sessions = webauth.Sessions(store)
+current_user, require = webauth.make_dependencies(sessions)
+CONTROLLER, ADMIN, DRIVER = auth_mod.CONTROLLER, auth_mod.ADMIN, auth_mod.DRIVER
+
+
 @asynccontextmanager
 async def lifespan(_app):
     loop_ref["loop"] = asyncio.get_running_loop()
     (DATA / "videos").mkdir(parents=True, exist_ok=True)
+    webauth.ensure_admin(store)
     yield
     await asyncio.to_thread(manager.stop_all)
 
@@ -135,6 +146,148 @@ def camera_view(cam):
 
 
 # ---------------------------------------------------------------- meta
+
+# Paths reachable without a session. Everything else under /api/ needs one: the check below fails shut, so
+# a route added later is protected until someone deliberately lists it here.
+PUBLIC_API = {"/api/login", "/api/login/code", "/api/login/verify", "/api/logout", "/api/me"}
+# What a driver may reach. Their portal is a different surface from the operator dashboard, not a filtered
+# view of it, so the two never share an endpoint.
+DRIVER_API = {"/api/me", "/api/logout", "/api/portal/violations", "/api/portal/vehicles",
+              "/api/portal/violation"}
+
+
+@app.middleware("http")
+async def guard(request: Request, call_next):
+    path = request.url.path
+    if not path.startswith("/api/") or path in PUBLIC_API:
+        return await call_next(request)
+    user = sessions.resolve(request.cookies.get(auth_mod.SESSION_COOKIE))
+    if user is None:
+        return JSONResponse({"detail": "Sign in to continue"}, status_code=401)
+    if user["role"] == DRIVER and not any(path == d or path.startswith(d + "/") for d in DRIVER_API):
+        return JSONResponse({"detail": "Your account does not have access to this"}, status_code=403)
+    request.state.user = user
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------- signing in
+
+class StaffLogin(BaseModel):
+    username: str
+    password: str
+
+
+class CodeRequest(BaseModel):
+    licence_no: str
+
+
+class CodeVerify(BaseModel):
+    licence_no: str
+    code: str
+
+
+def _limited(ok_wait, what):
+    ok, wait = ok_wait
+    if not ok:
+        raise HTTPException(429, f"Too many {what}. Try again in {wait} seconds.")
+
+
+@app.post("/api/login")
+def staff_login(body: StaffLogin, request: Request, response: Response):
+    """Traffic controllers and administrators."""
+    address = webauth.client_address(request)
+    _limited(auth_mod.by_address.check(address), "attempts from this address")
+    _limited(auth_mod.login_attempts.check(body.username.strip().lower()), "sign-in attempts")
+    user = store.user_by_username(body.username.strip())
+    # The same answer whether the account is unknown or the password is wrong: anything else tells an
+    # attacker which usernames exist.
+    if not user or user["role"] == DRIVER or not auth_mod.verify_secret(body.password,
+                                                                        user["password_hash"]):
+        store.audit(None, "login.fail", "user", body.username.strip(), "bad username or password", address)
+        raise HTTPException(401, "Wrong username or password")
+    auth_mod.login_attempts.clear(body.username.strip().lower())
+    sessions.start(response, user, address)
+    store.audit({"user_id": user["id"], "name": user["name"], "username": user["username"],
+                 "role": user["role"]}, "login.ok", "user", user["id"], "", address)
+    return {"id": user["id"], "role": user["role"], "name": user["name"], "username": user["username"]}
+
+
+@app.post("/api/login/code")
+def request_code(body: CodeRequest, request: Request):
+    """Step one for a driver: send a one-time code to the mobile registered against this licence.
+
+    The reply is identical whether or not the licence is known. A licence number is printed on a card and
+    handed over routinely, so telling a caller "no such licence" turns this endpoint into a way of testing
+    whether a person holds one."""
+    address = webauth.client_address(request)
+    _limited(auth_mod.by_address.check(address), "attempts from this address")
+    licence = auth_mod.normalise_licence(body.licence_no)
+    if not licence:
+        raise HTTPException(400, "Enter your driving licence number")
+    _limited(auth_mod.code_requests.check(licence), "codes requested for this licence")
+    user = store.user_by_licence(licence)
+    out = {"sent": True, "message": "If that licence is registered, a code has been sent to the mobile "
+                                    "number held for it."}
+    if not user:
+        store.audit(None, "login.code.unknown", "licence", licence, "", address)
+        return out
+    code = auth_mod.new_code()
+    store.add_login_code(user["id"], auth_mod.hash_secret(code),
+                         time.time() + auth_mod.OTP_TTL_SEC)
+    shown = auth_mod.deliver_code(code, user["phone"], licence)
+    store.audit(None, "login.code.sent", "user", user["id"], "", address)
+    # No hint about the number here, however helpful it would be. Returning one for a licence that exists
+    # and nothing for one that does not turns this endpoint into a test for whether a person holds a
+    # licence, which is exactly the question the identical wording above is meant to refuse to answer.
+    if shown:
+        out["demo_code"] = shown      # only when OTP_DELIVERY=echo, which warns about itself
+    return out
+
+
+@app.post("/api/login/verify")
+def verify_code(body: CodeVerify, request: Request, response: Response):
+    """Step two for a driver: exchange the code for a session."""
+    address = webauth.client_address(request)
+    _limited(auth_mod.by_address.check(address), "attempts from this address")
+    licence = auth_mod.normalise_licence(body.licence_no)
+    _limited(auth_mod.code_attempts.check(licence), "codes tried for this licence")
+    user = store.user_by_licence(licence)
+    bad = HTTPException(401, "That code is wrong or has expired")
+    if not user:
+        raise bad
+    row = store.live_login_code(user["id"], time.time())
+    if not row or row["attempts"] >= auth_mod.OTP_MAX_ATTEMPTS:
+        raise bad
+    store.bump_code_attempts(row["id"])
+    if not auth_mod.verify_secret(body.code.strip(), row["code_hash"]):
+        store.audit(None, "login.code.bad", "user", user["id"], "", address)
+        raise bad
+    store.spend_login_code(row["id"])
+    auth_mod.code_attempts.clear(licence)
+    sessions.start(response, user, address)
+    store.audit({"user_id": user["id"], "name": user["name"], "licence_no": user["licence_no"],
+                 "role": user["role"]}, "login.ok", "user", user["id"], "", address)
+    return {"id": user["id"], "role": user["role"], "name": user["name"]}
+
+
+@app.post("/api/logout")
+def logout(response: Response, tsid: str = Cookie(default=None), user=Depends(current_user)):
+    if user:
+        store.audit(user, "logout", "user", user["user_id"], "", user.get("address", ""))
+    sessions.end(response, tsid)
+    return {"ok": True}
+
+
+@app.get("/api/me")
+def me(user=Depends(current_user)):
+    """Who is signed in, for the page to decide what to show. Null when nobody is."""
+    if not user:
+        return {"signed_in": False}
+    out = {"signed_in": True, **user}
+    if user["role"] == DRIVER:
+        out["vehicles"] = store.vehicles_of(user["user_id"])
+    return out
+
 
 @app.get("/api/meta")
 def meta(request: Request):
@@ -197,7 +350,7 @@ def get_camera(cid: int):
 
 
 @app.post("/api/cameras")
-def add_camera(body: CameraIn):
+def add_camera(body: CameraIn, user=Depends(require(ADMIN))):
     """A live camera (phone / IP / device index) or a video file already on this Mac."""
     source = body.source.strip()
     if is_live_source(source):
@@ -220,7 +373,8 @@ def add_camera(body: CameraIn):
 
 @app.post("/api/cameras/upload")
 def upload_camera(name: str = Form(...), location: str = Form(""), start_time: str = Form(""),
-                  zone_mode: str = Form("manual"), file: UploadFile = File(...)):
+                  zone_mode: str = Form("manual"), file: UploadFile = File(...),
+                  user=Depends(require(ADMIN))):
     ext = Path(file.filename or "").suffix.lower()
     if ext not in VIDEO_EXTS:
         raise HTTPException(400, f"Not a video file: {file.filename}")
@@ -240,8 +394,48 @@ def upload_camera(name: str = Form(...), location: str = Form(""), start_time: s
     return camera_view(store.camera(cid))
 
 
+@app.post("/api/sites/upload")
+def upload_site(name: str = Form(""), location: str = Form(""), zone_mode: str = Form("auto"),
+                files: list[UploadFile] = File(...), user=Depends(require(ADMIN))):
+    """Several camera views of one place at once: one camera per video, learned and analysed in turn, then
+    linked so a vehicle keeps one identity across all of them.
+
+    They run one after another rather than together on purpose - the detector already uses every core, and
+    two analyses at once would simply halve each other's frame rate - and the batch link runs when the last
+    one finishes."""
+    if len(files) < 1:
+        raise HTTPException(400, "Choose at least one video")
+    site = name.strip() or f"Site {datetime.now():%H:%M}"
+    made = []
+    for n, file in enumerate(files, 1):
+        ext = Path(file.filename or "").suffix.lower()
+        if ext not in VIDEO_EXTS:
+            raise HTTPException(400, f"Not a video file: {file.filename}")
+        dest = DATA / "videos" / f"{datetime.now():%Y%m%d_%H%M%S}_{n}_{Path(file.filename).name}"
+        with open(dest, "wb") as f:
+            shutil.copyfileobj(file.file, f, 16 * 1024 * 1024)
+        start, how = detect_start_time(file.filename)
+        if not start:
+            start, how = detect_start_time(dest)
+        cid = store.add_camera(f"{site} - {Path(file.filename).stem}", "file", str(dest), location,
+                               start.isoformat(timespec="seconds") if start else None, how,
+                               {**default_settings("file"), "zone_mode": zone_mode, "site": site})
+        made.append(cid)
+    if not any(store.camera(c)["start_time"] for c in made):
+        pass     # no recording times: linking still works, it just uses each video's own clock
+    sites[site] = SiteRun(manager, store, made, zone_mode, notify=notify, linker=linker)
+    sites[site].start()
+    return {"site": site, "cameras": [camera_view(store.camera(c)) for c in made],
+            "status": sites[site].status}
+
+
+@app.get("/api/sites")
+def list_sites():
+    return {s: dict(j.status, cameras=j.cameras) for s, j in sites.items()}
+
+
 @app.patch("/api/cameras/{cid}")
-def patch_camera(cid: int, body: CameraPatch):
+def patch_camera(cid: int, body: CameraPatch, user=Depends(require(ADMIN))):
     """Rename / move a camera position, or change its settings. The source of a running camera cannot change."""
     cam = cam_or_404(cid)
     fields = body.model_dump(exclude_none=True)
@@ -273,7 +467,7 @@ def patch_camera(cid: int, body: CameraPatch):
 
 
 @app.delete("/api/cameras/{cid}")
-def delete_camera(cid: int):
+def delete_camera(cid: int, user=Depends(require(ADMIN))):
     cam_or_404(cid)
     manager.stop_autozone(cid)
     manager.stop(cid, wait=True)
@@ -331,13 +525,13 @@ def stop_camera(cid: int):
 
 
 @app.delete("/api/cameras/{cid}/violations")
-def clear_camera_violations(cid: int):
+def clear_camera_violations(cid: int, user=Depends(require(ADMIN))):
     if manager.running(cid):
         raise HTTPException(400, "Stop the camera first")
     store.clear_violations(cid)
     shutil.rmtree(DATA / "evidence" / f"cam{cid}", ignore_errors=True)
+    store.audit(user, "camera.clear_violations", "camera", cid, "all cases and tracklets deleted", user.get("address", ""))
     return {"ok": True}
-
 
 @app.get("/api/status")
 def all_status():
@@ -351,7 +545,7 @@ def devices():
 
 
 @app.post("/api/test-source")
-def test_source(body: CameraIn):
+def test_source(body: CameraIn, user=Depends(require(ADMIN))):
     try:
         frame = grab_frame(body.source.strip())
     except Exception as e:
@@ -446,7 +640,7 @@ def validate_config(config):
 
 
 @app.put("/api/cameras/{cid}/zones")
-def save_zones(cid: int, body: ZonesIn):
+def save_zones(cid: int, body: ZonesIn, user=Depends(require(ADMIN))):
     cam = cam_or_404(cid)
     validate_config(body.config)
     if not body.config.get("auto"):  # drawn / edited by hand
@@ -464,7 +658,7 @@ def save_zones(cid: int, body: ZonesIn):
 
 
 @app.post("/api/cameras/{cid}/zones/validate")
-def check_zones(cid: int, body: ZonesIn):
+def check_zones(cid: int, body: ZonesIn, user=Depends(require(ADMIN))):
     """Validates a draft and returns what the detector will do with it: the detection area and, per road zone,
     the line from which positions are precise enough to measure (drawn in the editor)."""
     cam = cam_or_404(cid)
@@ -493,7 +687,7 @@ class KerbIn(BaseModel):
 
 
 @app.post("/api/kerb-strip")
-def kerb_strip(body: KerbIn):
+def kerb_strip(body: KerbIn, user=Depends(require(ADMIN))):
     """A no-parking strip `strip_m` wide along the left or right edge of a road zone, as image points (follows the
     road's perspective, which is hard to click by hand)."""
     try:
@@ -514,7 +708,7 @@ class TopDownIn(BaseModel):
 
 
 @app.post("/api/cameras/{cid}/topdown")
-def topdown(cid: int, body: TopDownIn):
+def topdown(cid: int, body: TopDownIn, user=Depends(require(ADMIN))):
     """Bird's-eye view of a road zone: lane lines must come out straight and parallel if the size is right."""
     cam = cam_or_404(cid)
     if cam["kind"] == "live" and manager.running(cid):
@@ -561,12 +755,13 @@ def get_violation(vid: int):
 
 
 @app.patch("/api/violations/{vid}")
-def review_violation(vid: int, body: ReviewIn):
+def review_violation(vid: int, body: ReviewIn, user=Depends(require(CONTROLLER))):
     if body.status not in ("pending", "confirmed", "rejected"):
         raise HTTPException(400, "status must be pending, confirmed or rejected")
     if not store.violation(vid):
         raise HTTPException(404, "Violation not found")
-    store.review(vid, body.status, body.note)
+    store.review(vid, body.status, body.note, by=user)
+    store.audit(user, f"violation.{body.status}", "violation", vid, body.note, user.get("address", ""))
     return store.violation(vid)
 
 
@@ -593,6 +788,9 @@ def explain_violation(vid: int, body: ExplainIn = ExplainIn()):
     # Mark it pending before queueing, never after: a fast backend can finish and write its answer while
     # this request is still running, and a "pending" written afterwards would erase it.
     store.set_vlm(vid, "pending")
+    # Hand the reasoner where else this vehicle was seen: one camera cannot distinguish a vehicle caught in
+    # a jam from one that stopped dead, and the camera before it usually can.
+    v = {**v, "journey": store.journey_for_violation(v)}
     if not explainer.request(v, settings):
         store.set_vlm(vid, "")
         raise HTTPException(429, "The reasoning queue is full; try again shortly")
@@ -659,6 +857,232 @@ def vehicle_journey(gid: int):
     return {"global_id": gid, "passes": rows}
 
 
+# ---------------------------------------------------------------- the driver's own portal
+
+def _driver(request: Request):
+    u = getattr(request.state, "user", None)
+    if not u or u["role"] != DRIVER:
+        raise HTTPException(403, "Drivers only")
+    return u
+
+
+def _my_plate_keys(uid):
+    return [v["plate_key"] for v in store.vehicles_of(uid, verified_only=True)]
+
+
+def _for_driver(v):
+    """A case as its registered keeper may see it: the evidence, and nothing about anyone else.
+
+    Internal review material is stripped - the reviewer's name, the operator's note, the camera's
+    identifiers - because none of it is theirs to see and some of it names a police officer."""
+    keep = ("id", "code", "title", "cls", "wall_time", "video_time_s", "zone", "kph", "details",
+            "plate_text", "plate_text_en", "snapshot", "crop", "clip", "plate_img", "evidence",
+            "camera_location", "status", "vlm")
+    out = {k: v.get(k) for k in keep}
+    out["camera"] = v.get("camera_location") or ""
+    out.pop("camera_location", None)
+    return out
+
+
+@app.get("/api/portal/violations")
+def portal_violations(request: Request, limit: int = 50, offset: int = 0):
+    """Confirmed cases against vehicles registered to the signed-in driver.
+
+    Only confirmed ones, and only verified vehicles: a case still in the review queue has not been decided
+    by anybody yet, and showing it as though it had would be telling someone they are liable for something
+    nobody has looked at."""
+    u = _driver(request)
+    plates = _my_plate_keys(u["user_id"])
+    rows, total = store.violations_for_plates(plates, limit=min(limit, 200), offset=offset)
+    return {"items": [_for_driver(r) for r in rows], "total": total,
+            "vehicles": store.vehicles_of(u["user_id"]),
+            "note": ("These are violations recorded against vehicles registered to you. The system "
+                     "identifies vehicles by their number plate, not drivers, so a case shows the vehicle "
+                     "that was involved rather than who was at the wheel.")}
+
+
+@app.get("/api/portal/violation/{vid}")
+def portal_violation(vid: int, request: Request):
+    u = _driver(request)
+    plates = set(_my_plate_keys(u["user_id"]))
+    v = store.violation(vid)
+    if not v or v["status"] != "confirmed":
+        raise HTTPException(404, "No such case")
+    if auth_mod.normalise_plate(v.get("plate_text_en") or "") not in plates:
+        store.audit(u, "portal.denied", "violation", vid, "case is not against a registered vehicle",
+                    u.get("address", ""))
+        raise HTTPException(404, "No such case")
+    return _for_driver(v)
+
+
+class PlateClaim(BaseModel):
+    plate: str
+
+
+@app.post("/api/portal/vehicles")
+def claim_vehicle(body: PlateClaim, request: Request):
+    """A driver says a plate is theirs. It shows nothing until an administrator verifies it - otherwise
+    anyone could read any vehicle's history by claiming its plate."""
+    u = _driver(request)
+    key = auth_mod.normalise_plate(body.plate)
+    if len(key) < 4:
+        raise HTTPException(400, "Enter the full number plate")
+    existing = store.vehicle_by_plate(key)
+    if existing:
+        if existing["owner_id"] == u["user_id"]:
+            return {"ok": True, "already": True, "verified": bool(existing["verified"])}
+        raise HTTPException(409, "That plate is already registered to someone else. "
+                                 "Contact the traffic authority if this is wrong.")
+    vid = store.add_vehicle(key, u["user_id"], plate_en=body.plate.strip(), source="claimed", verified=0)
+    store.audit(u, "vehicle.claim", "vehicle", vid, key, u.get("address", ""))
+    return {"ok": True, "verified": False,
+            "message": "Added. It will show your violations once the traffic authority has verified it."}
+
+
+@app.delete("/api/portal/vehicles/{vid}")
+def unclaim_vehicle(vid: int, request: Request):
+    u = _driver(request)
+    rows = [v for v in store.vehicles_of(u["user_id"]) if v["id"] == vid]
+    if not rows:
+        raise HTTPException(404, "Not one of your vehicles")
+    store.delete_vehicle(vid)
+    store.audit(u, "vehicle.unclaim", "vehicle", vid, rows[0]["plate_key"], u.get("address", ""))
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- accounts and registry (admin)
+
+class UserIn(BaseModel):
+    role: str
+    name: str = ""
+    username: Optional[str] = None
+    password: Optional[str] = None
+    licence_no: Optional[str] = None
+    phone: str = ""
+
+
+@app.get("/api/users")
+def list_users(role: Optional[str] = None, user=Depends(require(ADMIN))):
+    return {"items": store.users(role)}
+
+
+@app.post("/api/users")
+def create_user(body: UserIn, user=Depends(require(ADMIN))):
+    if body.role not in auth_mod.ROLES:
+        raise HTTPException(400, f"role must be one of {', '.join(auth_mod.ROLES)}")
+    if body.role == DRIVER:
+        licence = auth_mod.normalise_licence(body.licence_no or "")
+        if not licence:
+            raise HTTPException(400, "A driver needs a licence number")
+        if not (body.phone or "").strip():
+            raise HTTPException(400, "A driver needs a mobile number to receive sign-in codes")
+        if store.user_by_licence(licence):
+            raise HTTPException(409, "That licence number is already registered")
+        uid = store.add_user(DRIVER, body.name, licence_no=licence, phone=body.phone.strip())
+    else:
+        if not body.username or not body.password:
+            raise HTTPException(400, "Staff need a username and a password")
+        if store.user_by_username(body.username.strip()):
+            raise HTTPException(409, "That username is taken")
+        uid = store.add_user(body.role, body.name, username=body.username.strip(),
+                             password_hash=auth_mod.hash_secret(body.password))
+    store.audit(user, "user.create", "user", uid, body.role, user.get("address", ""))
+    return store.user(uid)
+
+
+class UserPatch(BaseModel):
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    active: Optional[bool] = None
+    password: Optional[str] = None
+
+
+@app.patch("/api/users/{uid}")
+def update_user(uid: int, body: UserPatch, user=Depends(require(ADMIN))):
+    target = store.user(uid)
+    if not target:
+        raise HTTPException(404, "No such account")
+    fields = {k: v for k, v in body.dict().items() if v is not None and k != "password"}
+    if body.active is not None:
+        fields["active"] = int(body.active)
+    if body.password:
+        fields["password_hash"] = auth_mod.hash_secret(body.password)
+    store.update_user(uid, **fields)
+    if body.password or body.active is False:
+        store.drop_sessions_of(uid)       # a changed password or a disabled account ends every session
+    store.audit(user, "user.update", "user", uid, ",".join(fields), user.get("address", ""))
+    return store.user(uid)
+
+
+class PasswordChange(BaseModel):
+    current: str
+    new: str
+
+
+@app.post("/api/me/password")
+def change_own_password(body: PasswordChange, request: Request):
+    """Staff change their own password. The bootstrap administrator's printed password must not survive."""
+    u = getattr(request.state, "user", None)
+    if not u or u["role"] == DRIVER:
+        raise HTTPException(403, "Staff accounts only")
+    row = store.user(u["user_id"])
+    if not auth_mod.verify_secret(body.current, row["password_hash"]):
+        raise HTTPException(401, "Current password is wrong")
+    if len(body.new) < 10:
+        raise HTTPException(400, "Use at least 10 characters")
+    store.update_user(u["user_id"], password_hash=auth_mod.hash_secret(body.new))
+    store.audit(u, "user.password", "user", u["user_id"], "changed own password", u.get("address", ""))
+    return {"ok": True}
+
+
+@app.get("/api/registry")
+def list_registry(pending: bool = False, user=Depends(require(ADMIN))):
+    return {"items": store.all_vehicles(pending_only=pending)}
+
+
+class RegistryIn(BaseModel):
+    plate: str
+    licence_no: str
+    plate_bn: str = ""
+
+
+@app.post("/api/registry")
+def register_vehicle(body: RegistryIn, user=Depends(require(ADMIN))):
+    """Link a plate to a licence holder, standing in for the registry data a real deployment would import."""
+    owner = store.user_by_licence(auth_mod.normalise_licence(body.licence_no))
+    if not owner:
+        raise HTTPException(404, "No driver with that licence number")
+    key = auth_mod.normalise_plate(body.plate)
+    if store.vehicle_by_plate(key):
+        raise HTTPException(409, "That plate is already registered")
+    vid = store.add_vehicle(key, owner["id"], plate_en=body.plate.strip(), plate_bn=body.plate_bn,
+                            source="admin", verified=1)
+    store.audit(user, "vehicle.register", "vehicle", vid, f"{key} -> {owner['licence_no']}",
+                user.get("address", ""))
+    return store.vehicle_by_plate(key)
+
+
+@app.post("/api/registry/{vid}/verify")
+def verify_vehicle(vid: int, user=Depends(require(ADMIN))):
+    store.set_vehicle(vid, verified=1)
+    store.audit(user, "vehicle.verify", "vehicle", vid, "", user.get("address", ""))
+    return {"ok": True}
+
+
+@app.delete("/api/registry/{vid}")
+def remove_vehicle(vid: int, user=Depends(require(ADMIN))):
+    store.delete_vehicle(vid)
+    store.audit(user, "vehicle.remove", "vehicle", vid, "", user.get("address", ""))
+    return {"ok": True}
+
+
+@app.get("/api/audit")
+def audit_trail(object_type: Optional[str] = None, object_id: Optional[str] = None,
+                user_id: Optional[int] = None, limit: int = 200, user=Depends(require(ADMIN))):
+    """Who did what. Append-only by convention: nothing in the API deletes from it."""
+    return {"items": store.audit_trail(object_type, object_id, user_id, min(limit, 1000))}
+
+
 @app.get("/api/export.csv")
 def export_csv(camera_id: Optional[int] = None, status: Optional[str] = None):
     rows = store.violations(camera_id, status=status, limit=1_000_000, order="ASC")
@@ -700,7 +1124,7 @@ def evidence_figure(e):
 
 
 @app.get("/notice/{vid}", response_class=HTMLResponse)
-def notice(vid: int):
+def notice(vid: int, user=Depends(require(CONTROLLER))):
     """Printable violation notice for a confirmed case (browser: Print -> Save as PDF)."""
     v = store.violation(vid)
     if not v:
@@ -723,12 +1147,45 @@ def notice(vid: int):
 
 # ---------------------------------------------------------------- static
 
-app.mount("/media", StaticFiles(directory=str(DATA), check_dir=False), name="media")
+# Only the folders the dashboard actually reads from, and never `data/` as a whole: that served the
+# database itself at /media/surveillance.db - every plate, every offender record - along with the source
+# footage, to anyone who could reach the port. The paths stored in the database are relative to `data/`,
+# so mounting each sub-folder at the same name keeps every existing link working.
+for _name in ("evidence", "autozone"):
+    (DATA / _name).mkdir(parents=True, exist_ok=True)
+    app.mount(f"/media/{_name}", StaticFiles(directory=str(DATA / _name)), name=f"media-{_name}")
 
 
 @app.get("/")
-def index():
+def index(request: Request):
+    """Each actor lands where they belong: staff on the dashboard, drivers on their own portal, and
+    anyone else at the sign-in page."""
+    user = sessions.resolve(request.cookies.get(auth_mod.SESSION_COOKIE))
+    if user is None:
+        return RedirectResponse("/login", status_code=302)
+    if user["role"] == DRIVER:
+        return RedirectResponse("/portal", status_code=302)
     return FileResponse(WEB / "index.html", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/login")
+def login_page(request: Request):
+    user = sessions.resolve(request.cookies.get(auth_mod.SESSION_COOKIE))
+    if user:
+        return RedirectResponse("/portal" if user["role"] == DRIVER else "/", status_code=302)
+    return FileResponse(WEB / "login.html", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/portal")
+def portal_page(request: Request):
+    """A driver's own violations. Deliberately a separate page from the operator dashboard rather than a
+    filtered view of it: there is then no state in which the wrong thing can be shown to the wrong person."""
+    user = sessions.resolve(request.cookies.get(auth_mod.SESSION_COOKIE))
+    if user is None:
+        return RedirectResponse("/login", status_code=302)
+    if user["role"] != DRIVER:
+        return RedirectResponse("/", status_code=302)
+    return FileResponse(WEB / "portal.html", headers={"Cache-Control": "no-store"})
 
 
 app.mount("/static", StaticFiles(directory=str(WEB)), name="static")

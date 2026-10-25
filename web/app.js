@@ -15,6 +15,10 @@
       init.body = JSON.stringify(opts.body);
     }
     const res = await fetch(path, init);
+    if (res.status === 401) {          // the session ended or never existed
+      location.href = "/login";
+      throw new Error("Sign in to continue");
+    }
     if (!res.ok) {
       let msg = res.statusText;
       try { const j = await res.json(); msg = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail); } catch (e) { /* not json */ }
@@ -128,7 +132,10 @@
   }
 
   // ------------------------------------------------------------------ app state, live events
-  const state = { meta: null, status: {}, pending: 0, sse: null, page: null };
+  const state = { meta: null, status: {}, pending: 0, sse: null, page: null, me: null };
+  // Hiding a control is a courtesy to the user, not a security measure: the server refuses the request
+  // regardless of what the page chose to draw.
+  const isAdmin = () => state.me && state.me.role === "admin";
   const listeners = new Set(); // page-level handlers for live messages
 
   function connectEvents() {
@@ -213,6 +220,7 @@
       else if (name === "camera") await pageCamera(main, +parts[1]);
       else if (name === "review") await pageReview(main, parts[1] ? +parts[1] : null);
       else if (name === "vehicles") await pageVehicles(main, parts[1] ? +parts[1] : null);
+      else if (name === "admin") await pageAdmin(main);
       else if (name === "stats") await pageStats(main);
       else main.innerHTML = `<div class="empty">Page not found</div>`;
     } catch (e) {
@@ -621,6 +629,23 @@
     if (im) { e.preventDefault(); lightbox(im.dataset.zoom, im.dataset.caption || "Evidence"); }
   });
 
+  // Form-data POST with upload progress, for anything that is not the single-camera form.
+  function postForm(url, fd, onPct) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", url);
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable && onPct) onPct(Math.round(100 * e.loaded / e.total));
+      };
+      xhr.onload = () => {
+        if (xhr.status < 300) resolve(xhr.responseText ? JSON.parse(xhr.responseText) : {});
+        else { try { reject(new Error(JSON.parse(xhr.responseText).detail)); } catch (e) { reject(new Error(xhr.statusText)); } }
+      };
+      xhr.onerror = () => reject(new Error("Upload failed"));
+      xhr.send(fd);
+    });
+  }
+
   function upload(file, name, location, start, prog, zoneMode = "manual") {
     return new Promise((resolve, reject) => {
       const fd = new FormData();
@@ -887,6 +912,8 @@
         ${x.downgraded ? `<div class="vlm-overruled">${esc(x.downgraded)}</div>` : ""}
         <div class="vlm-summary">${esc(x.summary || "")}</div>
         ${part("In the photos", x.visible)}
+        ${x.other_cameras && !/^(nothing|not applicable|n\/a)\.?$/i.test(x.other_cameras.trim())
+            ? part("Other cameras", x.other_cameras) : ""}
         ${part("Before", x.pre_event)}${part("The event", x.event)}
         ${part("After", x.aftermath)}${part("Probable cause", x.cause)}
         <div class="small muted vlm-foot">${esc(x.model || "model")} · ${esc(x.backend || "")} ·
@@ -1072,7 +1099,24 @@
     const fmtTime = (t) => t ? new Date(t * 1000).toLocaleString() : "-";
     root.innerHTML = `<div class="row page-head"><h1>Vehicles across cameras</h1><span class="spacer"></span>
         <span class="small muted" id="v-routes"></span>
+        <button class="btn" id="v-add">${ICON.plus}Add camera views</button>
         <button class="btn primary" id="v-link">${ICON.auto}Match vehicles across cameras</button></div>
+      <div class="card" id="v-upload" hidden>
+        <div class="card-head"><h2>Several views of one place</h2><span class="spacer"></span>
+          <button class="btn small" id="v-cancel">${ICON.cross}Close</button></div>
+        <div class="small secondary">Choose every video of the same junction or stretch of road. Each becomes
+          its own camera, they are analysed one after another, and the vehicles are matched across them at the
+          end. Recording times are read from the file names where possible - matching is most accurate when
+          the clips overlap in real time.</div>
+        <label class="field">Place<input id="v-site" placeholder="e.g. Kakoli footbridge"></label>
+        <label class="field">Location note<input id="v-loc" placeholder="optional, e.g. Banani"></label>
+        <label class="field">Videos
+          <input id="v-files" type="file" multiple accept="video/*,.mp4,.mov,.mkv,.avi,.ts,.webm"></label>
+        <div id="v-chosen" class="small muted"></div>
+        <div class="row"><button class="btn primary" id="v-go">${ICON.play}Upload and analyse</button>
+          <span class="small muted" id="v-prog"></span></div>
+      </div>
+      <div class="card" id="v-site-status" hidden></div>
       <div class="card" id="v-status" hidden></div>
       <div class="card"><div class="small secondary">A vehicle is recognised on a second camera from where
         and when it crossed, how fast it was going, how wide it is, its class, and the colour of its body -
@@ -1130,13 +1174,163 @@
       $("#v-journey").scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
 
+    $("#v-add").onclick = () => { $("#v-upload").hidden = !$("#v-upload").hidden; };
+    $("#v-cancel").onclick = () => { $("#v-upload").hidden = true; };
+    $("#v-files").onchange = () => {
+      const f = [...($("#v-files").files || [])];
+      $("#v-chosen").textContent = f.length
+        ? `${f.length} video(s): ` + f.map((x) => `${x.name} (${(x.size / 1e6).toFixed(0)} MB)`).join(", ")
+        : "";
+    };
+    $("#v-go").onclick = async () => {
+      const files = [...($("#v-files").files || [])];
+      if (!files.length) return fail(new Error("Choose at least one video"));
+      const fd = new FormData();
+      fd.append("name", $("#v-site").value);
+      fd.append("location", $("#v-loc").value);
+      fd.append("zone_mode", "auto");
+      files.forEach((f) => fd.append("files", f));
+      $("#v-go").disabled = true;
+      try {
+        await postForm("/api/sites/upload", fd, (pct) => { $("#v-prog").textContent = `uploading ${pct}%`; });
+        $("#v-prog").textContent = "";
+        $("#v-upload").hidden = true;
+        siteStatus();
+      } catch (e) { fail(e); } finally { $("#v-go").disabled = false; }
+    };
+
+    async function siteStatus() {
+      let sites;
+      try { sites = await api("/api/sites"); } catch (e) { return; }
+      const names = Object.keys(sites);
+      const box = $("#v-site-status");
+      if (!names.length) { box.hidden = true; return; }
+      box.hidden = false;
+      box.innerHTML = names.map((n) => {
+        const j = sites[n];
+        const pct = Math.round(100 * (j.done || []).length / Math.max(j.total || 1, 1));
+        return `<div><div class="row"><b>${esc(n)}</b>
+          <span class="muted small">${esc(j.message || "")}</span><span class="spacer"></span>
+          <span class="small muted">${(j.done || []).length}/${j.total} camera(s)</span></div>
+          <div class="bar"><div style="width:${pct}%"></div></div></div>`;
+      }).join("");
+      if (names.some((n) => !["done", "error"].includes(sites[n].state))) setTimeout(siteStatus, 2000);
+      else { refreshStatus(); load(); }
+    }
+
     $("#v-link").onclick = async () => {
       try { await api("/api/link", { method: "POST", body: {} }); refreshStatus();
             setTimeout(load, 2500); } catch (e) { fail(e); }
     };
-    listeners.add((msg) => { if (msg.type === "link") { refreshStatus(); load(); } });
+    listeners.add((msg) => {
+      if (msg.type === "link") { refreshStatus(); load(); }
+      if (msg.type === "site") siteStatus();
+      if (msg.type === "vehicle_linked") load();
+    });
     await refreshStatus();
+    await siteStatus();
     await load();
+  }
+
+  // ---------------------------------------------------------------- accounts, registry, audit (admin)
+  async function pageAdmin(root) {
+    if (!isAdmin()) { root.innerHTML = `<div class="card empty">Administrators only.</div>`; return; }
+    const fmt = (t) => t ? new Date(t).toLocaleString() : "-";
+    root.innerHTML = `<div class="row page-head"><h1>Accounts</h1><span class="spacer"></span>
+        <span class="seg" id="a-tabs">${["people", "vehicles", "activity"].map((k, i) =>
+          `<button data-v="${k}"${i ? "" : ' class="on"'}>${k[0].toUpperCase() + k.slice(1)}</button>`).join("")}</span></div>
+      <div id="a-body"></div>`;
+    let tab = "people";
+    $$("#a-tabs button").forEach((b) => b.onclick = () => {
+      tab = b.dataset.v;
+      $$("#a-tabs button").forEach((x) => x.classList.toggle("on", x === b));
+      render();
+    });
+
+    async function render() {
+      const body = $("#a-body");
+      if (tab === "people") {
+        const r = await api("/api/users");
+        body.innerHTML = `<div class="card">
+          <div class="card-head"><h2>People</h2></div>
+          <table class="kv wide"><tr><th>Name</th><th>Role</th><th>Signs in with</th><th>Last seen</th><th></th></tr>
+          ${r.items.map((u) => `<tr><td>${esc(u.name || "-")}</td><td>${esc(u.role)}</td>
+            <td class="small">${esc(u.username || u.licence_no || "-")}${u.phone ? " · " + esc(u.phone) : ""}</td>
+            <td class="small muted">${esc(fmt(u.last_login))}</td>
+            <td><button class="btn small" data-toggle="${u.id}" data-active="${u.active}">${
+              u.active ? "Disable" : "Enable"}</button></td></tr>`).join("")}</table></div>
+          <div class="grid2">
+            <div class="card"><div class="card-head"><h2>Add a driver</h2></div>
+              <label class="field">Name<input id="d-name"></label>
+              <label class="field">Driving licence number<input id="d-lic" placeholder="DK-1234567"></label>
+              <label class="field">Mobile (receives the sign-in code)<input id="d-phone" placeholder="+8801..."></label>
+              <button class="btn primary" id="d-add">Add driver</button></div>
+            <div class="card"><div class="card-head"><h2>Add staff</h2></div>
+              <label class="field">Name<input id="s-name"></label>
+              <label class="field">Username<input id="s-user"></label>
+              <label class="field">Password<input id="s-pass" type="password"></label>
+              <label class="field">Role<select id="s-role"><option value="controller">Traffic controller</option>
+                <option value="admin">Administrator</option></select></label>
+              <button class="btn primary" id="s-add">Add staff</button></div></div>`;
+        $$("[data-toggle]").forEach((b) => b.onclick = async () => {
+          try { await api(`/api/users/${b.dataset.toggle}`, { method: "PATCH",
+                  body: { active: b.dataset.active !== "1" } }); render(); } catch (e) { fail(e); }
+        });
+        $("#d-add").onclick = async () => {
+          try { await api("/api/users", { method: "POST", body: { role: "driver", name: $("#d-name").value,
+                  licence_no: $("#d-lic").value, phone: $("#d-phone").value } }); render(); } catch (e) { fail(e); }
+        };
+        $("#s-add").onclick = async () => {
+          try { await api("/api/users", { method: "POST", body: { role: $("#s-role").value,
+                  name: $("#s-name").value, username: $("#s-user").value, password: $("#s-pass").value } });
+                render(); } catch (e) { fail(e); }
+        };
+      } else if (tab === "vehicles") {
+        const r = await api("/api/registry");
+        const pending = r.items.filter((v) => !v.verified).length;
+        body.innerHTML = `<div class="card">
+          <div class="card-head"><h2>Registered vehicles</h2><span class="spacer"></span>
+            <span class="small muted">${pending} awaiting verification</span></div>
+          <div class="small secondary">A driver only sees violations for a plate once it is verified here.
+            Verifying a plate someone claimed wrongly hands them another person's record, so check it
+            against the registration document.</div>
+          <table class="kv wide"><tr><th>Plate</th><th>Keeper</th><th>Added</th><th>Status</th><th></th></tr>
+          ${r.items.map((v) => `<tr><td><b>${esc(v.plate_en || v.plate_key)}</b></td>
+            <td>${esc(v.owner_name || "-")}<span class="small muted"> ${esc(v.owner_licence || "")}</span></td>
+            <td class="small muted">${esc(v.source)}</td>
+            <td>${v.verified ? '<span class="small">verified</span>' : '<span class="small" style="color:var(--warning-ink)">claimed, unverified</span>'}</td>
+            <td>${v.verified ? "" : `<button class="btn small good" data-ok="${v.id}">Verify</button>`}
+              <button class="btn small danger" data-rm="${v.id}">Remove</button></td></tr>`).join("")
+            || '<tr><td colspan="5" class="muted small">Nothing registered yet.</td></tr>'}</table></div>
+          <div class="card"><div class="card-head"><h2>Link a plate to a licence</h2></div>
+            <div class="row"><input id="r-plate" placeholder="DHAKA METRO-GA 12-3456" style="flex:1">
+              <input id="r-lic" placeholder="Licence number" style="flex:1">
+              <button class="btn primary" id="r-add">Link</button></div></div>`;
+        $$("[data-ok]").forEach((b) => b.onclick = async () => {
+          try { await api(`/api/registry/${b.dataset.ok}/verify`, { method: "POST" }); render(); } catch (e) { fail(e); }
+        });
+        $$("[data-rm]").forEach((b) => b.onclick = async () => {
+          try { await api(`/api/registry/${b.dataset.rm}`, { method: "DELETE" }); render(); } catch (e) { fail(e); }
+        });
+        $("#r-add").onclick = async () => {
+          try { await api("/api/registry", { method: "POST", body: { plate: $("#r-plate").value,
+                  licence_no: $("#r-lic").value } }); render(); } catch (e) { fail(e); }
+        };
+      } else {
+        const r = await api("/api/audit?limit=300");
+        body.innerHTML = `<div class="card"><div class="card-head"><h2>Activity</h2></div>
+          <div class="small secondary">Every decision recorded against the person who made it. A case with
+            nobody's name on it is not evidence of anything, so this is written on each confirm, reject,
+            registration and sign-in.</div>
+          <table class="kv wide"><tr><th>When</th><th>Who</th><th>Did what</th><th>To</th><th>Detail</th></tr>
+          ${r.items.map((a) => `<tr><td class="small muted">${esc(fmt(a.at))}</td>
+            <td>${esc(a.who)}<span class="small muted"> ${esc(a.role)}</span></td>
+            <td><code class="small">${esc(a.action)}</code></td>
+            <td class="small">${esc(a.object_type)}${a.object_id ? " " + esc(a.object_id) : ""}</td>
+            <td class="small muted">${esc(a.detail || "")}</td></tr>`).join("")}</table></div>`;
+      }
+    }
+    await render();
   }
 
   async function pageStats(main) {
@@ -1242,6 +1436,14 @@
 
   window.addEventListener("hashchange", route);
   window.addEventListener("DOMContentLoaded", async () => {
+    try { state.me = await api("/api/me"); } catch (e) { return; }          // 401 already redirected
+    if (!state.me.signed_in) { location.href = "/login"; return; }
+    if (state.me.role === "driver") { location.href = "/portal"; return; }
+    $("#who-box").hidden = false;
+    $("#who-name").textContent = state.me.name || state.me.username || "";
+    $("#who-role").textContent = state.me.role === "admin" ? "Administrator" : "Traffic controller";
+    $("#nav-admin").hidden = !isAdmin();
+    $("#signout").onclick = async () => { await api("/api/logout", { method: "POST" }); location.href = "/login"; };
     try { state.meta = await api("/api/meta"); } catch (e) { $("#main").innerHTML = `<div class="card errors">Server not reachable: ${esc(e.message)}</div>`; return; }
     if (state.meta.lan_url) $("#lan-url").innerHTML = `Phone / LAN: <a href="${esc(state.meta.lan_url)}">${esc(state.meta.lan_url.replace("http://", ""))}</a>`;
     connectEvents();

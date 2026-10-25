@@ -19,11 +19,14 @@
         <a href="#/cameras" data-route="cameras"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 8h12l4-3v14l-4-3H3z"/></svg>Cameras</a>
         <a href="#/review" data-route="review"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3 8-8"/><path d="M20 12v7a2 2 0 01-2 2H6a2 2 0 01-2-2V5a2 2 0 012-2h9"/></svg>Review<span class="count hidden" id="pending-count"></span></a>
         <a href="#/vehicles" data-route="vehicles"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 17H3v-5l2-5h11l3 5h2v5h-2"/><circle cx="7.5" cy="17" r="2"/><circle cx="17.5" cy="17" r="2"/></svg>Vehicles</a>
+        <a href="#/admin" data-route="admin" id="nav-admin" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="3.2"/><path d="M5 20c0-3.6 3.1-6 7-6s7 2.4 7 6"/></svg>Accounts</a>
         <a href="#/stats" data-route="stats"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>Statistics</a>
       </nav>
       <div class="sidebar-foot">
         <div><span class="sse-dot" id="sse-dot"></span><span id="sse-text">Connecting...</span></div>
         <div id="lan-url"></div>
+        <div id="who-box" class="who-box" hidden><span id="who-name"></span><span id="who-role"></span>
+          <button class="btn small ghost" id="signout" type="button">Sign out</button></div>
         <button class="btn small ghost" id="theme-btn" type="button">Toggle light / dark</button>
       </div>
     </aside>

@@ -163,7 +163,7 @@ The system would be WRONG about this if:
 {innocent}
 
 MEASUREMENTS (from the detector and the rule engine, treat these as given)
-{facts}
+{facts}{journey}
 
 Now answer. Fill "visible" first, from the photographs alone, before judging anything.
 
@@ -176,7 +176,8 @@ Now answer. Fill "visible" first, from the photographs alone, before judging any
   "cause":     "the most probable reason for the behaviour, 1-2 sentences, or \\"cannot be determined\\"",
   "assessment": "supported | contradicted | insufficient",
   "confidence": 0.0,
-  "summary":   "one sentence an officer could paste into a notice"
+  "summary":   "one sentence an officer could paste into a notice",
+  "other_cameras": "what the other cameras add, if anything, or \\"nothing\\" - and \\"not applicable\\" when none were given"
 }}
 
 Choosing "assessment":
@@ -195,6 +196,7 @@ class Explanation:
     assessment: str = "insufficient"
     confidence: float = 0.0
     visible: str = ""                # what the model says it can actually see, written before it judged
+    other_cameras: str = ""          # what the vehicle's passes on other cameras added
     present: bool = True             # could it identify the vehicle the case is about?
     downgraded: str = ""             # why the verdict was overruled here, if it was
     pre_event: str = ""
@@ -281,6 +283,35 @@ def describe_facts(violation):
     return "\n".join(lines) or "- no further measurements recorded"
 
 
+def describe_journey(violation):
+    """The same vehicle seen by other cameras, written out for the prompt.
+
+    This is what one camera cannot tell you. A bus halted for forty seconds reads very differently when the
+    camera before it also had it crawling - that is a jam it was caught in - than when it came through the
+    previous junction at speed and then stopped dead. The model is given the passes and told what they do
+    and do not establish, because the link itself is an inference and may be wrong."""
+    passes = violation.get("journey") or []
+    if len(passes) < 2:
+        return ""
+    here = violation.get("camera_id")
+    lines = []
+    prev_t = None
+    for p in passes:
+        when = p.get("wall_time") or (f"{p['t_cross']:.0f}" if p.get("t_cross") else "?")
+        gap = f", {p['t_cross'] - prev_t:.0f} s later" if prev_t and p.get("t_cross") else ""
+        mark = "  <- this case" if p.get("camera_id") == here else ""
+        speed = f"{(p.get('speed') or 0) * 3.6:.0f} km/h"
+        lines.append(f"- camera \"{p.get('camera_name', p.get('camera_id'))}\""
+                     f"{' (' + p['camera_location'] + ')' if p.get('camera_location') else ''}: "
+                     f"{speed}{gap}{mark}")
+        prev_t = p.get("t_cross")
+    return ("\n\nTHE SAME VEHICLE ON OTHER CAMERAS\n"
+            "The system believes these are the same vehicle, matched on where and when it crossed, its\n"
+            "speed, size, class and colour. That match is an inference and can be wrong, so treat it as\n"
+            "supporting context, never as proof, and say so if it is what your explanation rests on.\n"
+            + "\n".join(lines))
+
+
 def build_prompt(violation, images):
     code = (violation.get("code") or "").upper()
     claim, innocent = RULE_CLAIM.get(code, ("The system flagged this vehicle.", "Nothing visible supports it."))
@@ -288,7 +319,8 @@ def build_prompt(violation, images):
     subject = (violation.get("cls") or "vehicle").lower()
     return USER_TEMPLATE.format(vid=violation.get("id", "?"), code=code or "?",
                                 title=violation.get("title") or "", claim=claim, innocent=innocent,
-                                facts=describe_facts(violation), photos=photos, subject=subject)
+                                facts=describe_facts(violation), journey=describe_journey(violation),
+                                photos=photos, subject=subject)
 
 
 # ---------------------------------------------------------------- parsing
@@ -321,7 +353,7 @@ def to_explanation(obj, model, backend, seconds, images, subject=""):
     if not obj:
         ex.ok, ex.error = False, "the model did not return usable JSON"
         return ex
-    for k in ("pre_event", "event", "aftermath", "cause", "summary", "visible"):
+    for k in ("pre_event", "event", "aftermath", "cause", "summary", "visible", "other_cameras"):
         val = obj.get(k)
         setattr(ex, k, " ".join(str(val).split())[:600] if val not in (None, "") else "")
     a = str(obj.get("assessment", "")).strip().lower()

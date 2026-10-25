@@ -147,6 +147,99 @@ class RefusalTests(unittest.TestCase):
         self.assertEqual(reid.unidentifiable(src, P, {("hist", "other"): off, ("lab", "other"): off}), set())
 
 
+class SingleClassTests(unittest.TestCase):
+    """Dhaka traffic is dominated by one class, so a matcher that only works on a varied fleet is no use
+    here. The flow gate used to be the sharpness of the transit-distance peak, which is biased against
+    exactly this: when every vehicle is the same class every pair is a candidate, the histogram background
+    rises, and a correct route scored 4.1 sigma and was discarded while explaining 138 pairs against 68."""
+
+    def test_a_single_class_stream_is_still_matched(self):
+        tracklets, truth = traffic(seed=0, n=90, classes=["CNG"])
+        n, correct, prec, rec, _ = score(tracklets, truth)
+        self.assertGreater(n, 30, "a one-class stream produced almost no links")
+        self.assertGreaterEqual(prec, 0.9)
+
+    def test_the_route_is_found_at_the_right_distance(self):
+        tracklets, _ = traffic(seed=0, n=90, classes=["CNG"], gap=120.0)
+        flows, _ = reid.discover_flows(tracklets, log=lambda m: None)
+        self.assertTrue(flows, "no route discovered in single-class traffic")
+        self.assertAlmostEqual(flows[0].gap_m, 120.0, delta=25.0)
+
+    def test_a_fixed_distance_explains_a_real_route_better_than_a_fixed_delay(self):
+        """The physics the route test rests on: vehicles that really travel between two cameras all cover
+        the same distance, so a fast one arrives sooner. Streams that merely overlap in time share a delay
+        instead. Built both ways from the same speeds, the evidence must point opposite ways."""
+        rng = np.random.default_rng(0)
+        t0 = np.cumsum(rng.normal(1.0, 0.3, 80))
+        speeds = rng.uniform(4.0, 16.0, 80)         # a wide speed spread is what separates the two models
+        src = [Tracklet(1, i, "Car", float(t), 2.0, float(v), "outgoing")
+               for i, (t, v) in enumerate(zip(t0, speeds))]
+
+        # a real route: 120 m covered, so the delay is 120/v and differs vehicle by vehicle
+        route_dst = [Tracklet(2, 100 + i, "Car", a.t_cross + 120.0 / a.speed, 8.0, a.speed, "incoming")
+                     for i, a in enumerate(src)]
+        # a coincidence: everything reappears 8 s later however fast it was going
+        delay_dst = [Tracklet(2, 200 + i, "Car", a.t_cross + 8.0, 8.0, a.speed, "incoming")
+                     for i, a in enumerate(src)]
+
+        g1, _ = reid.gap_peak(src, route_dst)
+        _, route_r, delay_r = reid.is_a_route(src, route_dst, g1)
+        g2, _ = reid.gap_peak(src, delay_dst)
+        _, route_d, delay_d = reid.is_a_route(src, delay_dst, g2)
+        self.assertGreater(route_r / max(delay_r, 1), route_d / max(delay_d, 1),
+                           "a genuine route must look more like a fixed distance than a coincidence does")
+
+
+class EmbeddingTests(unittest.TestCase):
+    """The appearance vector exists for one case: a fleet whose colour is identical. Without it that fleet
+    is refused outright (correctly); with it, the vehicles can be told apart again."""
+
+    def fleet(self, seed, noise=None, headway=1.2, n=90):
+        tracklets, truth = traffic(seed=seed, n=n, headway=headway, classes=["CNG"], identical=True)
+        if noise is None:
+            return tracklets, truth
+        rng = np.random.default_rng(seed)
+        vecs = {}
+        for a, b in truth.items():
+            v = rng.normal(size=576)
+            v /= np.linalg.norm(v)
+            w = v + rng.normal(0, noise, 576)
+            w /= np.linalg.norm(w)
+            vecs[a], vecs[b] = v.astype(np.float32), w.astype(np.float32)
+        for t in tracklets:
+            if id(t) in vecs:
+                t.embed = vecs[id(t)]
+            else:
+                v = rng.normal(size=576)
+                t.embed = (v / np.linalg.norm(v)).astype(np.float32)
+        return tracklets, truth
+
+    def test_identical_colour_is_refused_without_a_vector(self):
+        n, _, _, _, _ = score(*self.fleet(0, noise=None))
+        self.assertEqual(n, 0)
+
+    def test_a_vector_recovers_an_identical_colour_fleet(self):
+        n, correct, prec, rec, _ = score(*self.fleet(0, noise=0.35))
+        self.assertGreater(n, 40, "the appearance vector bought nothing")
+        self.assertGreaterEqual(prec, 0.9)
+
+    def test_the_vector_is_carried_through_the_cost_model(self):
+        a = Tracklet(1, 1, "Car", 0.0, 2.0, 8.0, "outgoing", 1.7)
+        b = Tracklet(2, 2, "Car", 15.0, 8.0, 8.0, "incoming", 1.7)
+        v = np.zeros(576, np.float32)
+        v[0] = 1.0
+        a.embed, b.embed = v, v
+        P = dict(reid.default_params(120.0), l_a=10.0)
+        self.assertAlmostEqual(reid.pair_terms(a, b, P)["embed"], 1.0, places=5)
+
+    def test_matching_still_works_when_only_some_have_vectors(self):
+        tracklets, truth = self.fleet(0, noise=0.35)
+        for t in tracklets[::3]:
+            t.embed = None                       # a camera that could not embed, mixed with ones that could
+        n, correct, prec, _, _ = score(tracklets, truth)
+        self.assertGreaterEqual(prec, 0.85)
+
+
 class CostTests(unittest.TestCase):
     def tl(self, **kw):
         base = dict(camera_id=1, track_id=1, cls="Car", t_cross=0.0, lateral=2.0, speed=8.0,
@@ -239,11 +332,26 @@ class SignatureTests(unittest.TestCase):
         self.assertGreater(reid.colour_similarity(a, b)[0], reid.colour_similarity(a, c)[0])
         self.assertGreater(reid.colour_similarity(a, b)[1], reid.colour_similarity(a, c)[1])
 
+    def test_an_embedding_separates_vehicles_when_present(self):
+        from surveillance.embed import Embedder, similarity
+        red = [np.full((70, 50, 3), (30, 30, 200), np.uint8) for _ in range(3)]
+        blue = [np.full((70, 50, 3), (200, 30, 30), np.uint8) for _ in range(3)]
+        a, b, c = Embedder.encode(red), Embedder.encode(red), Embedder.encode(blue)
+        if a is None:
+            self.skipTest("embedding weights not available offline")
+        self.assertEqual(a.shape, (576,))
+        self.assertAlmostEqual(float(np.linalg.norm(a)), 1.0, places=3)
+        self.assertGreater(similarity(a, b), similarity(a, c))
+
+    def test_a_missing_embedding_is_just_a_missing_cue(self):
+        from surveillance.embed import similarity
+        self.assertTrue(np.isnan(similarity(None, np.zeros(576, np.float32))))
+
     def test_missing_signatures_are_not_fatal(self):
         a = Tracklet(1, 1, "Car", 0, 0, 8, "outgoing")
         b = Tracklet(2, 2, "Car", 0, 0, 8, "incoming")
-        h, lab = reid.colour_similarity(a, b)
-        self.assertTrue(np.isnan(h) and np.isnan(lab))
+        h, lab, emb = reid.colour_similarity(a, b)
+        self.assertTrue(np.isnan(h) and np.isnan(lab) and np.isnan(emb))
 
     def test_a_tiny_crop_yields_no_signature(self):
         self.assertIsNone(reid.hsv_hist(np.zeros((3, 3, 3), np.uint8)))

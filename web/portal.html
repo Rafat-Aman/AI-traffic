@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>My violations · Dhaka Traffic Surveillance</title>
+<link rel="stylesheet" href="/static/app.css">
+<style>
+  .p-wrap { max-width: 900px; margin: 0 auto; padding: 18px 16px 60px; }
+  .p-head { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; flex-wrap: wrap; }
+  .p-head h1 { font-size: 20px; margin: 0; }
+  .p-note { font-size: 12.5px; color: var(--text-muted); line-height: 1.55; margin-bottom: 16px; }
+  .plate { display: inline-flex; align-items: center; gap: 7px; padding: 5px 10px; border-radius: 6px;
+           background: var(--surface-3); font-weight: 600; font-size: 13px; }
+  .plate.pending { opacity: .62; font-weight: 400; }
+  .plates { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .case { display: grid; grid-template-columns: 148px 1fr; gap: 14px; padding: 14px 0;
+          border-top: 1px solid var(--border); cursor: pointer; }
+  .case:first-child { border-top: 0; }
+  .case img { width: 148px; height: 100px; object-fit: cover; border-radius: 7px; background: var(--surface-3); }
+  .case h3 { margin: 0 0 3px; font-size: 14.5px; }
+  .case .meta { font-size: 12.5px; color: var(--text-muted); line-height: 1.6; }
+  .ev { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; margin: 12px 0; }
+  .ev img, .ev video { width: 100%; border-radius: 8px; background: #000; }
+  .ev figcaption { font-size: 11.5px; color: var(--text-muted); margin-top: 4px; }
+  @media (max-width: 560px) { .case { grid-template-columns: 1fr; } .case img { width: 100%; height: 170px; } }
+</style></head>
+<body><div class="p-wrap">
+  <div class="p-head">
+    <h1>My violations</h1><span class="spacer" style="flex:1"></span>
+    <span class="small muted" id="who"></span>
+    <button class="btn small" id="out">Sign out</button>
+  </div>
+  <div id="body"><div class="card empty">Loading…</div></div>
+</div>
+<script>
+(() => {
+  const $ = (s, r = document) => r.querySelector(s);
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const media = (p) => p ? "/media/" + p.split("/").map(encodeURIComponent).join("/") : "";
+  const api = async (u, o) => {
+    const r = await fetch(u, { headers: { "Content-Type": "application/json" }, ...o });
+    if (r.status === 401) { location.href = "/login"; throw new Error("signed out"); }
+    let d = {}; try { d = await r.json(); } catch (e) { /* empty */ }
+    if (!r.ok) throw new Error(d.detail || r.statusText);
+    return d;
+  };
+  const when = (v) => v.wall_time || (v.video_time_s != null ? `${(+v.video_time_s).toFixed(0)} s into the recording` : "");
+
+  $("#out").onclick = async () => { await api("/api/logout", { method: "POST" }); location.href = "/login"; };
+
+  async function load() {
+    const me = await api("/api/me");
+    $("#who").textContent = me.name || me.licence_no || "";
+    const r = await api("/api/portal/violations");
+    const vehicles = r.vehicles || [];
+    const plates = vehicles.map((v) => `<span class="plate${v.verified ? "" : " pending"}">${esc(v.plate_en || v.plate_key)}${
+      v.verified ? "" : " · awaiting verification"}</span>`).join("");
+
+    $("#body").innerHTML = `
+      <div class="card">
+        <div class="card-head"><h2>My vehicles</h2></div>
+        <div class="plates">${plates || '<span class="muted small">No vehicles registered yet.</span>'}</div>
+        <div class="row">
+          <input id="plate" placeholder="Add a number plate, e.g. DHAKA METRO-GA 12-3456" style="flex:1">
+          <button class="btn" id="add">Add</button>
+        </div>
+        <div class="small muted" style="margin-top:7px">A vehicle you add shows nothing until the traffic
+          authority has verified that it is yours.</div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Violations</h2><span class="spacer" style="flex:1"></span>
+          <span class="small muted">${r.total} case${r.total === 1 ? "" : "s"}</span></div>
+        <div class="p-note">${esc(r.note)}</div>
+        <div id="cases">${r.items.length ? r.items.map(card).join("")
+          : '<div class="empty">No violations recorded against your registered vehicles.</div>'}</div>
+      </div>`;
+
+    $("#add").onclick = async () => {
+      const plate = $("#plate").value.trim();
+      if (!plate) return;
+      try { const res = await api("/api/portal/vehicles", { method: "POST", body: JSON.stringify({ plate }) });
+            alert(res.message || "Added."); load(); } catch (e) { alert(e.message); }
+    };
+    document.querySelectorAll(".case").forEach((el) => el.onclick = () => detail(+el.dataset.id));
+  }
+
+  const card = (v) => `<div class="case" data-id="${v.id}">
+      <img src="${media(v.crop || v.snapshot)}" alt="" loading="lazy">
+      <div><h3>${esc(v.title)}</h3>
+        <div class="meta">${esc(when(v))}${v.camera ? " · " + esc(v.camera) : ""}<br>
+          ${esc(v.cls || "")}${v.plate_text_en ? " · " + esc(v.plate_text_en) : ""}
+          ${v.kph != null ? " · " + Math.round(v.kph) + " km/h" : ""}</div></div></div>`;
+
+  async function detail(id) {
+    const v = await api(`/api/portal/violation/${id}`);
+    const items = [];
+    if (v.snapshot) items.push([media(v.snapshot), "The scene, with the vehicle outlined", "img"]);
+    if (v.crop) items.push([media(v.crop), "Close-up", "img"]);
+    (v.evidence || []).forEach((e) => items.push([media(e.path), e.label, "img"]));
+    if (v.plate_img) items.push([media(v.plate_img), "Number plate as read", "img"]);
+    if (v.clip) items.push([media(v.clip), "Video clip around the event", "video"]);
+    const x = v.vlm || {};
+    $("#body").innerHTML = `<div class="card">
+      <div class="card-head"><button class="btn small" id="back">&larr; Back</button>
+        <span class="spacer" style="flex:1"></span><span class="small muted">Case TV-${v.id}</span></div>
+      <h2 style="margin:10px 0 2px">${esc(v.title)}</h2>
+      <div class="meta small muted">${esc(when(v))}${v.camera ? " · " + esc(v.camera) : ""}
+        ${v.plate_text_en ? " · " + esc(v.plate_text_en) : ""}</div>
+      <div class="ev">${items.map(([src, cap, kind]) => `<figure style="margin:0">${
+        kind === "video" ? `<video src="${src}" controls muted playsinline preload="metadata"></video>`
+                         : `<img src="${src}" alt="${esc(cap)}" loading="lazy">`}
+        <figcaption>${esc(cap)}</figcaption></figure>`).join("")}</div>
+      ${x.summary ? `<div class="card" style="background:var(--surface-2)">
+        <div class="small"><b>What the system recorded</b></div>
+        <div class="small secondary" style="margin-top:5px">${esc(x.summary)}</div>
+        <div class="small muted" style="margin-top:7px">Written automatically from the images above. The
+          images and the video are the evidence; this description is a summary of them.</div></div>` : ""}
+      <div class="small muted" style="margin-top:14px">If you believe this is wrong — the plate was misread,
+        or the vehicle is not yours — contact the traffic authority quoting case TV-${v.id}.</div>
+    </div>`;
+    $("#back").onclick = load;
+  }
+
+  load().catch((e) => { $("#body").innerHTML = `<div class="card errors">${esc(e.message)}</div>`; });
+})();
+</script></body></html>

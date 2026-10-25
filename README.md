@@ -158,17 +158,108 @@ suggestion to check on the image: the training plates only cover Dhaka, Khulna a
 35-100 px wide and blurred, so every plate is (correctly) reported unreadable. To read plates, use a camera that
 sees 1-2 lanes so plates are at least 120 px wide.
 
+## Accounts: who can see what
+
+Everything the dashboard exposes used to be open to anyone who could reach the port - the review queue, the
+camera list, and a CSV of every case with its number plate. There are now three kinds of account.
+
+| Role | Sees | Does |
+|---|---|---|
+| **Driver** | Only violations against vehicles registered to them | Views the evidence, adds a plate to claim |
+| **Traffic controller** | Review queue, cameras, statistics, cross-camera vehicles | Confirms or rejects cases, runs *Explain*, prints notices |
+| **Administrator** | Everything | Cameras, zones, accounts, the vehicle registry, the activity log |
+
+Each lands on its own surface: staff on the dashboard, drivers on `/portal`, everyone else at `/login`.
+The driver portal is a **separate page**, not a filtered dashboard, so there is no state in which the wrong
+thing can be shown to the wrong person.
+
+### Signing in
+
+Staff use a username and password. **Drivers use their driving licence number and a one-time code sent to
+the mobile registered against it**, and that distinction is the point: a licence number is printed on a
+card, handed to police and copied onto rental forms. It identifies a person but keeps no secret. On its own
+it would let anyone who has seen a licence read that person's violation history, and licence numbers are
+regular enough to walk through one by one.
+
+So the licence number only says *who is being asked about*; the code is what authenticates. Both paths are
+rate limited, and the reply to a code request is **word-for-word identical** whether or not the licence
+exists - otherwise the endpoint answers "does this person hold a licence?", which is the question it is
+meant to refuse. That is pinned in `tests/test_auth.py`, because the first version did leak it: it returned
+a masked phone number for a licence that existed and nothing for one that did not.
+
+There is no SMS gateway wired up. By default the code is written to the server log for an operator to read
+out. `OTP_DELIVERY=echo` also returns it in the response so the login page can display it, which is useful
+for a demonstration and must never be set on a hosted instance - it warns about itself every time.
+
+### First run
+
+A database with no accounts gets an administrator, whose password is printed to the console once:
+
+```
+  No accounts existed, so an administrator has been created:
+      username  admin
+      password  NAldYyi3uXc38t3d
+  This is shown once. Sign in and change it.
+```
+
+Set `ADMIN_USER` / `ADMIN_PASSWORD` to choose them instead. Change the password from the dashboard; doing so
+ends every session on that account.
+
+### Registering a vehicle to a driver
+
+A driver only sees cases for plates **verified** as theirs, because the system reads plates rather than
+drivers. Two routes in, and the portal says as much to the driver: a case shows the vehicle that was
+involved, not who was at the wheel.
+
+* an administrator links a plate to a licence under **Accounts → Vehicles**, standing in for the registry
+  import a real deployment would do;
+* a driver claims a plate in their portal, which shows nothing until an administrator verifies it -
+  otherwise claiming a plate would be enough to read its owner's record.
+
+### Who decided what
+
+Every confirm, reject, registration, verification and sign-in is written to an activity log with the name
+of whoever did it, visible under **Accounts → Activity**. A case with nobody's name on it is not evidence
+of anything. The name is stored alongside the account id and survives the account being closed, so
+attribution cannot go missing later.
+
+### What this does not do yet
+
+There is **no dispute flow**: a driver who believes a plate was misread has to contact the authority out of
+band, and the portal tells them so. Everything it needs is in place - the case, the evidence and the
+audit trail - so it is a contained addition rather than a redesign.
+
+Sessions and rate limits live in this process's memory and in SQLite, which suits one server. Behind
+several workers, the rate limiter needs to move to Redis or the database, or each worker will allow the
+full quota on its own.
+
 ## The same vehicle on another camera
 
 Each camera's tracker numbers vehicles independently, so track 7 here has nothing to do with track 7 two
 junctions away. **Vehicles** in the dashboard links them into one identity, so a journey across the city is
 a query rather than a pile of separate per-camera logs.
 
-Every vehicle that passes a camera is summarised as a *tracklet*: when and where it crossed the zone's
-reference line, in metres across the carriageway and seconds on the wall clock, with its speed, physical
-width, class, and a colour signature taken from its clearest frames. Matching then happens **in metres on
-the road plane**, which is the whole trick - it is the same physics at every camera, so nothing has to be
-hand-configured per site:
+### Using it
+
+1. **Vehicles → Add camera views.** Pick every video of the same junction or stretch of road at once. Each
+   becomes its own camera; they are analysed one after another (the detector already uses every core, so
+   running them together would only halve each other's speed) and matched at the end.
+   Recording times are read from the file names where possible - `VID_20260922_173615.mp4` and most NVR
+   exports - which is what puts the cameras on a common clock. Matching is most accurate when the clips
+   overlap in real time.
+2. Watch the progress bar. Each camera learns its road layout automatically, then analyses.
+3. When the last one finishes, matching runs by itself. Afterwards, **Match vehicles across cameras**
+   re-runs it whenever you add more footage.
+4. Click any vehicle for its journey: every camera it passed, in order, with the time between them.
+
+Already have cameras set up? Just press **Match vehicles across cameras**. Nothing else is needed.
+
+### How a vehicle is recognised
+
+Every pass is summarised as a *tracklet*: when and where it crossed the zone's reference line, in metres
+across the carriageway and seconds on the wall clock, with its speed, physical width, class, a colour
+signature, and a 576-number appearance vector. Matching happens **in metres on the road plane**, which is
+the whole trick - it is the same physics at every camera, so nothing is configured per site:
 
 | Evidence | Where it comes from |
 |---|---|
@@ -177,35 +268,52 @@ hand-configured per site:
 | Lateral position maps linearly | learned per route, mirrored when cameras face opposite ways |
 | Speed and physical width agree | the homography this project already uses for speed |
 | Colour | HSV histogram + CIELAB of the body — or of the **rider's clothing** on a two-wheeler |
+| Appearance vector | MobileNetV3 features over the clearest crops (`surveillance/embed.py`) |
 
 Each cue becomes a log-likelihood ratio **fitted from the confident matches themselves**, so no threshold is
-guessed, and the assignment is one-to-one: leaving a vehicle unmatched has a cost, because most traffic at a
-junction never reaches the next camera, and forcing pairs is how a matcher invents journeys.
+guessed and a cue that fails to separate is switched off automatically. The assignment is one-to-one, and
+leaving a vehicle unmatched has a cost — most traffic at a junction never reaches the next camera, and
+forcing pairs is how a matcher invents journeys. Routes are discovered automatically; nobody describes the
+camera layout.
 
-Routes are discovered automatically — nobody describes the camera layout. Press **Match vehicles across
-cameras** once two cameras have been analysed.
+### Does the appearance vector earn its place?
 
-### Two paths, as a deployment needs
+It is **not** a vehicle re-identification model — MobileNetV3 was trained on ImageNet, not on telling one
+car from another. Measured on real footage from this project with `tools/reid_eval.py`, which splits each
+vehicle's crops into an early and a late half and asks whether the halves match each other better than they
+match other vehicles:
 
-* **online** — a tracklet is linked the moment its vehicle leaves view, using routes already learned. It
-  only answers when the best candidate clearly beats the next, because a wrong link on a dashboard is worse
-  than a blank.
-* **batch** — the *Match vehicles* button reconsiders every tracklet at once. More accurate, because a
-  vehicle's speed, width and colour are only final once it has left. It corrects the online guesses, and is
-  the result to quote. `link_source` on each pass records which path set it.
+| Cue | Same vehicle | Different | Separation | Rank-1 |
+|---|---|---|---|---|
+| Colour histogram | +0.927 | +0.584 | 2.37 | 61.3% |
+| CIELAB colour | −0.696 | −3.238 | 2.12 | 38.7% |
+| **Appearance vector** | +0.866 | +0.522 | **2.52** | **71.0%** |
+
+So it is the strongest single appearance cue here, and on a fleet whose colour is identical it is the
+difference between refusing and matching:
+
+| Identical-colour fleet | Links | Precision | Recall |
+|---|---:|---:|---:|
+| Colour only | 0 | — | *refuses* |
+| **+ appearance vector** | 90 | **98.2%** | **98.5%** |
+
+Proper ReID weights would be better and would drop straight in — the interface would not change — but they
+want a GPU and a labelled vehicle corpus, and this project has neither.
 
 ### When it refuses, and why that matters
 
-Dhaka's fleet includes a great many near-identical green CNG auto-rickshaws, and appearance is close to
-useless for them. Three safeguards exist because the matcher **failed these cases in testing**, not because
-they were anticipated:
+Four safeguards exist because the matcher **failed these cases in testing**, not because they were
+anticipated:
 
 1. **A flow is never taken in both directions.** A dense stream of look-alikes produces a reverse peak too;
    accepting it linked every vehicle backwards.
-2. **Routes are ranked by how much traffic a fixed distance explains**, not by how sharp the peak is. A
-   spurious backwards peak scored 12.5σ against the true route's 8.6σ while explaining 88 pairs against its
-   232 — ranking by sharpness picked the wrong one.
-3. **A class is refused outright** when colour carries no information *and* its vehicles arrive closer
+2. **Routes are gated and ranked on how much traffic a fixed distance explains**, not on how sharp the peak
+   is. Sharpness is biased against single-class traffic — which is most Dhaka roads: a correct 121 m route
+   explaining 138 pairs against a fixed delay's 68 scored only 4.1σ and was discarded. Fixing this took
+   recall on an all-CNG stream from 0% to 90%.
+3. **A route must beat a fixed delay.** Two streams that merely overlap in time share a *delay*; vehicles
+   that really travel share a *distance*, so a fast one arrives sooner.
+4. **A class is refused outright** when no appearance cue separates it *and* its vehicles arrive closer
    together than the timing can resolve. Then vehicle *k* and *k+1* explain the same arrival equally well,
    and the matcher can be confidently, systematically wrong.
 
@@ -215,17 +323,18 @@ matcher, so read these as a floor, not a result):
 | Traffic | Linked | Precision | Recall |
 |---|---:|---:|---:|
 | Mixed classes, 1.2 s headway | 99 | **99.3%** | 98.7% |
-| Half near-identical CNGs | 66 | **99.0%** | 65.3% |
-| All CNGs, normal and dense | 0 | — | *refuses* |
-| **Identical fleet, any density** | **0** | — | *refuses* |
-| Single class, distinct colours, jam | 100 | **100%** | 100% |
+| Half near-identical CNGs | 97 | **99.3%** | 96.7% |
+| All CNGs, 1.2 s headway | 91 | **99.3%** | 90.0% |
+| All CNGs, dense 0.5 s | 78 | **95.3%** | 74.3% |
+| **Identical fleet, no vector** | **0** | — | *refuses* |
 
 Recall falls before precision does, which is the intended trade: an unlinked vehicle is a gap, a wrongly
-linked one is a false journey attached to a plate.
+linked one is a false journey attached to a plate. Flow discovery also needs enough traffic — around 60
+vehicles per camera in testing; below that it links nothing rather than guessing.
 
 **Not validated on real footage yet.** There is no hand-labelled cross-camera ground truth for this project,
-so the figures above are synthetic. The team's own two-camera footbridge study is the dataset to check this
-against.
+so the matching figures above are synthetic. The team's own two-camera footbridge study is the dataset to
+check them against.
 
 ## Explaining a case (vision-language model)
 
@@ -253,7 +362,14 @@ notice is worse than no explanation, so an unparsable or unrecognised answer deg
 evidence", never to agreement.
 
 The model never detects anything. Detection, tracking, speed and the rule decision are done already and are
-handed to it as given facts; it reads the evidence photographs and judges. That is also why a 3B model is
+handed to it as given facts; it reads the evidence photographs and judges.
+
+**It is also told where else that vehicle was seen.** Once cameras are linked, a case carries the vehicle's
+whole journey into the prompt, and that changes what can be said about it: a bus halted for forty seconds
+reads very differently when the camera before it also had it crawling — a jam it was caught in — than when
+it came through the previous junction at speed and then stopped dead. The explanation gets an **Other
+cameras** line when that evidence actually contributed. The link is itself an inference, and the model is
+told to treat it as supporting context rather than proof. That is also why a 3B model is
 enough: it is not being asked to find vehicles, only to explain them.
 
 ### Setting it up
@@ -369,10 +485,14 @@ models/vlm/             vision-language weights (git-ignored; ./tools/setup_vlm.
 training/               scripts and labels to rebuild / re-measure the helmet and plate models
 surveillance/           video sources, detector, per-frame pipeline, clips, SQLite store, workers, web API
 surveillance/vlm.py       the reasoner: prompts, backends, the decline rule, the background queue
+surveillance/auth.py      password and code hashing, rate limits, what each role may do
+surveillance/webauth.py   sessions, the route guards, first-run administrator
 surveillance/reid.py      cross-camera Re-ID: tracklets, colour signatures, route discovery, matching
-surveillance/link.py      batch and online linking into global vehicle ids
+surveillance/embed.py     the appearance vector per vehicle
+surveillance/link.py      batch and online linking, and multi-video site runs
+tools/reid_eval.py        does appearance actually separate vehicles on this footage?
 tools/                  setup_vlm.sh, vlm_server.sh, vlm_check.py (hardware + cost check)
-web/                    dashboard (HTML/CSS/JS, no build step)
+web/                    dashboard, plus login.html (sign-in) and portal.html (a driver's own cases)
 tests/                  unit tests:  .venv/bin/python -m unittest discover -s tests
 data/                   database, uploaded videos, evidence (created at runtime)
 vehicle_tracker.py, speed_tracker.py   original scripts (still work)

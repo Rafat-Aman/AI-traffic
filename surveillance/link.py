@@ -38,6 +38,7 @@ def to_tracklet(row):
         id=row["id"], global_id=row["global_id"])
     t.hist = np.frombuffer(row["hist"], np.float32) if row["hist"] else None
     t.lab = np.frombuffer(row["lab"], np.float32) if row["lab"] else None
+    t.embed = np.frombuffer(row["embed"], np.float32) if row.get("embed") else None
     return t
 
 
@@ -166,3 +167,62 @@ class OnlineLinker:
             pairs.append((other.id, gid))
         self.store.set_global_ids(pairs, source="online")
         return gid
+
+
+class SiteRun(threading.Thread):
+    """Several videos of one place, taken through the whole pipeline and then linked together.
+
+    Runs the cameras one after another. The detector already saturates every core, so two analyses at once
+    would halve each other's frame rate without finishing any sooner; and linking needs every camera's
+    tracklets anyway, so there is nothing to gain by overlapping them. When the last one is done the batch
+    link runs, and the online linker picks up the routes it learned.
+    """
+
+    def __init__(self, manager, store, cameras, zone_mode="auto", notify=None, linker=None):
+        super().__init__(daemon=True, name="site")
+        self.manager, self.store, self.cameras = manager, store, list(cameras)
+        self.zone_mode, self.linker = zone_mode, linker
+        self.notify = notify or (lambda m: None)
+        self.status = {"state": "queued", "message": "Waiting to start...", "done": [], "current": None,
+                       "total": len(self.cameras)}
+        self.result = None
+
+    def _set(self, **kw):
+        self.status.update(kw)
+        self.notify({"type": "site", "status": dict(self.status), "cameras": self.cameras})
+
+    def _wait_while(self, check, timeout=24 * 3600, poll=2.0):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if not check():
+                return True
+            time.sleep(poll)
+        return False
+
+    def run(self):
+        try:
+            for n, cid in enumerate(self.cameras, 1):
+                cam = self.store.camera(cid)
+                label = cam["name"] if cam else f"camera {cid}"
+                if self.zone_mode == "auto":
+                    self._set(state="learning", current=cid,
+                              message=f"[{n}/{len(self.cameras)}] learning the road layout of {label}...")
+                    # start_autozone applies the zones and starts the analysis itself when it finishes
+                    self.manager.start_autozone(cid, apply=True, start_after=True)
+                    self._wait_while(lambda: self.manager.learning(cid))
+                else:
+                    self.manager.start(cid)
+                self._set(state="analysing", current=cid,
+                          message=f"[{n}/{len(self.cameras)}] analysing {label}...")
+                time.sleep(2.0)                      # let the worker register before we watch for it
+                self._wait_while(lambda: self.manager.running(cid))
+                self.status["done"].append(cid)
+
+            self._set(state="linking", current=None, message="Matching vehicles across the cameras...")
+            self.result = run_linking(self.store, log=lambda m: None)
+            if self.linker:
+                self.linker.learn_from()
+            self._set(state="done", message=self.result["message"])
+        except Exception as e:
+            traceback.print_exc()
+            self._set(state="error", message=str(e) or type(e).__name__)

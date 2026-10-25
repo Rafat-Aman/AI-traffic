@@ -6,6 +6,7 @@
 | `helmet_cls.pt` / `.mlpackage` | Is anyone on this motorbike bare-headed? (image classifier) | V6 |
 | `plate_detector.onnx` | Number-plate detection | plate reading |
 | `bd_plate_chars.pt` | Bangla plate character detection (digits, city, "metro", class letter) | plate reading |
+| MobileNetV3-Small (torchvision, cached in `~/.cache/torch`) | The appearance vector used to recognise a vehicle on another camera | cross-camera Re-ID |
 | `vlm/Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf` + `vlm/mmproj-*.gguf` | Explaining a case: what happened, why, and whether the photographs support the finding | **Explain** button |
 
 All numbers below were measured on data **not used for training or threshold tuning**, unless stated otherwise.
@@ -190,3 +191,34 @@ often it declines on cases a reviewer could settle, and the same for the cloud b
 **Cost on the development machine** (Intel i5-11400H, 6 cores, AVX-512/VNNI, no usable GPU): **4.7 GB**
 resident while the server runs, and **~110 s** per case at the default two 768-px photographs (15-60 s with
 one). `tools/vlm_check.py` measures both on any machine.
+
+
+---
+
+## Appearance vector for cross-camera Re-ID (`surveillance/embed.py`)
+
+**Model:** torchvision's `mobilenet_v3_small`, ImageNet weights (2.5M parameters, ~10 MB, fetched to
+`~/.cache/torch` on first use). The 576-dimension penultimate feature is averaged over a vehicle's clearest
+crops and L2-normalised. It runs once per vehicle when it leaves view - about 90 ms for six crops on the
+development CPU - and never on the per-frame path.
+
+**It is not a vehicle re-identification model.** It was trained to name a thousand kinds of object, not to
+tell one car from another car. Nothing here claims otherwise. It is used because the matcher scores every
+cue by a log-likelihood ratio fitted from the traffic itself, so a cue that does not separate is switched
+off automatically: the vector can only help where it carries signal.
+
+**Measured on this project's own footage** (`tools/reid_eval.py`, 62 vehicles, each vehicle's early crops
+against its late crops and against every other vehicle):
+
+| Cue | Same vehicle | Different vehicles | Separation | Rank-1 |
+|---|---|---|---|---|
+| Colour histogram | +0.927 | +0.584 | 2.37 | 61.3% |
+| CIELAB colour | -0.696 | -3.238 | 2.12 | 38.7% |
+| **Appearance vector** | +0.866 | +0.522 | **2.52** | **71.0%** |
+
+So on real Dhaka traffic it is the strongest single appearance cue, though none of them is decisive alone -
+geometry still does most of the identification, which is the point of matching in metres rather than pixels.
+
+**The upgrade path** is a trained ReID backbone (OSNet, ResNet50-IBN) in place of this one. `Embedder.encode`
+is the only thing that would change. That needs a GPU and a labelled vehicle corpus; the AI City Challenge
+work in the team's `models/` folder already has both and its weights would drop straight in.

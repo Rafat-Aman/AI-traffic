@@ -60,7 +60,14 @@ MIN_CROP_PX = 24
 # --- matching ---------------------------------------------------------------
 MAX_TERM = 8.0              # cap on any single cost term, so one bad cue cannot veto a pair
 CALIB_ITERS = 4
-MIN_FLOW_SIGNIFICANCE = 6.0  # sigma of the transit-distance peak; chance pairings reach about 3
+# A route has to explain clearly more pairs by a fixed distance than a fixed delay can. This replaced a
+# gate on the sharpness of the histogram peak, which was quietly biased against exactly the traffic this
+# project runs on: when every vehicle is the same class every pair is a candidate, so the background rises
+# and a real route scores few sigma. A single-class stream gave the correct 121 m route with 138 pairs
+# against a delay's 68 - overwhelming evidence - and 4.1 sigma, and was thrown away.
+MIN_ROUTE_RATIO = 1.5
+MIN_ROUTE_PAIRS = 20
+MIN_FLOW_SIGNIFICANCE = 0.0  # kept and reported, no longer a gate
 ACCEPT_COST = 9.0
 MIN_MARGIN = 1.0
 MAX_GAP_M = 300.0
@@ -117,11 +124,15 @@ def signature(crops, two_wheel):
 
 
 def colour_similarity(a, b):
-    """(histogram, lab) similarity of two signatures; NaN where either side is missing."""
+    """(histogram, lab, embedding) similarity of two signatures; NaN where either side is missing."""
     nan = float("nan")
     hist = (float(np.sum(np.sqrt(a.hist * b.hist))) if a.hist is not None and b.hist is not None else nan)
     lab = (-float(np.linalg.norm(a.lab - b.lab)) if a.lab is not None and b.lab is not None else nan)
-    return hist, lab
+    emb = nan
+    if getattr(a, "embed", None) is not None and getattr(b, "embed", None) is not None \
+            and a.embed.shape == b.embed.shape:
+        emb = float(np.dot(a.embed, b.embed))
+    return hist, lab, emb
 
 
 # ---------------------------------------------------------------- the tracklet
@@ -143,6 +154,7 @@ class Tracklet:
     id: Optional[int] = None         # row id once stored
     hist: Optional[np.ndarray] = None
     lab: Optional[np.ndarray] = None
+    embed: Optional[np.ndarray] = None     # appearance vector (surveillance.embed)
     plate: str = ""
     global_id: Optional[int] = None
 
@@ -254,6 +266,8 @@ def discover_flows(tracklets, min_significance=MIN_FLOW_SIGNIFICANCE,
                     f"explains {delay} pairs against {route} for a fixed distance - overlapping traffic, "
                     f"not a route")
                 continue
+            if route < MIN_ROUTE_PAIRS or route < MIN_ROUTE_RATIO * max(delay, 1):
+                continue
             # Strength is how much of the traffic a fixed distance actually explains, per vehicle present -
             # NOT the sharpness of the histogram peak. Sharpness ranks a narrow coincidence above a real
             # route: in testing a spurious backwards peak scored 12.5 sigma against the true flow's 8.6,
@@ -312,6 +326,9 @@ class LLR:
                 if self.ok else "off")
 
 
+OFF = LLR()       # the "this cue is switched off" singleton used when a cue is missing entirely
+
+
 def default_params(gap_m):
     return dict(gap=gap_m, t_sig0=0.4, t_sig1=0.1, l_a=0.0, l_b=-1.0, l_sig=1.0,
                 v_mu=0.0, v_sig=0.3, w_mu=0.0, w_sig=0.3)
@@ -348,15 +365,16 @@ def pair_terms(a, b, P, llr=None):
     def q(r):
         return min(0.5 * r * r, MAX_TERM)
 
-    hist, lab = colour_similarity(a, b)
+    hist, lab, emb = colour_similarity(a, b)
     g = a.group
     llr = llr if llr is not None else defaultdict(LLR)
-    t = dict(dt=dt, dt_pred=dt_pred, hist=hist, lab=lab,
+    t = dict(dt=dt, dt_pred=dt_pred, hist=hist, lab=lab, embed=emb,
              c_time=q(rt) + math.log(sig_t / P["t_sig0"]),
              c_lane=q(rl), c_speed=q(rv), c_size=q(rw),
-             c_hist=llr[("hist", g)].cost(hist), c_lab=llr[("lab", g)].cost(lab))
+             c_hist=llr[("hist", g)].cost(hist), c_lab=llr[("lab", g)].cost(lab),
+             c_embed=llr[("embed", g)].cost(emb))
     t["c_motion"] = t["c_time"] + t["c_lane"] + t["c_speed"] + t["c_size"]
-    t["c_colour"] = t["c_hist"] + t["c_lab"]
+    t["c_colour"] = t["c_hist"] + t["c_lab"] + t["c_embed"]
     t["cost"] = t["c_motion"] + t["c_colour"]
     return t
 
@@ -469,10 +487,11 @@ def refit(src, dst, matches, P):
         for j, b in enumerate(dst):
             if a.cls != b.cls:
                 continue
-            hist, lab = colour_similarity(a, b)
+            hist, lab, emb = colour_similarity(a, b)
             where = pos if (i, j) in matched else neg
             where[("hist", a.group)].append(hist)
             where[("lab", a.group)].append(lab)
+            where[("embed", a.group)].append(emb)
     for key in set(pos) | set(neg):
         llr[key] = LLR(pos.get(key), neg.get(key), weight=1.0)
     return P, llr
@@ -495,8 +514,9 @@ def unidentifiable(src, P, llr, ratio=0.5):
         if len(times) < 4:
             continue
         group = "2w" if cls in TWO_WHEEL else "other"
-        if llr[("hist", group)].ok or llr[("lab", group)].ok:
-            continue                                   # colour can still separate them
+        # .get, not [], so a plain dict works here as well as the defaultdict the matcher passes
+        if any(llr.get((cue, group), OFF).ok for cue in ("hist", "lab", "embed")):
+            continue                                   # some appearance cue can still separate them
         headway = float(np.median(np.diff(sorted(times))))
         sig_t = P["t_sig0"] + P["t_sig1"] * P["gap"] / 8.0    # at a typical 8 m/s
         if headway > 0 and sig_t > ratio * headway:
@@ -628,8 +648,8 @@ class TrackletCollector:
     """
 
     def __init__(self, camera_id, on_done, keep=CLEAR_FRAMES, min_samples=5, lost_sec=1.5,
-                 sample_sec=0.2, max_crop_px=96):
-        self.camera_id, self.on_done = camera_id, on_done
+                 sample_sec=0.2, max_crop_px=128, embed=True):
+        self.camera_id, self.on_done, self.embed = camera_id, on_done, embed
         self.keep, self.min_samples, self.lost_sec = keep, min_samples, lost_sec
         self.sample_sec, self.max_crop = sample_sec, max_crop_px
         self.samples = defaultdict(list)     # tid -> [(t, x_m, y_m)]
@@ -751,7 +771,8 @@ class TrackletCollector:
         lateral = float(np.polyval(np.polyfit(t, x, 1), t_cross))
         widths = m.get("width_samples") or []
         two_wheel = m.get("cls") in TWO_WHEEL
-        hist, lab = signature([c for _, c in self.crops.get(tid, ())], two_wheel)
+        kept = [c for _, c in self.crops.get(tid, ())]
+        hist, lab = signature(kept, two_wheel)
         heading = m.get("heading", 0)
         tl = Tracklet(
             camera_id=self.camera_id, track_id=tid, cls=m.get("cls", ""),
@@ -760,5 +781,8 @@ class TrackletCollector:
             direction="incoming" if heading > 0 else "outgoing" if heading < 0 else "unknown",
             width=float(np.median(widths)) if widths else float("nan"),
             extrap_m=extrap, zone=m.get("zone", ""), hist=hist, lab=lab)
+        if self.embed:
+            from .embed import Embedder
+            tl.embed = Embedder.encode(kept)
         tl.video_t = t_cross
         return tl

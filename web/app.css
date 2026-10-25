@@ -392,6 +392,13 @@ kbd { font: 11px var(--font); border: 1px solid var(--border-strong); border-bot
 .vlm-part span { font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--text-muted); }
 .vlm-part p { margin: 0; font-size: 13px; line-height: 1.5; color: var(--text-secondary); }
 .vlm-foot { border-top: 1px solid var(--border); padding-top: 6px; line-height: 1.45; }
+.who-box { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12px; margin-bottom: 7px; }
+.who-box #who-name { font-weight: 600; color: var(--text-primary); }
+.who-box #who-role { color: var(--text-muted); }
+
+.bar { height: 6px; border-radius: 3px; background: var(--surface-3); overflow: hidden; margin: 5px 0 10px; }
+.bar > div { height: 100%; background: var(--accent); transition: width .4s; }
+
 table.kv.wide { width: 100%; }
 table.kv.wide th { text-align: left; font-weight: 600; color: var(--text-muted); font-size: 12px; }
 tr.vrow { cursor: pointer; }

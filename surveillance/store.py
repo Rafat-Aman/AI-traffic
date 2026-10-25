@@ -71,8 +71,68 @@ CREATE TABLE IF NOT EXISTS violations (
     status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed', 'rejected')),
     note TEXT DEFAULT '',
     reviewed_at TEXT,
+    reviewed_by INTEGER,            -- deliberately NOT a foreign key: who decided a case has to survive
+    reviewed_by_name TEXT DEFAULT '',  -- the account being closed, so the name is the record and the id
+                                    -- is only a convenience for joining while the account still exists
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY,
+    role TEXT NOT NULL CHECK (role IN ('driver', 'controller', 'admin')),
+    name TEXT DEFAULT '',
+    username TEXT UNIQUE,           -- staff sign-in name; NULL for drivers
+    password_hash TEXT,             -- staff only
+    licence_no TEXT UNIQUE,         -- drivers: normalised, the identifier they are looked up by
+    phone TEXT DEFAULT '',          -- drivers: where the one-time code goes
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    last_login TEXT
+);
+CREATE TABLE IF NOT EXISTS vehicles (
+    id INTEGER PRIMARY KEY,
+    plate_key TEXT NOT NULL UNIQUE, -- normalised: upper case, no spaces or dashes
+    plate_en TEXT DEFAULT '',       -- as shown to people
+    plate_bn TEXT DEFAULT '',
+    owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    source TEXT DEFAULT 'claimed',  -- 'admin' (loaded from a registry) / 'claimed' (the driver said so)
+    verified INTEGER NOT NULL DEFAULT 0,
+    note TEXT DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_vehicle_owner ON vehicles(owner_id);
+CREATE TABLE IF NOT EXISTS login_codes (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    code_hash TEXT NOT NULL,        -- the code itself is never stored
+    expires_at REAL NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    used INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_code_user ON login_codes(user_id, used);
+CREATE TABLE IF NOT EXISTS sessions (
+    fingerprint TEXT PRIMARY KEY,   -- sha256 of the cookie value, so the database holds no usable token
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role TEXT NOT NULL,
+    expires_at REAL NOT NULL,
+    address TEXT DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_session_user ON sessions(user_id);
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY,
+    at TEXT NOT NULL,
+    user_id INTEGER,                -- kept even if the account is later removed
+    who TEXT DEFAULT '',            -- name / username as it was at the time
+    role TEXT DEFAULT '',
+    action TEXT NOT NULL,           -- 'violation.confirm', 'vehicle.verify', 'user.create', ...
+    object_type TEXT DEFAULT '',
+    object_id TEXT DEFAULT '',
+    detail TEXT DEFAULT '',
+    address TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ix_audit_at ON audit_log(at);
+CREATE INDEX IF NOT EXISTS ix_audit_object ON audit_log(object_type, object_id);
 CREATE TABLE IF NOT EXISTS tracklets (
     id INTEGER PRIMARY KEY,
     camera_id INTEGER NOT NULL REFERENCES cameras(id) ON DELETE CASCADE,
@@ -90,6 +150,7 @@ CREATE TABLE IF NOT EXISTS tracklets (
     extrap_m REAL DEFAULT 0,
     hist BLOB,                      -- HSV colour histogram  (float32)
     lab BLOB,                       -- CIELAB mean/spread    (float32)
+    embed BLOB,                     -- appearance vector     (float32, surveillance.embed)
     global_id INTEGER,              -- the vehicle this is an observation of, across all cameras
     link_source TEXT DEFAULT '',    -- how it got that id: online / batch
     created_at TEXT NOT NULL
@@ -137,9 +198,13 @@ class Store:
             for col, decl in (("plate_status", "TEXT DEFAULT ''"), ("plate_text", "TEXT DEFAULT ''"),
                               ("plate_text_en", "TEXT DEFAULT ''"), ("plate_conf", "REAL"), ("plate_img", "TEXT"),
                               ("evidence", "TEXT DEFAULT '[]'"), ("vlm_status", "TEXT DEFAULT ''"),
-                              ("vlm", "TEXT DEFAULT ''")):
+                              ("vlm", "TEXT DEFAULT ''"), ("reviewed_by", "INTEGER"),
+                              ("reviewed_by_name", "TEXT DEFAULT ''")):
                 if col not in have:
                     self.db.execute(f"ALTER TABLE violations ADD COLUMN {col} {decl}")
+            have_t = {r[1] for r in self.db.execute("PRAGMA table_info(tracklets)")}
+            if have_t and "embed" not in have_t:
+                self.db.execute("ALTER TABLE tracklets ADD COLUMN embed BLOB")
             self.db.commit()
 
     def q(self, sql, args=()):
@@ -151,6 +216,154 @@ class Store:
             cur = self.db.execute(sql, args)
             self.db.commit()
             return cur.lastrowid
+
+    # ------------------------------------------------------------ accounts
+    def add_user(self, role, name="", username=None, password_hash=None, licence_no=None, phone=""):
+        return self.x("INSERT INTO users (role, name, username, password_hash, licence_no, phone,"
+                      " created_at) VALUES (?,?,?,?,?,?,?)",
+                      (role, name, username or None, password_hash, licence_no or None, phone, now()))
+
+    def user(self, uid):
+        r = self.q("SELECT * FROM users WHERE id=?", (uid,))
+        return r[0] if r else None
+
+    def user_by_username(self, username):
+        r = self.q("SELECT * FROM users WHERE username=? AND active=1", (username,))
+        return r[0] if r else None
+
+    def user_by_licence(self, licence_no):
+        r = self.q("SELECT * FROM users WHERE licence_no=? AND active=1", (licence_no,))
+        return r[0] if r else None
+
+    def users(self, role=None):
+        w, a = (" WHERE role=?", (role,)) if role else ("", ())
+        return self.q("SELECT id, role, name, username, licence_no, phone, active, created_at, last_login"
+                      " FROM users" + w + " ORDER BY role, COALESCE(name, username, licence_no)", a)
+
+    def update_user(self, uid, **fields):
+        allowed = {"name", "phone", "active", "role", "password_hash", "username", "licence_no"}
+        sets, args = [], []
+        for k, v in fields.items():
+            if k in allowed:
+                sets.append(f"{k}=?")
+                args.append(v)
+        if sets:
+            self.x(f"UPDATE users SET {', '.join(sets)} WHERE id=?", (*args, uid))
+
+    def touch_login(self, uid):
+        self.x("UPDATE users SET last_login=? WHERE id=?", (now(), uid))
+
+    def count_users(self, role=None):
+        w, a = (" WHERE role=?", (role,)) if role else ("", ())
+        return self.q("SELECT COUNT(*) AS n FROM users" + w, a)[0]["n"]
+
+    # ------------------------------------------------------------ vehicles owned by a driver
+    def add_vehicle(self, plate_key, owner_id, plate_en="", plate_bn="", source="claimed", verified=0,
+                    note=""):
+        return self.x("INSERT INTO vehicles (plate_key, plate_en, plate_bn, owner_id, source, verified,"
+                      " note, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                      (plate_key, plate_en, plate_bn, owner_id, source, int(verified), note, now()))
+
+    def vehicle_by_plate(self, plate_key):
+        r = self.q("SELECT * FROM vehicles WHERE plate_key=?", (plate_key,))
+        return r[0] if r else None
+
+    def vehicles_of(self, owner_id, verified_only=False):
+        w = " AND verified=1" if verified_only else ""
+        return self.q(f"SELECT * FROM vehicles WHERE owner_id=?{w} ORDER BY created_at DESC", (owner_id,))
+
+    def all_vehicles(self, pending_only=False):
+        w = " WHERE v.verified=0" if pending_only else ""
+        return self.q("SELECT v.*, u.name AS owner_name, u.licence_no AS owner_licence FROM vehicles v"
+                      " LEFT JOIN users u ON u.id=v.owner_id" + w + " ORDER BY v.created_at DESC")
+
+    def set_vehicle(self, vid, **fields):
+        allowed = {"verified", "note", "owner_id", "plate_en", "plate_bn"}
+        sets, args = [], []
+        for k, v in fields.items():
+            if k in allowed:
+                sets.append(f"{k}=?")
+                args.append(v)
+        if sets:
+            self.x(f"UPDATE vehicles SET {', '.join(sets)} WHERE id=?", (*args, vid))
+
+    def delete_vehicle(self, vid):
+        self.x("DELETE FROM vehicles WHERE id=?", (vid,))
+
+    def violations_for_plates(self, plate_keys, limit=200, offset=0):
+        """Confirmed cases against any of these plates. Drivers only ever see this, never the whole table.
+
+        Matched on the normalised plate, the same way the search box does, because the stored text carries
+        spaces and dashes that nobody types consistently."""
+        if not plate_keys:
+            return [], 0
+        norm = "REPLACE(REPLACE(UPPER(v.plate_text_en), ' ', ''), '-', '')"
+        marks = ",".join("?" * len(plate_keys))
+        where = (f" WHERE v.status='confirmed' AND {norm} IN ({marks})")
+        rows = self.q("SELECT v.*, c.name AS camera_name, c.location AS camera_location FROM violations v"
+                      " JOIN cameras c ON c.id=v.camera_id" + where +
+                      " ORDER BY v.id DESC LIMIT ? OFFSET ?", (*plate_keys, limit, offset))
+        for r in rows:
+            r["details"] = json.loads(r["details"] or "{}")
+            r["evidence"] = json.loads(r.get("evidence") or "[]")
+            r["vlm"] = json.loads(r["vlm"]) if r.get("vlm") else None
+        total = self.q(f"SELECT COUNT(*) AS n FROM violations v{where}", tuple(plate_keys))[0]["n"]
+        return rows, total
+
+    # ------------------------------------------------------------ sessions
+    def add_session(self, fingerprint, user_id, role, expires_at, address=""):
+        self.x("INSERT OR REPLACE INTO sessions (fingerprint, user_id, role, expires_at, address,"
+               " created_at) VALUES (?,?,?,?,?,?)",
+               (fingerprint, user_id, role, expires_at, address, now()))
+
+    def session(self, fingerprint):
+        r = self.q("SELECT s.*, u.name, u.username, u.licence_no, u.active FROM sessions s"
+                   " JOIN users u ON u.id=s.user_id WHERE s.fingerprint=?", (fingerprint,))
+        return r[0] if r else None
+
+    def drop_session(self, fingerprint):
+        self.x("DELETE FROM sessions WHERE fingerprint=?", (fingerprint,))
+
+    def drop_sessions_of(self, user_id):
+        self.x("DELETE FROM sessions WHERE user_id=?", (user_id,))
+
+    def purge_sessions(self, before):
+        self.x("DELETE FROM sessions WHERE expires_at < ?", (before,))
+
+    # ------------------------------------------------------------ one-time login codes
+    def add_login_code(self, user_id, code_hash, expires_at):
+        self.x("UPDATE login_codes SET used=1 WHERE user_id=? AND used=0", (user_id,))
+        return self.x("INSERT INTO login_codes (user_id, code_hash, expires_at, created_at)"
+                      " VALUES (?,?,?,?)", (user_id, code_hash, expires_at, now()))
+
+    def live_login_code(self, user_id, now_ts):
+        r = self.q("SELECT * FROM login_codes WHERE user_id=? AND used=0 AND expires_at > ?"
+                   " ORDER BY id DESC LIMIT 1", (user_id, now_ts))
+        return r[0] if r else None
+
+    def bump_code_attempts(self, code_id):
+        self.x("UPDATE login_codes SET attempts=attempts+1 WHERE id=?", (code_id,))
+
+    def spend_login_code(self, code_id):
+        self.x("UPDATE login_codes SET used=1 WHERE id=?", (code_id,))
+
+    # ------------------------------------------------------------ audit
+    def audit(self, user, action, object_type="", object_id="", detail="", address=""):
+        """Record that somebody did something. `user` is a session dict or None for the system itself."""
+        u = user or {}
+        self.x("INSERT INTO audit_log (at, user_id, who, role, action, object_type, object_id, detail,"
+               " address) VALUES (?,?,?,?,?,?,?,?,?)",
+               (now(), u.get("user_id"), u.get("name") or u.get("username") or u.get("licence_no") or
+                "system", u.get("role", ""), action, object_type, str(object_id), detail, address))
+
+    def audit_trail(self, object_type=None, object_id=None, user_id=None, limit=200):
+        where, args = [], []
+        for col, val in (("object_type", object_type), ("object_id", object_id), ("user_id", user_id)):
+            if val not in (None, ""):
+                where.append(f"{col}=?")
+                args.append(str(val))
+        sql = "SELECT * FROM audit_log" + (" WHERE " + " AND ".join(where) if where else "")
+        return self.q(sql + " ORDER BY id DESC LIMIT ?", (*args, limit))
 
     # ------------------------------------------------------------ cameras
     def cameras(self):
@@ -234,12 +447,13 @@ class Store:
         """Store one vehicle's pass through one camera. `t` is a surveillance.reid.Tracklet."""
         return self.x(
             "INSERT INTO tracklets (camera_id, run_id, track_id, cls, class_conf, zone, t_cross, video_t,"
-            " lateral, speed, width, direction, extrap_m, hist, lab, global_id, link_source, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " lateral, speed, width, direction, extrap_m, hist, lab, embed, global_id, link_source, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (camera_id, run_id, t.track_id, t.cls, getattr(t, "class_conf", None), t.zone, t.t_cross,
              getattr(t, "video_t", None), t.lateral, t.speed, t.width, t.direction, t.extrap_m,
              None if t.hist is None else t.hist.astype("float32").tobytes(),
              None if t.lab is None else t.lab.astype("float32").tobytes(),
+             None if getattr(t, "embed", None) is None else t.embed.astype("float32").tobytes(),
              t.global_id, getattr(t, "link_source", ""), now()))
 
     def tracklets(self, camera_id=None, run_id=None, global_id=None, since=None, until=None, limit=100000):
@@ -256,6 +470,21 @@ class Store:
             args.append(until)
         sql = "SELECT * FROM tracklets" + (" WHERE " + " AND ".join(where) if where else "")
         return self.q(sql + " ORDER BY t_cross LIMIT ?", (*args, limit))
+
+    def tracklet_for_violation(self, v):
+        """The tracklet of the vehicle a violation is about, if its pass was recorded."""
+        rows = self.q("SELECT * FROM tracklets WHERE camera_id=? AND track_id=? AND (run_id=? OR ? IS NULL)"
+                      " ORDER BY ABS(COALESCE(video_t, 0) - ?) LIMIT 1",
+                      (v["camera_id"], v["track_id"], v.get("run_id"), v.get("run_id"),
+                       v.get("video_time_s") or 0))
+        return rows[0] if rows else None
+
+    def journey_for_violation(self, v):
+        """Where else this vehicle was seen, across every camera, ordered in time. [] when not linked."""
+        t = self.tracklet_for_violation(v)
+        if not t or not t["global_id"]:
+            return []
+        return self.journey(t["global_id"])
 
     def set_global_ids(self, assignments, source="batch"):
         """assignments: [(tracklet id, global id)], written in one transaction."""
@@ -343,8 +572,12 @@ class Store:
         return self.q("SELECT COUNT(*) AS n FROM violations" + (" WHERE " + " AND ".join(where) if where else ""),
                       args)[0]["n"]
 
-    def review(self, vid, status, note=""):
-        self.x("UPDATE violations SET status=?, note=?, reviewed_at=? WHERE id=?", (status, note, now(), vid))
+    def review(self, vid, status, note="", by=None):
+        """`by` is the session of whoever decided: a case with no name on it is not evidence of anything."""
+        u = by or {}
+        self.x("UPDATE violations SET status=?, note=?, reviewed_at=?, reviewed_by=?, reviewed_by_name=?"
+               " WHERE id=?", (status, note, now(), u.get("user_id"),
+                               u.get("name") or u.get("username") or "", vid))
 
     def clear_violations(self, cid):
         self.x("DELETE FROM violations WHERE camera_id=?", (cid,))
