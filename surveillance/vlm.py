@@ -79,6 +79,11 @@ RULE_CLAIM = {
     "V8": ("A class of vehicle banned from this road was using it.",
            "The vehicle is of a different class than the label says, or it is crossing rather than using the "
            "road, or it is an emergency or works vehicle."),
+    "V9": ("A vehicle that is not a bus drove along a lane reserved for buses, far enough and long enough to "
+           "be using the lane rather than crossing it.",
+           "It is only crossing the lane to turn or to reach the kerb; or it is in fact a bus, an ambulance or "
+           "another authorised vehicle; or the lane is not in force at that time of day, or its markings cannot "
+           "be seen in the photographs, so nothing shows that this is a bus lane."),
 }
 
 ASSESSMENTS = ("supported", "insufficient", "contradicted")

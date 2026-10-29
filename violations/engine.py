@@ -4,6 +4,7 @@ from collections import defaultdict
 
 from .base import Context, Scene
 from .bus_blocking import BusBlocking
+from .bus_lane import BusLaneViolation
 from .helmet import NoHelmet
 from .illegal_parking import IllegalParking
 from .lane_change import LaneLineCrossing
@@ -22,6 +23,7 @@ RULES = {
     "lane_line": LaneLineCrossing,
     "restricted_vehicle": RestrictedVehicle,
     "helmet": NoHelmet,
+    "bus_lane": BusLaneViolation,
 }
 CODES = {cls.code: key for key, cls in RULES.items()}
 
@@ -30,7 +32,7 @@ class ViolationEngine:
     def __init__(self, camera, overrides=None, only=None, helmet_detector=None, forget_sec=10.0, flow_kph=10.0,
                  lost_sec=1.0):
         """overrides: {rule key: {setting: value}} applied on top of the camera's "rules" settings.
-        only: rule keys or codes (V1..V8) to run; default all that can run."""
+        only: rule keys or codes (V1..V9) to run; default all that can run."""
         self.camera, self.flow_kph, self.forget_sec, self.lost_sec = camera, flow_kph, forget_sec, lost_sec
         self.lost_done = set()              # tids whose "left the view" decision has been made
         wanted = None if not only else {CODES.get(k.upper(), k) for k in only}
@@ -45,6 +47,8 @@ class ViolationEngine:
                 self.inactive[cls.code] = "needs a helmet model"
             elif key == "illegal_parking" and not camera.has_area("no_parking"):
                 self.inactive[cls.code] = "no no-parking kerb strip drawn"
+            elif key == "bus_lane" and not camera.has_area("bus_lane"):
+                self.inactive[cls.code] = "no bus lane drawn"
             elif key == "lane_line" and not camera.lines:
                 self.inactive[cls.code] = "no solid lane lines drawn"
             elif key == "wrong_side" and all(r.allowed_direction == "both" for r in camera.roads):

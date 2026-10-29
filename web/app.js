@@ -50,6 +50,10 @@
   // Short names for the violation types (the full titles come from the server).
   const VSHORT = { V1: "Bus stopping", V2: "Speeding", V3: "Kerb parking", V4: "Wrong side", V5: "Solid line", V6: "No helmet", V7: "Lane blocking", V8: "Banned vehicle" };
   const vcode = (c) => `<span class="code" data-v="${esc(c)}">${esc(c)}</span>`;
+  // Codes the project report keeps out of enforcement (speed): detected, reviewed and shown here, never cited.
+  // The server decides and refuses; this only settles what the page offers.
+  const isAdvisory = (c) => ((state.meta && state.meta.advisory_codes) || []).includes(c);
+  const hasLiveCitation = (v) => !!v.citation_no && v.citation_status !== "withdrawn";
   const STATUS_ICON = { confirmed: ICON.check, rejected: ICON.cross, pending: ICON.clock };
   const STATE_LABEL = { idle: "Idle", starting: "Starting", running: "Running", reconnecting: "Reconnecting", done: "Finished", stopped: "Stopped", error: "Error" };
 
@@ -861,9 +865,15 @@
       select(target ? target.id : null);
     }
 
+    function citeChip(v) {
+      if (v.citation_no) return ` <span class="chip" title="Citation ${esc(v.citation_no)}">${esc(v.citation_no)}${v.citation_status === "withdrawn" ? " · withdrawn" : ""}</span>`;
+      if (isAdvisory(v.code)) return ' <span class="chip" title="Detected and reviewable, but never cited">advisory</span>';
+      return "";
+    }
+
     function rvItem(v) {
       return `<div class="rv-item" data-vid="${v.id}"><img src="${media(v.crop || v.snapshot)}" alt="" loading="lazy">
-        <div><div class="small">${vcode(v.code)} <b>${esc(v.cls)}</b> ${statusBadge(v.status)}</div>
+        <div><div class="small">${vcode(v.code)} <b>${esc(v.cls)}</b> ${statusBadge(v.status)}${citeChip(v)}</div>
         <div class="small muted">${esc(summary(v))}</div><div class="small muted">${esc(v.camera_name)} · ${esc(when(v))}</div>
         <div class="small" data-plate-of="${v.id}">${plateChip(v)}</div></div></div>`;
     }
@@ -960,13 +970,16 @@
       const ev = evidenceItems(v);
       const main = Math.max(0, ev.findIndex((x) => x.label === "Scene"));
       const rows = Object.entries(v.details).filter(([k]) => k !== "started").map(([k, val]) => [k.replace(/_/g, " "), val]);
+      // While a citation stands the decision behind it cannot change (the server refuses too): say why here.
+      const lock = hasLiveCitation(v) ? ' disabled title="A citation stands for this case. An administrator has to withdraw it before the decision can change."' : "";
       d.innerHTML = `<div class="card stack">
         <div class="row">${vcode(v.code)}<h2>${esc(v.title)}</h2>${statusBadge(v.status)}<span class="spacer"></span>
           <span class="small muted">Case TV-${v.id}</span>
           ${!v.vlm && v.vlm_status !== "pending"
             ? `<button class="btn small" id="explain">${ICON.brain}Explain</button>` : ""}
-          <a class="btn small" href="/notice/${v.id}" target="_blank" rel="noopener">${ICON.print}Notice</a></div>
+          ${isAdvisory(v.code) ? "" : `<a class="btn small" href="/notice/${v.id}" target="_blank" rel="noopener">${ICON.print}Notice</a>`}</div>
         <div class="small secondary">${esc(summary(v))}</div>
+        <div id="cite-block"></div>
         <div class="evidence">
           <div class="ev-main" id="ev-main"></div>
           <div class="ev-thumbs">${ev.map((x, i) => `<button class="ev-thumb" data-ev="${i}">
@@ -984,9 +997,9 @@
             <tr><th>Zone</th><td>${esc(v.zone)}${v.areas ? ` · ${esc(v.areas.replace(/_/g, " "))}` : ""}</td></tr></table>
           <table class="kv">${rows.map(([k, val]) => `<tr><th>${esc(k)}</th><td>${esc(val)}</td></tr>`).join("")}</table></div>
         <label class="field">Reviewer note<input id="note" value="${esc(v.note || "")}" placeholder="optional, e.g. plate number or reason for rejecting"></label>
-        <div class="rv-actions"><button class="btn good" id="ok">${ICON.check}Confirm <kbd>C</kbd></button>
-          <button class="btn bad" id="no">${ICON.cross}Reject <kbd>R</kbd></button>
-          ${v.status !== "pending" ? '<button class="btn" id="undo">Back to pending</button>' : ""}
+        <div class="rv-actions"><button class="btn good" id="ok"${lock}>${ICON.check}Confirm <kbd>C</kbd></button>
+          <button class="btn bad" id="no"${lock}>${ICON.cross}Reject <kbd>R</kbd></button>
+          ${v.status !== "pending" ? `<button class="btn" id="undo"${lock}>Back to pending</button>` : ""}
           <span class="spacer"></span><span class="small muted">Rejected cases are kept out of statistics and show how accurate each rule is.</span></div></div>`;
       const show = (i) => {
         const x = ev[i];
@@ -1006,6 +1019,103 @@
       if ($("#undo")) $("#undo").onclick = () => decide("pending");
       if ($("#explain")) $("#explain").onclick = () => explain(false);
       if ($("#vlm-again")) $("#vlm-again").onclick = () => explain(true);
+      renderCite();
+    }
+
+    // ---- e-prosecution: what this case can be as a citation, and what has been done with it.
+    // (The boxes reuse the model-verdict box styles: ok / warn / bad on the left edge.)
+    function citationBlock(v) {
+      if (isAdvisory(v.code)) {
+        return `<div class="vlm-box warn"><div class="vlm-head"><b>Advisory — not citable</b></div>
+          <div class="small muted">${esc(v.code)} is detected and reviewed so that its accuracy can be measured, but it never supports a
+          citation: it has no notice and does not appear in a driver's portal.</div></div>`;
+      }
+      if (v.citation_no) {
+        const withdrawn = v.citation_status === "withdrawn";
+        return `<div class="vlm-box ${withdrawn ? "bad" : "ok"}"><div class="vlm-head"><b>Citation ${esc(v.citation_no)}</b>
+            <span class="vlm-conf">${esc(v.citation_status || "")}</span><span class="spacer"></span>
+            <button class="btn small" id="verify">Verify evidence</button>
+            ${isAdmin() && v.citation_status === "issued" ? '<button class="btn small bad" id="withdraw">Withdraw</button>' : ""}</div>
+          <div class="small muted">Every evidence file was hashed when this citation was issued. Verify hashes them again now and names any that differ.</div>
+          <div id="verify-out"></div></div>`;
+      }
+      if (v.status !== "confirmed") return "";
+      if (v.plate_status === "read" || v.plate_status === "partial") {
+        return `<div class="vlm-box"><div class="vlm-head"><b>Confirmed — ready for a citation</b><span class="spacer"></span>
+            <button class="btn small good" id="cite">Issue citation</button></div>
+          <div class="small muted">Issuing numbers the citation, seals every evidence file with a SHA-256 hash, and makes the smaller copy of the clip that the driver is shown.</div></div>`;
+      }
+      return `<div class="vlm-box warn"><div class="vlm-head"><b>Cannot be cited yet</b></div>
+        <div class="small muted">${v.plate_status === "pending" ? "The number plate is still being read." : "The number plate could not be read, so the vehicle cannot be named in a citation."}</div></div>`;
+    }
+
+    function renderCite() {
+      const box = $("#cite-block");
+      if (!box || !sel) return;
+      box.innerHTML = citationBlock(sel);
+      if ($("#cite")) $("#cite").onclick = issueCitation;
+      if ($("#verify")) $("#verify").onclick = verifyCitation;
+      if ($("#withdraw")) $("#withdraw").onclick = withdrawCitation;
+    }
+
+    // Put a changed citation into the list and the open pane without losing the reviewer's place.
+    function citationChanged(id, fields) {
+      const i = items.findIndex((x) => x.id === id);
+      if (i < 0) return;
+      items[i] = { ...items[i], ...fields };
+      const row = $(`.rv-item[data-vid="${id}"]`);
+      if (row) row.outerHTML = rvItem(items[i]);
+      if (sel && sel.id === id) select(id);
+    }
+
+    async function issueCitation() {
+      if (!sel) return;
+      const id = sel.id, btn = $("#cite");
+      btn.disabled = true;
+      btn.textContent = "Issuing…";             // it hashes the files and makes the driver's copy: a few seconds
+      try {
+        const c = await api(`/api/violations/${id}/citation`, { method: "POST" });
+        (c.warnings || []).forEach((w) => toast(esc(w), "error", null, 9000));
+        toast(`Citation ${esc(c.citation_no)} ${c.created ? "issued" : "already issued"}`);
+        citationChanged(id, { citation_no: c.citation_no, citation_status: c.status, delivery_clip: c.delivery_clip });
+      } catch (e) {
+        if ($("#cite")) { $("#cite").disabled = false; $("#cite").textContent = "Issue citation"; }
+        fail(e);
+      }
+    }
+
+    async function verifyCitation() {
+      if (!sel || !sel.citation_no) return;
+      const out = $("#verify-out");
+      out.innerHTML = '<div class="small muted" style="margin-top:6px">Checking every file…</div>';
+      try {
+        const r = await api(`/api/citations/${encodeURIComponent(sel.citation_no)}/verify`);
+        const bad = r.files.filter((f) => f.status !== "match");
+        const caseBad = Object.entries(r.case).filter(([, s]) => s !== "match");
+        out.innerHTML = r.ok
+          ? `<div class="small" style="margin-top:6px"><b>Intact.</b> All ${r.counts.match} files match what was sealed, and the sealed record is unchanged.</div>`
+          : `<div class="small" style="margin-top:6px;color:var(--critical-ink)"><b>Not intact.</b>
+              ${r.bundle.status !== "match" ? "<div>The sealed record itself has been altered.</div>" : ""}
+              ${bad.map((f) => `<div>${esc(f.status)}: ${esc(f.path)}</div>`).join("")}
+              ${caseBad.map(([k, s]) => `<div>case ${esc(k.replace(/_/g, " "))}: ${esc(s)}</div>`).join("")}</div>`;
+      } catch (e) { out.innerHTML = ""; fail(e); }
+    }
+
+    function withdrawCitation() {
+      if (!sel || !sel.citation_no) return;
+      const id = sel.id, no = sel.citation_no;
+      const m = modal(`<div class="modal-head"><h2>Withdraw ${esc(no)}?</h2></div>
+        <p class="secondary">The citation stops applying and the driver sees it as withdrawn. It stays on record with your name and the reason, and its number is never used again. Say why:</p>
+        <label class="field"><input id="why" maxlength="500" placeholder="e.g. plate misread on review"></label>
+        <div class="row" style="justify-content:flex-end"><button class="btn" data-close>Cancel</button><button class="btn bad" id="go">Withdraw</button></div>`);
+      $("#go", m.el).onclick = async () => {
+        try {
+          const c = await api(`/api/citations/${encodeURIComponent(no)}/withdraw`, { method: "POST", body: { reason: $("#why", m.el).value } });
+          m.close();
+          toast(`Citation ${esc(no)} withdrawn`);
+          citationChanged(id, { citation_status: c.status });
+        } catch (e) { fail(e); }
+      };
     }
 
     async function explain(force) {

@@ -48,5 +48,15 @@ speeds.csv
 models/vlm/*.gguf
 vendor/
 
+# Vehicle re-identification weights (~94 MB, trained in research/cityflow/): copy the notebook's reid_*.pth here
+models/reid/*.pth
+
 side1_1.mp4
 side2_1.mp4
+
+# Secrets: evidence-link signing key (surveillance/citation.py creates it) and local API keys
+data/.media_secret
+.env
+
+# Team's raw footage drops (multi-GB zips) — upload through the dashboard, never commit
+videos/

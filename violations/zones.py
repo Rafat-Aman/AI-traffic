@@ -16,7 +16,8 @@ violation_zones.json (one file per camera position):
     {"type": "no_parking", "name": "Left kerb", "points": [...]},
     {"type": "signal",   "name": "Queue before stop line", "points": [...]},
     {"type": "parking",  "name": "Legal parking bay", "points": [...]},
-    {"type": "uturn",    "name": "U-turn opening", "points": [...]}
+    {"type": "uturn",    "name": "U-turn opening", "points": [...]},
+    {"type": "bus_lane", "name": "Left bus lane", "points": [...], "hours": [["07:00", "10:00"]]}   # hours optional
   ],
   "lane_lines": [{"name": "Solid line lane 1|2", "points": [[x1, y1], [x2, y2]]}]
 }
@@ -27,9 +28,15 @@ Bus stops: Dhaka's bus stops are placed just AFTER an intersection (far side), s
 intersection is marked at most BUS_STOP_MAX_AFTER_M before it, in the direction traffic flows. A bus stop drawn
 anywhere else on a straight road is treated as an unapproved stop: buses standing there are reported (V1). Set
 "approved": true on a stop to accept it anyway (an official mid-block bus bay).
+
+Bus lanes: a vehicle that is not allowed in the lane (only buses by default, see the bus_lane rule) and drives along
+a "bus_lane" area is reported (V9); crossing it to turn or reach the kerb is not. A vehicle counts as in the lane when
+its road-contact point is, so draw the polygon inside the painted edges. "hours" (optional, the format of peak_hours,
+a range may cross midnight) limits the lane to those times of day; without it the lane applies all day.
 """
 
 import json
+import re
 from pathlib import Path
 
 import cv2
@@ -38,9 +45,9 @@ import numpy as np
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 ROAD_CATEGORIES = ("city", "highway", "expressway")
 DIRECTIONS = ("both", "toward_camera", "away_from_camera")
-AREA_TYPES = ("no_parking", "bus_stop", "intersection", "signal", "parking", "uturn")
+AREA_TYPES = ("no_parking", "bus_stop", "intersection", "signal", "parking", "uturn", "bus_lane")
 AREA_COLORS = {"bus_stop": (0, 200, 0), "signal": (0, 220, 255), "parking": (255, 120, 0), "uturn": (200, 0, 200),
-               "no_parking": (60, 60, 230), "intersection": (230, 230, 230)}
+               "no_parking": (60, 60, 230), "intersection": (230, 230, 230), "bus_lane": (190, 210, 0)}
 BUS_STOP_MAX_AFTER_M = 120.0   # a far-side bus stop starts within this distance after the intersection
 ROAD_COLOR = (255, 200, 0)
 LINE_COLOR = (255, 255, 255)
@@ -62,6 +69,29 @@ def draw_label(img, text, org, color, scale=0.6, thickness=None):
     x, y = int(org[0]), max(th + 4, int(org[1]))
     cv2.rectangle(img, (x - 3, y - th - 4), (x + tw + 3, y + base), (20, 20, 20), -1)
     cv2.putText(img, text, (x, y), FONT, scale, color, thickness, cv2.LINE_AA)
+
+
+_HHMM = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
+
+
+def clean_hours(hours, what):
+    """The hour ranges of an area as [["HH:MM", "HH:MM"], ...] - the format of the camera's peak_hours; a range may
+    cross midnight - or None for "in force all day". Raises ValueError with a readable message for anything else.
+    Checked when the zones are loaded: a malformed time would otherwise fail in the middle of a recording."""
+    if not hours:
+        return None
+    out = []
+    try:
+        for rng in hours:
+            start, end = rng
+            if not (isinstance(start, str) and isinstance(end, str) and _HHMM.fullmatch(start)
+                    and _HHMM.fullmatch(end)) or start == end:
+                raise ValueError
+            out.append([start, end])
+    except (TypeError, ValueError):
+        raise ValueError(f"{what}: hours must be a list of [\"HH:MM\", \"HH:MM\"] ranges such as "
+                         f"[[\"07:00\", \"10:30\"]]; start and end must differ (a range may cross midnight)") from None
+    return out
 
 
 class RoadZone:
@@ -177,9 +207,11 @@ class AreaZone:
     intersection  junction mouth: vehicles wait here to turn / for the traffic police, never a stop violation
     signal        queue before a stop line: never a stop violation
     parking       legal parking bay
-    uturn         legal U-turn opening (not wrong-side driving)"""
+    uturn         legal U-turn opening (not wrong-side driving)
+    bus_lane      lane reserved for buses: another vehicle driving along it is reported (V9); `hours` optionally
+                  limits it to some times of day"""
 
-    def __init__(self, kind, name, points, scale=(1.0, 1.0), approved=False):
+    def __init__(self, kind, name, points, scale=(1.0, 1.0), approved=False, hours=None):
         if kind not in AREA_TYPES:
             raise ValueError(f"area '{name}': type must be one of {AREA_TYPES}")
         if len(points) < 3:
@@ -187,6 +219,7 @@ class AreaZone:
         self.kind, self.name = kind, name
         self.poly = np.float32(points) * np.float32(scale)
         self.approved = bool(approved)
+        self.hours = clean_hours(hours, f"area '{name}'") if kind == "bus_lane" else None   # None = all day
         self.valid, self.reason = True, ""    # bus stops: set by CameraConfig.check_bus_stops()
 
     def contains(self, pt):
@@ -197,11 +230,18 @@ class AreaZone:
         """What a rule sees: an invalid bus stop is not a bus stop."""
         return "bus_stop_unapproved" if self.kind == "bus_stop" and not self.valid else self.kind
 
+    @property
+    def hours_text(self):
+        """"07:00-10:30, 16:00-20:30"; empty when the area applies all day."""
+        return ", ".join(f"{a}-{b}" for a, b in self.hours or ())
+
     def to_dict(self):
         d = {"type": self.kind, "name": self.name,
              "points": [[round(float(x), 1), round(float(y), 1)] for x, y in self.poly]}
         if self.kind == "bus_stop":
             d["approved"] = self.approved
+        if self.hours:
+            d["hours"] = [list(h) for h in self.hours]
         return d
 
     def draw(self, img, ui=1.0, s=1.0):
@@ -216,7 +256,8 @@ class AreaZone:
             cv2.addWeighted(overlay, 0.18, roi, 0.82, 0, roi)
         cv2.polylines(img, [pts], True, col, max(1, round(2 * ui)), cv2.LINE_AA)
         x, y = map(int, pts[0])
-        txt = f"{self.kind.replace('_', ' ')}: {self.name}" + ("" if self.valid else " (NOT after a junction)")
+        txt = (f"{self.kind.replace('_', ' ')}: {self.name}" + ("" if self.valid else " (NOT after a junction)")
+               + (f" [{self.hours_text}]" if self.hours else ""))
         draw_label(img, txt, (x, y - 8), col, 0.5 * ui)
 
 
@@ -368,7 +409,8 @@ def camera_config_from_dict(cfg, frame_w, frame_h, quiet=True, require_road=True
                                   scale_source=z.get("scale_source", "measured"),
                                   speed_uncertainty_pct=z.get("speed_uncertainty_pct")))
         else:
-            areas.append(AreaZone(kind, z["name"], z["points"], scale, approved=z.get("approved", False)))
+            areas.append(AreaZone(kind, z["name"], z["points"], scale, approved=z.get("approved", False),
+                                  hours=z.get("hours")))
     if not roads and require_road:
         raise ValueError("Draw at least one road zone")
     lines = [LaneLine(ln["name"], ln["points"], roads, scale) for ln in cfg.get("lane_lines", [])]

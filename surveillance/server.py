@@ -6,6 +6,7 @@ from html import escape
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import time
@@ -28,11 +29,13 @@ from violations.zones import (AREA_TYPES, DEFAULT_SPEED_LIMITS, DIRECTIONS, ROAD
                               camera_config_from_dict)
 
 from . import auth as auth_mod
+from . import citation as cit
 from . import vlm as vlm_mod
 from . import webauth
 from .link import LinkJob, OnlineLinker, SiteRun, run_linking
 from .anpr import find_models
 from .camera_motion import save_reference
+from .clips import make_delivery_clip
 from .detector import MODELS_DIR, find_helmet_model
 from .pipeline import reliable_limits, zones_roi
 from .sources import detect_start_time, grab_frame, is_live_source, probe_mac_cameras
@@ -40,7 +43,9 @@ from .store import DEFAULT_SETTINGS, Store
 from .worker import WorkerManager
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA = ROOT / "data"
+# Importing this module opens the database, so the folder it lives in can be redirected: the tests point it at a
+# scratch directory instead of the one a running installation is using.
+DATA = Path(os.environ.get("TRAFFIC_DATA_DIR") or ROOT / "data")
 WEB = ROOT / "web"
 EDITOR_WIDTH = 1920  # zones are drawn on a 1920-px frame and scaled to the analysis resolution
 EDITOR_FRAMES = {}   # camera id -> last frame shown in the zone editor
@@ -90,12 +95,24 @@ sessions = webauth.Sessions(store)
 current_user, require = webauth.make_dependencies(sessions)
 CONTROLLER, ADMIN, DRIVER = auth_mod.CONTROLLER, auth_mod.ADMIN, auth_mod.DRIVER
 
+_media_key = {}
+
+
+def media_key():
+    """The secret that signs a driver's media links. Loaded on first use rather than at import, so merely
+    importing this module never creates a key file; and loaded at start-up (below), so a bad MEDIA_SECRET
+    stops the server from booting instead of failing on the first driver who opens a case."""
+    if "key" not in _media_key:
+        _media_key["key"] = cit.media_secret(DATA)
+    return _media_key["key"]
+
 
 @asynccontextmanager
 async def lifespan(_app):
     loop_ref["loop"] = asyncio.get_running_loop()
     (DATA / "videos").mkdir(parents=True, exist_ok=True)
     webauth.ensure_admin(store)
+    media_key()
     yield
     await asyncio.to_thread(manager.stop_all)
 
@@ -108,6 +125,20 @@ def cam_or_404(cid):
     if not cam:
         raise HTTPException(404, "Camera not found")
     return cam
+
+
+def keep_cited_evidence(cid):
+    """Refuse to delete a camera, or its cases, while a citation stands for any of them.
+
+    A citation seals files that live under this camera's evidence folder, and the cases it was made from are
+    rows that cascade away with the camera. Without this, one click on "delete camera" would silently turn
+    every standing citation's evidence into "missing". Withdrawing the citations first makes it a decision
+    somebody takes, and leaves the audit trail saying who."""
+    held = store.live_citations_for_camera(cid)
+    if held:
+        shown = ", ".join(held[:3]) + (f" and {len(held) - 3} more" if len(held) > 3 else "")
+        raise HTTPException(409, f"Citations are standing for cases from this camera ({shown}). Their "
+                                 "evidence has to be kept: withdraw them first.")
 
 
 def jpeg(img, quality=85):
@@ -158,6 +189,9 @@ DRIVER_API = {"/api/me", "/api/logout", "/api/portal/violations", "/api/portal/v
 
 @app.middleware("http")
 async def guard(request: Request, call_next):
+    # Only /api/ is guarded here. Everything else decides for itself: /media/* and /notice/* check the session
+    # in their own dependency, and /m/* is open on purpose - its credential is the signature in the URL, and a
+    # driver's <img> and <video> tags could not send anything else.
     path = request.url.path
     if not path.startswith("/api/") or path in PUBLIC_API:
         return await call_next(request)
@@ -297,6 +331,7 @@ def meta(request: Request):
         "speed_limits": DEFAULT_SPEED_LIMITS, "default_settings": DEFAULT_SETTINGS,
         "rules": {key: {"code": cls.code, "title": cls.title, "defaults": cls.DEFAULTS} for key, cls in RULES.items()},
         "lan_url": lan_url(request.url.port or 80),
+        "advisory_codes": sorted(cit.ADVISORY_CODES),    # detected and reviewable, but never cited
         "features": {"anpr": all(find_models(MODELS_DIR)), "helmet": find_helmet_model() is not None,
                      "vlm": vlm_mod.backend_status(vlm_settings())["enabled"],
                      "reid": True},
@@ -469,6 +504,7 @@ def patch_camera(cid: int, body: CameraPatch, user=Depends(require(ADMIN))):
 @app.delete("/api/cameras/{cid}")
 def delete_camera(cid: int, user=Depends(require(ADMIN))):
     cam_or_404(cid)
+    keep_cited_evidence(cid)
     manager.stop_autozone(cid)
     manager.stop(cid, wait=True)
     store.delete_camera(cid)
@@ -528,6 +564,7 @@ def stop_camera(cid: int):
 def clear_camera_violations(cid: int, user=Depends(require(ADMIN))):
     if manager.running(cid):
         raise HTTPException(400, "Stop the camera first")
+    keep_cited_evidence(cid)
     store.clear_violations(cid)
     shutil.rmtree(DATA / "evidence" / f"cam{cid}", ignore_errors=True)
     store.audit(user, "camera.clear_violations", "camera", cid, "all cases and tracklets deleted", user.get("address", ""))
@@ -760,9 +797,80 @@ def review_violation(vid: int, body: ReviewIn, user=Depends(require(CONTROLLER))
         raise HTTPException(400, "status must be pending, confirmed or rejected")
     if not store.violation(vid):
         raise HTTPException(404, "Violation not found")
+    held = store.citation_by_violation(vid)
+    if held and held["status"] != "withdrawn":
+        # The seal records that this case was confirmed when it was cited. Letting a decision change underneath
+        # a standing citation would leave a citation for a case nobody now stands behind.
+        raise HTTPException(409, f"Citation {held['citation_no']} was issued for this case. An administrator "
+                                 "has to withdraw it before the decision can change.")
     store.review(vid, body.status, body.note, by=user)
     store.audit(user, f"violation.{body.status}", "violation", vid, body.note, user.get("address", ""))
     return store.violation(vid)
+
+
+# ---------------------------------------------------------------- citations (e-prosecution)
+
+def citation_or_404(no):
+    if not cit.NUMBER_RE.match(no or "") or not store.citation(no):
+        raise HTTPException(404, "No such citation")
+    return store.citation(no)
+
+
+@app.post("/api/violations/{vid}/citation")
+def issue_citation(vid: int, user=Depends(require(CONTROLLER))):
+    """Issue the citation for a case: number it, seal its evidence, make the driver's smaller copy of the clip.
+
+    Idempotent - asking again returns the citation already issued. Refused with 409, and the reason, for an
+    advisory code (speed), a case no controller has confirmed, a plate that was not read, or a clip that is
+    still being encoded. Takes a few seconds: it hashes every evidence file and transcodes the clip."""
+    try:
+        row, created, warnings = cit.issue(store, vid, user, DATA, delivery=make_delivery_clip)
+    except cit.Refused as e:
+        raise HTTPException(e.status, str(e))
+    return {**cit.view(row), "created": created, "warnings": warnings}
+
+
+@app.get("/api/citations")
+def list_citations(status: Optional[str] = None, plate: Optional[str] = None, limit: int = 100, offset: int = 0,
+                   user=Depends(require(CONTROLLER))):
+    if status and status not in ("issued", "withdrawn", "paid"):
+        raise HTTPException(400, "status must be issued, withdrawn or paid")
+    rows, total = store.citations(status, plate, min(max(limit, 1), 500), max(offset, 0))
+    return {"items": [{**r, "fine_text": cit.fine_text(r["fine_bdt"])} for r in rows], "total": total}
+
+
+@app.get("/api/citations/{no}")
+def get_citation(no: str, user=Depends(require(CONTROLLER))):
+    c = citation_or_404(no)
+    v = store.violation(c["violation_id"])
+    case = ({k: v[k] for k in ("id", "code", "title", "status", "plate_text_en", "wall_time", "camera_name")}
+            if v else None)       # None once the case itself has been deleted: the citation outlives it
+    return {**cit.view(c), "case": case}
+
+
+@app.get("/api/citations/{no}/verify")
+def verify_citation(no: str, user=Depends(require(CONTROLLER))):
+    """Re-hash every file the citation sealed and report match / mismatch / missing per file. Audited."""
+    citation_or_404(no)
+    try:
+        return cit.verify_citation(store, no, user, DATA)
+    except cit.Refused as e:
+        raise HTTPException(e.status, str(e))
+
+
+class WithdrawIn(BaseModel):
+    reason: str = ""
+
+
+@app.post("/api/citations/{no}/withdraw")
+def withdraw_citation(no: str, body: WithdrawIn, user=Depends(require(ADMIN))):
+    """Withdraw a citation (administrators only). The reason is required and kept; the number is never reused."""
+    citation_or_404(no)
+    try:
+        row, changed = cit.withdraw(store, no, user, body.reason)
+    except cit.Refused as e:
+        raise HTTPException(e.status, str(e))
+    return {**cit.view(row), "changed": changed}
 
 
 class ExplainIn(BaseModel):
@@ -870,17 +978,36 @@ def _my_plate_keys(uid):
     return [v["plate_key"] for v in store.vehicles_of(uid, verified_only=True)]
 
 
+def shared_link(path):
+    """A signed, expiring URL for a file under data/evidence, or None when there is no such file (a dangling
+    link would only show the driver a broken picture)."""
+    return cit.signed_url(path, media_key()) if path and cit.evidence_file(DATA, path) else None
+
+
 def _for_driver(v):
     """A case as its registered keeper may see it: the evidence, and nothing about anyone else.
 
     Internal review material is stripped - the reviewer's name, the operator's note, the camera's
-    identifiers - because none of it is theirs to see and some of it names a police officer."""
+    identifiers - because none of it is theirs to see and some of it names a police officer.
+
+    Files are never given as paths. Every picture and the clip is a signed link that expires (one hour by
+    default), so a path that leaks - in a screenshot, a log, a forwarded message - opens nothing. The clip is
+    the smaller copy made when the citation was issued, if there is one; the original stays on the server."""
     keep = ("id", "code", "title", "cls", "wall_time", "video_time_s", "zone", "kph", "details",
-            "plate_text", "plate_text_en", "snapshot", "crop", "clip", "plate_img", "evidence",
-            "camera_location", "status", "vlm")
+            "plate_text", "plate_text_en", "camera_location", "status", "vlm")
     out = {k: v.get(k) for k in keep}
     out["camera"] = v.get("camera_location") or ""
     out.pop("camera_location", None)
+    out["snapshot"] = shared_link(v.get("snapshot"))
+    out["crop"] = shared_link(v.get("crop"))
+    out["plate_img"] = shared_link(v.get("plate_img"))
+    out["clip"] = shared_link(v.get("delivery_clip")) or shared_link(v.get("clip"))
+    photos = [(e, shared_link(e.get("path"))) for e in v.get("evidence") or []]
+    out["evidence"] = [{"label": e.get("label"), "time_s": e.get("time_s"), "wall_time": e.get("wall_time"),
+                        "url": url} for e, url in photos if url]
+    out["citation"] = None if not v.get("citation_no") else {
+        "number": v["citation_no"], "status": v.get("citation_status"), "issued_at": v.get("citation_issued_at"),
+        "fine_bdt": v.get("citation_fine_bdt"), "fine_text": cit.fine_text(v.get("citation_fine_bdt"))}
     return out
 
 
@@ -906,7 +1033,9 @@ def portal_violation(vid: int, request: Request):
     u = _driver(request)
     plates = set(_my_plate_keys(u["user_id"]))
     v = store.violation(vid)
-    if not v or v["status"] != "confirmed":
+    # An advisory case (speed) is answered exactly like one that does not exist: the list already leaves it out,
+    # and a driver who guesses its number must not be able to tell it is there.
+    if not v or v["status"] != "confirmed" or cit.is_advisory(v["code"]):
         raise HTTPException(404, "No such case")
     if auth_mod.normalise_plate(v.get("plate_text_en") or "") not in plates:
         store.audit(u, "portal.denied", "violation", vid, "case is not against a registered vehicle",
@@ -1123,12 +1252,55 @@ def evidence_figure(e):
             f'{escape(when)}</figcaption></figure>')
 
 
+VERIFY_TEXT = ("The issuing authority can re-check this evidence at any time (a traffic controller opens "
+               "/api/citations/{no}/verify). The check recomputes the SHA-256 of every file listed below and of "
+               "the record that lists them, and names any file that differs. The bundle hash above is the "
+               "SHA-256 of that record: keep this printout, because a copy of the hash held outside the "
+               "system is what makes later alteration detectable.")
+
+
+def citation_fields(c):
+    """The citation block of the notice, as template fields: number, state, issuer, fine, and the evidence seal."""
+    if not c:
+        return {"cit_no": "Not issued", "cit_state": "none", "cit_status": "", "cit_issued": "-", "cit_fine": "-",
+                "cit_bundle": "-", "sealed": "",
+                "cit_note": "No citation has been issued for this case, so this page is a record of the case "
+                            "only and carries no penalty."}
+    try:
+        files = json.loads(c["manifest"]).get("files") or []
+    except (ValueError, AttributeError):
+        files = []
+    rows = "".join(f'<tr><td>{escape(str(f.get("role", "")))}</td>'
+                   f'<td>{escape(str(f.get("path", "")).rsplit("/", 1)[-1])}</td>'
+                   f'<td class="hash">{escape(str(f.get("sha256", "")))}</td></tr>' for f in files)
+    sealed = (f'<table class="seal"><caption>Sealed evidence files (SHA-256)</caption>{rows}</table>'
+              if rows else "")
+    note = VERIFY_TEXT.replace("{no}", c["citation_no"])
+    if c["status"] == "withdrawn":
+        note = (f"WITHDRAWN on {c['withdrawn_at'].replace('T', ' ')} by "
+                f"{c['withdrawn_by_name'] or 'an administrator'}: {c['withdraw_reason']}. "
+                "This citation is void. " + note)
+    return {"cit_no": c["citation_no"], "cit_state": c["status"], "cit_status": c["status"],
+            "cit_issued": f"{c['issued_at'].replace('T', ' ')} by {c['issued_by_name'] or 'unknown'}",
+            "cit_fine": cit.fine_text(c["fine_bdt"]), "cit_bundle": c["bundle_sha256"], "cit_note": note,
+            "sealed": sealed}
+
+
+# Template fields whose value is HTML this module has already escaped; every other field is escaped on the way in.
+NOTICE_HTML_FIELDS = ("details", "extra", "sealed")
+
+
 @app.get("/notice/{vid}", response_class=HTMLResponse)
 def notice(vid: int, user=Depends(require(CONTROLLER))):
-    """Printable violation notice for a confirmed case (browser: Print -> Save as PDF)."""
+    """Printable violation notice for a case (browser: Print -> Save as PDF), with its citation if one was issued.
+
+    Refused for an advisory code: speed is detected and shown to staff but never printed as a notice."""
     v = store.violation(vid)
     if not v:
         raise HTTPException(404, "Violation not found")
+    if cit.is_advisory(v["code"]):
+        raise HTTPException(409, f"{v['code']} is advisory: it is detected and reviewed, but it is never printed "
+                                 "as a notice or cited.")
     tpl = (WEB / "notice.html").read_text()
     details = "".join(f"<tr><th>{escape(k.replace('_', ' '))}</th><td>{escape(str(val))}</td></tr>"
                       for k, val in v["details"].items())
@@ -1139,21 +1311,71 @@ def notice(vid: int, user=Depends(require(CONTROLLER))):
               "snapshot": f"/media/{v['snapshot']}", "crop": f"/media/{v['crop']}" if v["crop"] else "",
               "note": v["note"] or "", "printed": datetime.now().strftime("%Y-%m-%d %H:%M"),
               "plate": plate_line(v), "plate_img": f"/media/{v['plate_img']}" if v.get("plate_img") else "",
-              "extra": "".join(evidence_figure(e) for e in v.get("evidence") or [])}
-    for k, val in fields.items():
-        tpl = tpl.replace("{{" + k + "}}", str(val) if k in ("details", "extra") else escape(str(val)))
-    return tpl
+              "extra": "".join(evidence_figure(e) for e in v.get("evidence") or []),
+              **citation_fields(store.citation_by_violation(vid))}
+
+    def fill(m):
+        k = m.group(1)
+        if k not in fields:
+            return m.group(0)
+        return str(fields[k]) if k in NOTICE_HTML_FIELDS else escape(str(fields[k]))
+
+    # One pass over the template. Replacing field by field would re-read text that an earlier field had
+    # inserted, so an officer's note containing "{{plate}}" would be expanded as though it were part of the page.
+    return re.sub(r"\{\{(\w+)\}\}", fill, tpl)
 
 
 # ---------------------------------------------------------------- static
 
-# Only the folders the dashboard actually reads from, and never `data/` as a whole: that served the
-# database itself at /media/surveillance.db - every plate, every offender record - along with the source
-# footage, to anyone who could reach the port. The paths stored in the database are relative to `data/`,
-# so mounting each sub-folder at the same name keeps every existing link working.
-for _name in ("evidence", "autozone"):
+# ---------------------------------------------------------------- media
+
+# Never `data/` as a whole: that once served the database itself at /media/surveillance.db - every plate, every
+# offender record - along with the source footage, to anyone who could reach the port. Only the two folders the
+# dashboard reads from are reachable, and neither is a public mount any more: even with the database out of
+# reach, evidence is pictures of vehicles and their number plates.
+#   /media/<folder>/...   staff (controller or admin) with a session. The paths stored in the database are
+#                         relative to `data/`, so every link the dashboard already builds keeps working.
+#   /m/<token>/<path>     whoever holds a link the portal signed: one file, until it expires.
+for _name in cit.MEDIA_AREAS:
     (DATA / _name).mkdir(parents=True, exist_ok=True)
-    app.mount(f"/media/{_name}", StaticFiles(directory=str(DATA / _name)), name=f"media-{_name}")
+
+
+def media_response(path, max_age=300):
+    # private: a shared cache must not keep pictures of number plates; nosniff and no referrer: a link carries
+    # its own credential, and must not be handed on to whatever site the page happens to be embedded from.
+    return FileResponse(path, headers={"Cache-Control": f"private, max-age={max_age}",
+                                       "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"})
+
+
+@app.get("/media/{area}/{path:path}")
+def staff_media(area: str, path: str, user=Depends(require(CONTROLLER))):
+    """Evidence and learned-zone pictures for the dashboard. Needs a controller or admin session: a driver is
+    refused here too (they get their evidence through signed links), and an unknown folder is a plain 404."""
+    if area not in cit.MEDIA_AREAS:
+        raise HTTPException(404, "Not found")
+    f = cit.resolve_under(DATA / area, path)
+    if f is None:
+        raise HTTPException(404, "Not found")
+    return media_response(f)
+
+
+@app.get("/m/{token}/{path:path}")
+def shared_media(token: str, path: str):
+    """One evidence file for the holder of a signed link. No session: the signature is the credential.
+
+    The answers are deliberately few. A link that does not verify is 403 whether or not the file exists, so
+    this cannot be used to probe the evidence folder; only a link that was really issued can be told it has
+    expired (410), and an expired link is not served."""
+    state = cit.check_token(token, path, media_key())
+    if state == "invalid":
+        raise HTTPException(403, "This link is not valid")
+    if state == "expired":
+        raise HTTPException(410, "This link has expired. Open the case again to get a new one.")
+    f = cit.evidence_file(DATA, path)
+    if f is None:
+        raise HTTPException(404, "Not found")
+    remaining = max(0, int(token.split(".", 1)[0]) - int(time.time()))
+    return media_response(f, max_age=min(300, remaining))
 
 
 @app.get("/")

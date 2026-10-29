@@ -24,6 +24,20 @@
     .offence { margin-top: 18px; padding: 12px 14px; border: 1px solid var(--ink); }
     .offence b { font-size: 16px; }
     .status { display: inline-block; padding: 1px 8px; border: 1px solid var(--ink); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .status:empty { display: none; }
+    /* The citation: what makes this page more than a record of the case. Dashed and grey when there is none, so a
+       printout of an unissued case can never be mistaken for one that carries a penalty. */
+    .citation { margin-top: 14px; padding: 12px 14px; border: 2px solid var(--ink); }
+    .citation.none { border: 1px dashed var(--muted); color: var(--muted); }
+    .citation.withdrawn { border-style: dashed; }
+    .citation.withdrawn .cit-no { text-decoration: line-through; }
+    .cit-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+    .cit-no { font-size: 18px; font-weight: 700; letter-spacing: 0.3px; }
+    .hash { font: 11px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace; word-break: break-all; }
+    .verify { font-size: 11.5px; color: var(--muted); margin-top: 8px; }
+    .seal { margin-top: 10px; font-size: 11px; }
+    .seal caption { text-align: left; color: var(--muted); font-size: 11.5px; padding-bottom: 3px; }
+    .seal td { padding: 3px 8px 3px 0; vertical-align: top; }
     .photos { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin-top: 18px; }
     figure { margin: 0; }
     figcaption { font-size: 12px; color: var(--muted); margin-top: 4px; }
@@ -46,6 +60,15 @@
       <div class="ref">Case no.<b>TV-{{id}}</b><span class="status">{{status}}</span></div>
     </header>
     <div class="offence"><b>{{code}} &middot; {{title}}</b><div class="sub">Vehicle class: {{cls}} &middot; Track #{{track}}</div></div>
+    <div class="citation {{cit_state}}">
+      <div class="cit-head"><div>Citation no. <span class="cit-no">{{cit_no}}</span></div><span class="status">{{cit_status}}</span></div>
+      <table>
+        <tr><th>Issued</th><td>{{cit_issued}}</td></tr>
+        <tr><th>Fine</th><td>{{cit_fine}}</td></tr>
+        <tr><th>Evidence seal (SHA-256)</th><td class="hash">{{cit_bundle}}</td></tr>
+      </table>
+      <div class="verify">{{cit_note}}</div>
+    </div>
     <div class="grid">
       <table>
         <tr><th>Number plate</th><td class="plate">{{plate}}</td></tr>
@@ -53,7 +76,7 @@
         <tr><th>Camera</th><td>{{camera}}</td></tr>
         <tr><th>Location</th><td>{{location}}</td></tr>
         <tr><th>Road zone</th><td>{{zone}}</td></tr>
-        <tr><th>Measured speed</th><td>{{kph}}</td></tr>
+        <tr><th>Speed (descriptor only)</th><td>{{kph}}</td></tr>
         {{details}}
         <tr><th>Officer note</th><td>{{note}}</td></tr>
       </table>
@@ -61,9 +84,10 @@
         <img class="plate-img" src="{{plate_img}}" alt="Number plate" onerror="this.remove()"></div>
     </div>
     <div class="photos">{{extra}}<figure><img src="{{snapshot}}" alt="Scene at the time of the violation"><figcaption>Reported: {{when}}</figcaption></figure></div>
+    {{sealed}}
     <div class="sign"><div>Reviewing officer (name, signature)</div><div>Date</div></div>
-    <div class="foot">Printed {{printed}}. Speeds are measured from calibrated camera geometry with an enforcement tolerance; the
-      evidence video clip is kept with case no. TV-{{id}}.</div>
+    <div class="foot">Printed {{printed}}. Speed is shown only as a descriptor of the scene and is never the basis of a
+      citation. The evidence video clip is kept with case no. TV-{{id}}.</div>
   </div>
 </body>
 </html>

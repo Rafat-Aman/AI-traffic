@@ -6,6 +6,8 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+from .citation import ADVISORY_CODES
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cameras (
     id INTEGER PRIMARY KEY,
@@ -160,7 +162,36 @@ CREATE INDEX IF NOT EXISTS ix_track_global ON tracklets(global_id);
 CREATE INDEX IF NOT EXISTS ix_track_run ON tracklets(run_id);
 CREATE INDEX IF NOT EXISTS ix_viol_cam ON violations(camera_id, created_at);
 CREATE INDEX IF NOT EXISTS ix_viol_status ON violations(status);
+CREATE TABLE IF NOT EXISTS citations (
+    id INTEGER PRIMARY KEY,
+    citation_no TEXT NOT NULL UNIQUE,   -- DMP-2026-000123, the number printed on the notice
+    year INTEGER NOT NULL,              -- numbering restarts each year, so (year, seq) is the real key
+    seq INTEGER NOT NULL,
+    violation_id INTEGER NOT NULL UNIQUE,  -- one citation per case. Deliberately NOT a foreign key: a citation
+                                        -- is a legal record and has to outlive the operational data it was
+                                        -- made from (the manifest below keeps the facts of the case)
+    issued_at TEXT NOT NULL,
+    issued_by INTEGER,                  -- not a foreign key either, for the reason given on violations.reviewed_by
+    issued_by_name TEXT DEFAULT '',
+    fine_bdt INTEGER,                   -- NULL = not set: the amounts are the authority's to supply
+    status TEXT NOT NULL DEFAULT 'issued' CHECK (status IN ('issued', 'withdrawn', 'paid')),
+    bundle_sha256 TEXT NOT NULL,        -- SHA-256 of `manifest`: the figure printed on the notice
+    manifest TEXT NOT NULL,             -- the canonical JSON that was hashed, byte for byte
+    delivery_clip TEXT,                 -- the driver's shorter copy of the clip; the original is what is sealed
+    withdrawn_at TEXT,
+    withdrawn_by INTEGER,
+    withdrawn_by_name TEXT DEFAULT '',
+    withdraw_reason TEXT DEFAULT '',
+    UNIQUE (year, seq)
+);
+CREATE INDEX IF NOT EXISTS ix_citation_status ON citations(status);
 """
+
+# What a case row carries about its citation, joined in so that no caller has to ask a second time (all NULL
+# when the case has none). `delivery_clip` is the driver's shorter copy of the clip.
+CITATION_COLUMNS = (" ct.citation_no, ct.status AS citation_status, ct.issued_at AS citation_issued_at,"
+                    " ct.fine_bdt AS citation_fine_bdt, ct.delivery_clip AS delivery_clip")
+CITATION_JOIN = " LEFT JOIN citations ct ON ct.violation_id=v.id"
 
 DEFAULT_SETTINGS = {
     "model": "bd_vehicles_best.pt",
@@ -290,24 +321,33 @@ class Store:
     def delete_vehicle(self, vid):
         self.x("DELETE FROM vehicles WHERE id=?", (vid,))
 
-    def violations_for_plates(self, plate_keys, limit=200, offset=0):
+    def violations_for_plates(self, plate_keys, limit=200, offset=0, exclude_codes=None):
         """Confirmed cases against any of these plates. Drivers only ever see this, never the whole table.
 
         Matched on the normalised plate, the same way the search box does, because the stored text carries
-        spaces and dashes that nobody types consistently."""
+        spaces and dashes that nobody types consistently.
+
+        Advisory codes (speed) are left out in the query itself, not by whoever formats the answer: a rule
+        that may not support a citation must not reach a driver through a code path that forgot to filter.
+        Leave `exclude_codes` unset for the configured policy; pass a collection only to change it on purpose."""
         if not plate_keys:
             return [], 0
+        skip = sorted(ADVISORY_CODES if exclude_codes is None else exclude_codes)
         norm = "REPLACE(REPLACE(UPPER(v.plate_text_en), ' ', ''), '-', '')"
         marks = ",".join("?" * len(plate_keys))
         where = (f" WHERE v.status='confirmed' AND {norm} IN ({marks})")
-        rows = self.q("SELECT v.*, c.name AS camera_name, c.location AS camera_location FROM violations v"
-                      " JOIN cameras c ON c.id=v.camera_id" + where +
-                      " ORDER BY v.id DESC LIMIT ? OFFSET ?", (*plate_keys, limit, offset))
+        args = list(plate_keys)
+        if skip:
+            where += f" AND v.code NOT IN ({','.join('?' * len(skip))})"
+            args += skip
+        rows = self.q("SELECT v.*, c.name AS camera_name, c.location AS camera_location," + CITATION_COLUMNS +
+                      " FROM violations v JOIN cameras c ON c.id=v.camera_id" + CITATION_JOIN + where +
+                      " ORDER BY v.id DESC LIMIT ? OFFSET ?", (*args, limit, offset))
         for r in rows:
             r["details"] = json.loads(r["details"] or "{}")
             r["evidence"] = json.loads(r.get("evidence") or "[]")
             r["vlm"] = json.loads(r["vlm"]) if r.get("vlm") else None
-        total = self.q(f"SELECT COUNT(*) AS n FROM violations v{where}", tuple(plate_keys))[0]["n"]
+        total = self.q(f"SELECT COUNT(*) AS n FROM violations v{where}", tuple(args))[0]["n"]
         return rows, total
 
     # ------------------------------------------------------------ sessions
@@ -553,8 +593,8 @@ class Store:
     def violations(self, camera_id=None, code=None, status=None, run_id=None, ids=None, limit=100, offset=0,
                    order="DESC", plate=None):
         w, args = self._filters(camera_id, code, status, run_id, ids, plate)
-        sql = ("SELECT v.*, c.name AS camera_name, c.location AS camera_location FROM violations v "
-               "JOIN cameras c ON c.id=v.camera_id" + w +
+        sql = ("SELECT v.*, c.name AS camera_name, c.location AS camera_location," + CITATION_COLUMNS +
+               " FROM violations v JOIN cameras c ON c.id=v.camera_id" + CITATION_JOIN + w +
                f" ORDER BY v.id {'ASC' if order == 'ASC' else 'DESC'} LIMIT ? OFFSET ?")
         rows = self.q(sql, (*args, limit, offset))
         for r in rows:
@@ -578,6 +618,85 @@ class Store:
         self.x("UPDATE violations SET status=?, note=?, reviewed_at=?, reviewed_by=?, reviewed_by_name=?"
                " WHERE id=?", (status, note, now(), u.get("user_id"),
                                u.get("name") or u.get("username") or "", vid))
+
+    # ------------------------------------------------------------ citations
+    def citation(self, no):
+        r = self.q("SELECT * FROM citations WHERE citation_no=?", (no,))
+        return r[0] if r else None
+
+    def citation_by_violation(self, vid):
+        r = self.q("SELECT * FROM citations WHERE violation_id=?", (vid,))
+        return r[0] if r else None
+
+    def citations(self, status=None, plate=None, limit=100, offset=0):
+        """(rows, total), newest first. A row carries the case and camera as they are now (blank if the case
+        has since been deleted - the citation outlives it) and no manifest: that is for the single view."""
+        where, args = [], []
+        if status:
+            where.append("ct.status=?")
+            args.append(status)
+        if plate:       # the same matching as the review search: ignores case, spaces and dashes
+            where.append("REPLACE(REPLACE(UPPER(v.plate_text_en), ' ', ''), '-', '') LIKE ?")
+            args.append("%" + "".join(ch for ch in plate.upper() if ch not in " -") + "%")
+        base = (" FROM citations ct LEFT JOIN violations v ON v.id=ct.violation_id"
+                " LEFT JOIN cameras c ON c.id=v.camera_id" + (" WHERE " + " AND ".join(where) if where else ""))
+        rows = self.q("SELECT ct.id, ct.citation_no, ct.violation_id, ct.issued_at, ct.issued_by_name,"
+                      " ct.fine_bdt, ct.status, ct.bundle_sha256, ct.delivery_clip, ct.withdrawn_at,"
+                      " ct.withdraw_reason, v.code, v.title, v.plate_text_en AS plate, v.wall_time,"
+                      " c.name AS camera_name" + base + " ORDER BY ct.id DESC LIMIT ? OFFSET ?",
+                      (*args, limit, offset))
+        return rows, self.q("SELECT COUNT(*) AS n" + base, args)[0]["n"]
+
+    def create_citation(self, violation_id, by, fine_bdt, bundle_sha256, manifest, delivery_clip=None,
+                        issued_at=None, prefix="DMP"):
+        """Number a citation and store it as one step. Returns (row, created).
+
+        The number is the next in this year's sequence. The look-up of the highest number and the insert
+        happen inside one write transaction (taken up front, so the look-up cannot go stale between two
+        requests, or between two server processes); the unique keys on the number and on the case are the
+        backstop. If the case already has a citation, that one is returned and nothing is written."""
+        u = by or {}
+        at = issued_at or now()
+        year = int(at[:4])
+        with self.lock:
+            if self.db.in_transaction:      # a statement that failed earlier can leave one open; it holds nothing
+                self.db.commit()
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                have = self.db.execute("SELECT * FROM citations WHERE violation_id=?", (violation_id,)).fetchone()
+                if have:
+                    self.db.rollback()
+                    return dict(have), False
+                seq = self.db.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM citations WHERE year=?",
+                                      (year,)).fetchone()[0]
+                no = f"{prefix}-{year:04d}-{seq:06d}"
+                self.db.execute(
+                    "INSERT INTO citations (citation_no, year, seq, violation_id, issued_at, issued_by,"
+                    " issued_by_name, fine_bdt, bundle_sha256, manifest, delivery_clip)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (no, year, seq, violation_id, at, u.get("user_id"),
+                     u.get("name") or u.get("username") or "", fine_bdt, bundle_sha256, manifest, delivery_clip))
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()
+                raise
+        return self.citation(no), True
+
+    def set_delivery_clip(self, no, path):
+        self.x("UPDATE citations SET delivery_clip=? WHERE citation_no=?", (path, no))
+
+    def withdraw_citation(self, no, by, reason):
+        u = by or {}
+        self.x("UPDATE citations SET status='withdrawn', withdrawn_at=?, withdrawn_by=?, withdrawn_by_name=?,"
+               " withdraw_reason=? WHERE citation_no=? AND status='issued'",
+               (now(), u.get("user_id"), u.get("name") or u.get("username") or "", reason, no))
+
+    def live_citations_for_camera(self, cid):
+        """Numbers of the citations still standing (not withdrawn) for cases from this camera. Their evidence
+        has to stay on the disk, so deleting the camera or its cases is refused while there are any."""
+        return [r["citation_no"] for r in self.q(
+            "SELECT ct.citation_no FROM citations ct JOIN violations v ON v.id=ct.violation_id"
+            " WHERE v.camera_id=? AND ct.status != 'withdrawn' ORDER BY ct.id", (cid,))]
 
     def clear_violations(self, cid):
         self.x("DELETE FROM violations WHERE camera_id=?", (cid,))

@@ -2,9 +2,13 @@
 
 The last `pre_sec` of display frames are kept in memory as JPEG bytes (~100 KB each at 1280 px). When a violation
 happens the clip collects `post_sec` more seconds, then a background thread encodes it with ffmpeg (libx264).
+
+A second, smaller copy is made for the person a citation is addressed to (make_delivery_clip). The original is
+the evidence and is never changed; the copy is only so a phone on a mobile plan can watch it.
 """
 
 import queue
+import subprocess
 import threading
 from collections import deque
 from pathlib import Path
@@ -39,6 +43,47 @@ def write_mp4(path, jpegs, fps):
             vw.write(f)
         vw.release()
     tmp.rename(path)
+
+
+DELIVERY_MAX_HEIGHT = 720
+DELIVERY_CRF = 28
+
+
+def make_delivery_clip(src, dst, max_height=DELIVERY_MAX_HEIGHT, crf=DELIVERY_CRF, preset="veryfast", timeout=180):
+    """A smaller copy of an evidence clip for the person it is addressed to: at most `max_height` pixels
+    tall (never enlarged), H.264, constant-quality `crf`, index first (+faststart) so it starts playing before
+    it has all arrived.
+
+    The original is not touched and is what a citation's hash seals; this copy is regenerated if it is lost.
+    It is written as <name>.part.mp4 and renamed when complete - the convention write_mp4 uses - so a
+    half-written file is never served. Measured on this project's footage: a 1242x1440 original of 5.7 MB
+    becomes 1.1 MB, and a 1280x720 original loses about a third. The `veryfast` preset is the smallest at
+    this quality as well as the quickest (about 2 s for a 10 s clip on the development CPU). Raise `crf`
+    (30 gives under 1 MB for the first case) if a hard size target matters more than detail.
+    Raises RuntimeError when ffmpeg is missing or fails; the caller decides whether that matters."""
+    if imageio_ffmpeg is None:
+        raise RuntimeError("ffmpeg is not available")
+    src, dst = Path(src), Path(dst)
+    if src.resolve() == dst.resolve():
+        raise ValueError("the delivery copy must not overwrite the original clip")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(".part.mp4")
+    # scale to an even height no taller than max_height (H.264 4:2:0 needs even sides); -2 keeps the width even
+    # and the aspect ratio. The single quotes keep the comma inside min() from being read as a filter separator.
+    scale = f"scale=-2:'trunc(min({int(max_height)},ih)/2)*2'"
+    cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-v", "error", "-i", str(src), "-vf", scale, "-c:v", "libx264",
+           "-preset", preset, "-crf", str(int(crf)), "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an",
+           str(tmp)]
+    try:
+        run = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if run.returncode != 0:
+            tail = (run.stderr.strip().splitlines() or ["no message"])[-1]
+            raise RuntimeError(f"ffmpeg failed: {tail}")
+        tmp.replace(dst)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"ffmpeg took more than {timeout} s") from None
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 class ClipRecorder:

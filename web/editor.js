@@ -1,9 +1,9 @@
 /* Zone editor: draw road zones, special areas and solid lane lines on a frame of the camera. */
 (function () {
   "use strict";
-  const COLORS = { road: "#ffc800", no_parking: "#ff5a4f", bus_stop: "#2ecc71", intersection: "#e8e8e8", signal: "#ffdc00", parking: "#3d8bff", uturn: "#c86bfa", line: "#ffffff" };
-  const LABEL = { road: "Road zone", no_parking: "No-parking kerb", bus_stop: "Bus stop", intersection: "Intersection", signal: "Signal queue area", parking: "Legal parking", uturn: "U-turn opening", line: "Solid lane line" };
-  const AREA_ORDER = ["no_parking", "bus_stop", "intersection", "signal", "parking", "uturn"];
+  const COLORS = { road: "#ffc800", no_parking: "#ff5a4f", bus_stop: "#2ecc71", intersection: "#e8e8e8", signal: "#ffdc00", parking: "#3d8bff", uturn: "#c86bfa", bus_lane: "#00d2be", line: "#ffffff" };
+  const LABEL = { road: "Road zone", no_parking: "No-parking kerb", bus_stop: "Bus stop", intersection: "Intersection", signal: "Signal queue area", parking: "Legal parking", uturn: "U-turn opening", bus_lane: "Bus lane", line: "Solid lane line" };
+  const AREA_ORDER = ["no_parking", "bus_stop", "intersection", "signal", "parking", "uturn", "bus_lane"];
   const HELP = {
     select: "Click a shape to select it, drag its corners or body to adjust. Delete removes it. Ctrl/⌘+Z undoes.",
     road: "Click the 4 corners of a real rectangle on the road surface that you can measure – e.g. two lane lines, between two dash ends. Any order.",
@@ -13,6 +13,7 @@
     signal: "Mark where vehicles queue for the signal (the lanes before the stop line). Stops inside are never violations. Enter to finish.",
     parking: "Mark a legal parking bay. Vehicles standing inside are not illegal parking. Enter to finish.",
     uturn: "Mark a legal U-turn opening in the median. Turning there is not wrong-side driving. Enter to finish.",
+    bus_lane: "Click around a lane reserved for buses, inside its painted edges. Another vehicle driving along it for 25 m and 4 s is reported (V9); crossing it to turn or reach the kerb is not. Set the hours if it only applies at certain times. Enter to finish.",
     line: "Click both ends of a SOLID (unbroken) lane line. Only solid lines prohibit changing lanes; skip broken lines.",
   };
   const CORNER_NAMES = ["far-left", "far-right", "near-right", "near-left"];
@@ -260,7 +261,8 @@
         ctx.strokeStyle = col; ctx.lineWidth = (isSel ? 3.5 : 2) * k; ctx.stroke();
         if (s.kind === "road") drawRoadExtras(s.obj, k, col);
         const top = pts.reduce((a, p) => (p[1] < a[1] ? p : a), pts[0]);
-        const sizeTxt = s.kind === "road" ? (s.obj.width_m && s.obj.length_m ? ` · ${s.obj.width_m}×${s.obj.length_m} m` : " · size?") : "";
+        const sizeTxt = s.kind === "road" ? (s.obj.width_m && s.obj.length_m ? ` · ${s.obj.width_m}×${s.obj.length_m} m` : " · size?")
+          : (s.kind === "bus_lane" && s.obj.hours && s.obj.hours.length ? ` · ${s.obj.hours.map((h) => h.join("–")).join(", ")}` : "");
         const stop = s.kind === "bus_stop" ? (check.bus_stops || []).find((b) => b.name === s.obj.name) : null;
         const bad = stop && !stop.valid;
         if (bad) { ctx.setLineDash([10 * k, 7 * k]); ctx.strokeStyle = "#ff3b30"; ctx.lineWidth = 3 * k; ctx.stroke(); ctx.setLineDash([]); }
@@ -419,7 +421,7 @@
           <li>Check <b>Top-down view</b>: lane lines must come out straight and parallel.</li>
           <li>Set the allowed direction (use the suggestion once traffic has been analysed), banned vehicle classes and road type.</li>
           <li>Add <b>No-parking kerb</b> strips along the kerbs (select a road zone → <i>Add kerb strips</i>).</li>
-          <li>Mark <b>Intersections</b> (junction mouths), then <b>Bus stops</b> just after them – a bus stop anywhere else does not count. Add signal queue areas, legal parking and U-turn openings; draw solid lane lines if painted.</li>
+          <li>Mark <b>Intersections</b> (junction mouths), then <b>Bus stops</b> just after them – a bus stop anywhere else does not count. Add signal queue areas, legal parking, U-turn openings and <b>Bus lanes</b> (with their hours, if they only apply at certain times); draw solid lane lines if painted.</li>
           <li>Save, then start the camera.</li></ol>`;
         return;
       }
@@ -459,7 +461,8 @@
         html += `<label class="field">Type<select id="p-type">${meta.area_types.map((t) => `<option value="${t}" ${z.type === t ? "selected" : ""}>${LABEL[t]}</option>`).join("")}</select></label>
           <div class="hint">${HELP[z.type]}</div>
           ${kind === "bus_stop" ? `${stop ? `<div class="small ${stop.valid ? "okline" : "errors"}">${stop.valid ? "Valid bus stop: " : "Not a bus stop for enforcement: "}${esc(stop.reason)}</div>` : ""}
-            <label class="row small"><input type="checkbox" id="p-approved" ${z.approved ? "checked" : ""}> Officially approved mid-block bus bay (skip the after-intersection check)</label>` : ""}`;
+            <label class="row small"><input type="checkbox" id="p-approved" ${z.approved ? "checked" : ""}> Officially approved mid-block bus bay (skip the after-intersection check)</label>` : ""}
+          ${kind === "bus_lane" ? hoursField(z) : ""}`;
       } else {
         html += `<div class="hint">Crossing this line from one side to the other is reported as V5. Vehicles riding on the line are not.</div>`;
       }
@@ -494,9 +497,27 @@
         });
         $("#p-top", box).onclick = () => topDown(z);
       } else if (kind !== "line") {
-        $("#p-type", box).onchange = (e) => { commit(() => { z.type = e.target.value; }); renderProps(); };
+        $("#p-type", box).onchange = (e) => { commit(() => { z.type = e.target.value; if (z.type !== "bus_lane") delete z.hours; }); renderProps(); };
         if ($("#p-approved", box)) $("#p-approved", box).onchange = (e) => commit(() => { z.approved = e.target.checked; });
+        if (kind === "bus_lane") {
+          const setHours = (v) => { if (v && v.length) z.hours = v; else delete z.hours; };   // none = in force all day
+          $("#p-allday", box).onchange = (e) => { commit(() => setHours(e.target.checked ? null : DEFAULT_PEAK.map((p) => [...p]))); renderProps(); };
+          $$("[data-hr]", box).forEach((inp) => inp.onchange = () => commit(() => { z.hours[+inp.dataset.hr][+inp.dataset.e] = inp.value; }));
+          $$("[data-hrdel]", box).forEach((b) => b.onclick = () => { commit(() => { z.hours.splice(+b.dataset.hrdel, 1); setHours(z.hours); }); renderProps(); });
+          if ($("#p-hradd", box)) $("#p-hradd", box).onclick = () => { commit(() => { z.hours.push(["12:00", "14:00"]); }); renderProps(); };
+        }
       }
+    }
+
+    // The times of day a bus lane is in force (V9). Same ranges and editing as the kerb no-parking hours below; none = all day.
+    function hoursField(z) {
+      const allDay = !(z.hours && z.hours.length);
+      return `<div class="field">Hours the lane is in force <span class="hint">– outside them any vehicle may use it</span>
+        <label class="row small"><input type="checkbox" id="p-allday" ${allDay ? "checked" : ""}> In force all day</label>
+        <div id="p-hours" class="stack ${allDay ? "hidden" : ""}" style="gap:6px">${(z.hours || []).map((h, i) => `<div class="row">
+          <input type="time" value="${esc(h[0])}" data-hr="${i}" data-e="0"> – <input type="time" value="${esc(h[1])}" data-hr="${i}" data-e="1">
+          <button class="btn small ghost" data-hrdel="${i}">Remove</button></div>`).join("")}
+          <button class="btn small" id="p-hradd" style="align-self:flex-start">Add time range</button></div></div>`;
     }
 
     function speedHint(cat) {
@@ -540,7 +561,7 @@
             <button class="btn small" id="r-pkadd" style="align-self:flex-start">Add time range</button></div></div>
         <div class="field">Active rules<div class="stack" style="gap:4px">${ruleList.map((x) => `<label class="row small"><input type="checkbox" data-rule="${x.key}" ${enabled(x.key) ? "checked" : ""}>
           <span class="code">${x.code}</span>${esc(x.title)}</label>`).join("")}</div>
-          <span class="hint">V3 needs a no-parking kerb strip, V5 solid lane lines, V8 banned classes, V6 a helmet model; V4 needs a one-way zone.</span></div></div>`;
+          <span class="hint">V3 needs a no-parking kerb strip, V5 solid lane lines, V8 banned classes, V9 a bus lane, V6 a helmet model; V4 needs a one-way zone.</span></div></div>`;
       const setRule = (key, field, value) => { snapshot(); r[key] = { ...(r[key] || {}), [field]: value }; };
       $("#r-bus").onchange = (e) => setRule("bus_blocking", "dwell_sec", +e.target.value);
       $("#r-park").onchange = (e) => setRule("illegal_parking", "dwell_sec", +e.target.value);
@@ -562,6 +583,7 @@
         if (names.has(z.name)) errs.push(`Two shapes are called "${z.name}"`);
         names.add(z.name);
         if ((z.type || "road") === "road" && !(z.width_m > 0 && z.length_m > 0)) errs.push(`Enter the width and length of "${z.name}"`);
+        if (z.type === "bus_lane" && (z.hours || []).some((h) => !h[0] || !h[1] || h[0] === h[1])) errs.push(`Set a different start and end for each hour range of "${z.name}"`);
       });
       if (!cfg.zones.some((z) => (z.type || "road") === "road")) errs.push("Draw at least one road zone");
       return errs;
