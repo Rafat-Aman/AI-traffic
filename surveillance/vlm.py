@@ -23,6 +23,8 @@ Declining is a first-class answer
     illegal-stopping detector.
 
 Backends
+    cascade - surveillance/vlm_cascade.py: a 2B model screens every case and an 8B reasons on the escalated
+             ones; it calls into this module for the prompt, the schema and every guard.
     local  - llama.cpp's server with a quantised Qwen2.5-VL (tools/setup_vlm.sh, tools/vlm_server.sh).
              Runs on the CPU, needs no key and no network.
     cloud  - Anthropic or any OpenAI-compatible endpoint, for better reasoning when a key is configured.
@@ -84,6 +86,17 @@ RULE_CLAIM = {
            "It is only crossing the lane to turn or to reach the kerb; or it is in fact a bus, an ambulance or "
            "another authorised vehicle; or the lane is not in force at that time of day, or its markings cannot "
            "be seen in the photographs, so nothing shows that this is a bus lane."),
+    "V10": ("The vehicle swerved abruptly while moving at speed: it shifted sideways by about two metres or more "
+            "within about two seconds, which the system flags as a possible unsafe or erratic manoeuvre. This is a "
+            "candidate for you to judge, not an established offence.",
+            "It swerved round something in its way - a pothole, a pedestrian or a stopped vehicle - or merged into "
+            "a gap in the next lane, or the road bends or opens into a junction there, so the path is ordinary "
+            "driving rather than a dangerous manoeuvre."),
+    "V11": ("Two vehicles came dangerously close while closing on each other and one braked hard, or they touched "
+            "and both then stood still. This is a candidate for you to judge, not an established accident.",
+            "The two vehicles are only passing close to each other in dense, slow traffic, with no sign of an "
+            "impact, a skid or a vehicle stopped askew; or the two outlined boxes have swapped or merged and "
+            "really mark the same vehicle."),
 }
 
 ASSESSMENTS = ("supported", "insufficient", "contradicted")
@@ -180,7 +193,7 @@ Now answer. Fill "visible" first, from the photographs alone, before judging any
   "aftermath": "what followed - traffic going round it, a queue forming, the vehicle moving off - or \\"not visible\\"",
   "cause":     "the most probable reason for the behaviour, 1-2 sentences, or \\"cannot be determined\\"",
   "assessment": "supported | contradicted | insufficient",
-  "confidence": 0.0,
+  "confidence": <a number from 0.0 to 1.0: how sure you are of your verdict>,
   "summary":   "one sentence an officer could paste into a notice",
   "other_cameras": "what the other cameras add, if anything, or \\"nothing\\" - and \\"not applicable\\" when none were given"
 }}
@@ -214,6 +227,12 @@ class Explanation:
     seconds: float = 0.0
     error: str = ""
     images: int = 0
+    # Two-tier cascade (surveillance/vlm_cascade.py). Empty / default on the single-model path.
+    decided_by: str = ""             # "" (single model) | "reasoner" | "screen" | "prescreen"
+    escalated: Optional[bool] = None
+    escalation_reason: str = ""
+    reasoner_unavailable: bool = False
+    stages: list = field(default_factory=list)
 
     def as_dict(self):
         return {k: v for k, v in self.__dict__.items()}
@@ -237,25 +256,39 @@ def encode_image(path, max_side, quality=85):
     return buf.tobytes() if ok else None
 
 
+CONTACT_CODES = ("V10", "V11")
+
+
 def gather_images(violation, data_dir, max_images, max_side):
     """Evidence photos for a case, most informative first: the close-up, the whole scene with the vehicle
     boxed and its path drawn, then any extra moment the rule saved (e.g. when the vehicle stopped).
 
+    For the two candidates the model has to decide (V10 swerve, V11 near-collision / collision) the frame that
+    shows both vehicles boxed at the moment of contact is the one photograph that can settle it, so when the
+    rule saved one it goes first and the default of two photographs keeps it: contact frame, then the close-up.
+
     Returns [(label, jpeg bytes)]."""
     data_dir = Path(data_dir)
+    extras = [(e.get("label", "happened"), e["path"]) for e in (violation.get("evidence") or []) if e.get("path")]
     wanted = []
+    contact = [x for x in extras if x[0] == "contact"] \
+        if (violation.get("code") or "").upper() in CONTACT_CODES else []
+    for _, path in contact[:1]:
+        wanted.append(("the moment the two vehicles touched, both outlined", path))
     if violation.get("crop"):
         wanted.append(("close-up of the vehicle", violation["crop"]))
     if violation.get("snapshot"):
         wanted.append(("the whole scene, vehicle outlined in red, its recent path in yellow",
                        violation["snapshot"]))
-    for e in (violation.get("evidence") or []):
-        if e.get("path"):
-            wanted.append((f"the moment it {e.get('label', 'happened')}", e["path"]))
+    for label, path in extras:
+        if (label, path) not in contact[:1]:
+            wanted.append((f"the moment it {label}", path))
     if violation.get("plate_img"):
         wanted.append(("the number plate as read", violation["plate_img"]))
     out = []
-    for label, rel in wanted[:max_images]:
+    for label, rel in wanted:
+        if len(out) >= max_images:
+            break
         p = data_dir / rel
         if not p.exists():
             continue
@@ -276,7 +309,7 @@ def describe_facts(violation):
     if v.get("zone"):
         add(f"- road zone: {v['zone']}")
     if v.get("areas"):
-        add(f"- marked areas the vehicle was standing in: {v['areas'].replace('|', ', ')}")
+        add(f"- marked areas the vehicle was inside: {v['areas'].replace('|', ', ')}")
     if v.get("wall_time"):
         add(f"- time of day: {v['wall_time']}")
     d = v.get("details") or {}
@@ -435,14 +468,18 @@ class OpenAIChat:
         self._health[self.base] = (time.monotonic(), up)
         return up
 
-    def ask(self, system, user_text, images):
+    def ask(self, system, user_text, images, max_tokens=None, schema=None):
+        """`schema`: a JSON schema the reply must follow (llama.cpp turns it into a grammar, so a 2B model
+        cannot ramble); without it the reply is "some JSON object"."""
         content = [{"type": "text", "text": user_text}]
         for _, jpg in images:
             b64 = base64.b64encode(jpg).decode()
             content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
-        payload = {"model": self.model, "max_tokens": self.max_tokens, "temperature": 0.2,
+        fmt = ({"type": "json_schema", "json_schema": {"name": "reply", "strict": True, "schema": schema}}
+               if schema else {"type": "json_object"})
+        payload = {"model": self.model, "max_tokens": max_tokens or self.max_tokens, "temperature": 0.2,
                    "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}],
-                   "response_format": {"type": "json_object"}}
+                   "response_format": fmt}
         headers = {"Authorization": f"Bearer {self.key}"} if self.key else {}
         data = _post(f"{self.base}/v1/chat/completions", payload, headers, self.timeout)
         return data["choices"][0]["message"]["content"]
@@ -460,13 +497,14 @@ class AnthropicChat:
     def available(self):
         return bool(self.key)
 
-    def ask(self, system, user_text, images):
+    def ask(self, system, user_text, images, max_tokens=None, schema=None):
         content = []
         for _, jpg in images:
             content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
                                                         "data": base64.b64encode(jpg).decode()}})
         content.append({"type": "text", "text": user_text})
-        payload = {"model": self.model, "max_tokens": self.max_tokens, "temperature": 0.2, "system": system,
+        payload = {"model": self.model, "max_tokens": max_tokens or self.max_tokens, "temperature": 0.2,
+                   "system": system,
                    "messages": [{"role": "user", "content": content}]}
         headers = {"x-api-key": self.key, "anthropic-version": "2023-06-01"}
         data = _post(self.API, payload, headers, self.timeout)
@@ -482,6 +520,21 @@ DEFAULTS = {
     "vlm_max_images": 2,               # every image costs real seconds on a CPU backend
     "vlm_max_side": 768,               # longest side sent to the model, pixels
     "vlm_timeout_sec": 300,
+    # ---- two-tier cascade (surveillance/vlm_cascade.py); the keys above are the single-model path
+    "vlm_mode": "auto",                # auto: cascade when a reasoner can exist, else single | cascade | single
+    "vlm_screen_url": "http://127.0.0.1:8081",
+    "vlm_screen_model": "qwen3-vl-2b",
+    "vlm_screen_images": 2,
+    "vlm_screen_timeout_sec": 120,
+    "vlm_reason_backend": "auto",      # auto (local 8B if installed, else cloud) | local | cloud
+    "vlm_reason_url": "http://127.0.0.1:8082",
+    "vlm_reason_model": "qwen3-vl-8b",
+    "vlm_reason_idle_sec": 300,        # stop the on-demand 8B after this long without a case
+    "vlm_reason_start_sec": 240,       # give up if it is not serving by then
+    "vlm_reason_timeout_sec": 900,     # one 8B answer: ~4 min on a busy 6-core CPU with two photographs
+    "vlm_escalation": "asymmetric",    # asymmetric | balanced | always (see vlm_cascade.py)
+    "vlm_stop_score": 0.6,             # asymmetric: only a pre-screen score below this may be stopped by a "no"
+    "vlm_no_confidence": 0.7,          # a "no" counts as confident from here
 }
 
 
@@ -538,8 +591,9 @@ class Explainer:
     `on_result(vid, Explanation)` is called from the worker thread.
     """
 
-    def __init__(self, data_dir, settings, on_result, max_queue=50):
+    def __init__(self, data_dir, settings, on_result, max_queue=50, cascade=None):
         self.data_dir, self.on_result = Path(data_dir), on_result
+        self.cascade = cascade         # surveillance.vlm_cascade.Cascade, or None for the single-model path
         self.settings = {**DEFAULTS, **(settings or {})}
         self.jobs = queue.Queue(max_queue)
         self.pending = set()
@@ -570,6 +624,8 @@ class Explainer:
     def explain_now(self, violation, settings=None):
         """Run synchronously (command line, tests). Returns an Explanation."""
         settings = {**self.settings, **(settings or {})}
+        if self.cascade is not None and self.cascade.active(settings):
+            return self.cascade.run(violation, settings)
         backend = resolve_backend(settings)
         if backend is None:
             return Explanation(ok=False, error="No reasoning model configured. Start tools/vlm_server.sh or "

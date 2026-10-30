@@ -13,6 +13,9 @@ web dashboard for setting up camera zones, watching live, reviewing evidence and
 | V5 | Crossing a solid lane line | solid lane lines drawn |
 | V6 | Motorbike rider or pillion without helmet | included (`models/helmet_cls`) |
 | V8 | Vehicle banned on this road (rickshaw on a main road, CNG on a flyover, ...) | banned classes per zone |
+| V9 | Non-bus vehicle driving along a bus lane (crossing it to turn or reach the kerb is fine) | bus lane drawn (optional hours) |
+| V10 | Unsafe or erratic manoeuvre: abrupt swerve at speed. A *candidate* for the vision-language model, never cited on its own | road zone |
+| V11 | Near-collision or collision: fast closing plus hard braking, or contact then both vehicles stationary. A *candidate* for the vision-language model, never cited on its own | road zone |
 
 Every case also gets an attempt at **reading the number plate** (Bangla, BRTA layout). See "Number plates" below.
 
@@ -268,7 +271,7 @@ the whole trick - it is the same physics at every camera, so nothing is configur
 | Lateral position maps linearly | learned per route, mirrored when cameras face opposite ways |
 | Speed and physical width agree | the homography this project already uses for speed |
 | Colour | HSV histogram + CIELAB of the body — or of the **rider's clothing** on a two-wheeler |
-| Appearance vector | MobileNetV3 features over the clearest crops (`surveillance/embed.py`) |
+| Appearance vector | the team's CityFlow ReID model (background thread) or, until it arrives and as the fallback, MobileNetV3 features, over the clearest crops (`surveillance/embed.py`) |
 
 Each cue becomes a log-likelihood ratio **fitted from the confident matches themselves**, so no threshold is
 guessed and a cue that fails to separate is switched off automatically. The assignment is one-to-one, and
@@ -278,7 +281,7 @@ camera layout.
 
 ### Does the appearance vector earn its place?
 
-It is **not** a vehicle re-identification model — MobileNetV3 was trained on ImageNet, not on telling one
+The MobileNetV3 fallback is **not** a vehicle re-identification model — MobileNetV3 was trained on ImageNet, not on telling one
 car from another. Measured on real footage from this project with `tools/reid_eval.py`, which splits each
 vehicle's crops into an early and a late half and asks whether the halves match each other better than they
 match other vehicles:
@@ -297,8 +300,11 @@ difference between refusing and matching:
 | Colour only | 0 | — | *refuses* |
 | **+ appearance vector** | 90 | **98.2%** | **98.5%** |
 
-Proper ReID weights would be better and would drop straight in — the interface would not change — but they
-want a GPU and a labelled vehicle corpus, and this project has neither.
+The team's trained ReID model (ResNet50-IBN-a, CityFlowV2 weights) is now wired in: it makes a second vector in
+a background thread (about 1 s per vehicle, off the video loop), the matcher prefers it when both tracklets have
+it, and the likelihood-ratio cue is fitted separately per model. On this project's single-camera footage it
+ranks a vehicle's other half first 98.4% of the time (MobileNet 75.8%); how it does across cameras is not yet
+measured.
 
 ### When it refuses, and why that matters
 
@@ -488,7 +494,7 @@ surveillance/vlm.py       the reasoner: prompts, backends, the decline rule, the
 surveillance/auth.py      password and code hashing, rate limits, what each role may do
 surveillance/webauth.py   sessions, the route guards, first-run administrator
 surveillance/reid.py      cross-camera Re-ID: tracklets, colour signatures, route discovery, matching
-surveillance/embed.py     the appearance vector per vehicle
+surveillance/embed.py     the appearance vectors (ReID + MobileNet) per vehicle
 surveillance/link.py      batch and online linking, and multi-video site runs
 tools/reid_eval.py        does appearance actually separate vehicles on this footage?
 tools/                  setup_vlm.sh, vlm_server.sh, vlm_check.py (hardware + cost check)

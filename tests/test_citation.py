@@ -69,7 +69,11 @@ class Scratch(unittest.TestCase):
 class AdvisoryPolicyTests(unittest.TestCase):
     def test_speed_is_advisory_unless_the_environment_says_otherwise(self):
         """The report: speed "never supports a speeding citation". The default has to be that position."""
-        self.assertEqual(cit.advisory_codes({}), frozenset({"V2"}))
+        self.assertIn("V2", cit.advisory_codes({}))
+
+    def test_vlm_decided_candidates_are_advisory_by_default(self):
+        """V10 / V11 come from kinematics alone and are decided by the VLM; nothing here may cite them."""
+        self.assertEqual(cit.advisory_codes({}), frozenset({"V2", "V10", "V11"}))
 
     def test_the_environment_replaces_the_list(self):
         self.assertEqual(cit.advisory_codes({"ADVISORY_CODES": "v2, V6 ,"}), frozenset({"V2", "V6"}))
@@ -78,7 +82,7 @@ class AdvisoryPolicyTests(unittest.TestCase):
         self.assertEqual(cit.advisory_codes({"ADVISORY_CODES": ""}), frozenset())
 
     def test_every_other_rule_stays_citable(self):
-        for code in ("V1", "V3", "V4", "V5", "V6", "V7", "V8"):
+        for code in ("V1", "V3", "V4", "V5", "V6", "V7", "V8", "V9"):
             self.assertFalse(cit.is_advisory(code, cit.advisory_codes({})), code)
 
     def test_matching_ignores_case_and_stray_spaces(self):
@@ -923,13 +927,16 @@ class PortalAndListingTests(StoreScratch):
 
     def test_a_driver_never_gets_a_speed_case_even_when_it_is_confirmed(self):
         speed, kerb = self.case(code="V2"), self.case(code="V3")
+        for vid in (speed, kerb):        # the portal lists cited cases only
+            cit.issue(self.store, vid, self.officer, self.root, advisory=frozenset(), schedule={})
         ids = [r["id"] for r in self.store.violations_for_plates(self.keys())[0]]
         self.assertEqual(ids, [kerb])
         self.assertNotIn(speed, ids)
         self.assertEqual(self.store.violations_for_plates(self.keys())[1], 1)
 
     def test_the_exclusion_follows_the_configured_policy_unless_overridden_on_purpose(self):
-        self.case(code="V2")
+        speed = self.case(code="V2")
+        cit.issue(self.store, speed, self.officer, self.root, advisory=frozenset(), schedule={})
         self.assertEqual(self.store.violations_for_plates(self.keys(), exclude_codes=())[1], 1)
         self.assertEqual(self.store.violations_for_plates(self.keys(), exclude_codes=("V2",))[1], 0)
 
@@ -940,7 +947,7 @@ class PortalAndListingTests(StoreScratch):
         self.assertEqual((rows[cited]["citation_no"], rows[cited]["citation_status"], rows[cited]["citation_fine_bdt"]),
                          (no, "issued", 700))
         self.assertTrue(rows[cited]["delivery_clip"].endswith("_delivery.mp4"))
-        self.assertIsNone(rows[plain]["citation_no"])
+        self.assertNotIn(plain, rows, "an uncited case is not in the driver's list")
         staff = {r["id"]: r for r in self.store.violations(limit=10)}
         self.assertEqual(staff[cited]["citation_no"], no)
         self.assertIsNone(staff[plain]["citation_no"])
@@ -1366,8 +1373,10 @@ class NoticeTests(ServerScratch):
         self.assertNotIn("<b>x</b>", html)
 
     def test_the_notice_is_for_staff_only(self):
-        self.assertEqual(self.call("GET", f"/notice/{self.vid}")[0], 401)
-        self.assertEqual(self.call("GET", f"/notice/{self.vid}", self.drv)[0], 403)
+        anon = self.call("GET", f"/notice/{self.vid}")
+        self.assertEqual((anon[0], anon[1]["location"]), (302, "/login"))
+        drv = self.call("GET", f"/notice/{self.vid}", self.drv)
+        self.assertEqual((drv[0], drv[1]["location"]), (302, "/portal"))
 
 
 class PortalTests(ServerScratch):
@@ -1402,11 +1411,13 @@ class PortalTests(ServerScratch):
         clip = unquote(self.listing()["items"][0]["clip"])
         self.assertTrue(clip.endswith("_delivery.mp4"), clip)
 
-    def test_a_case_that_has_not_been_cited_gets_the_original_clip_and_no_number(self):
+    def test_a_case_that_has_not_been_cited_is_not_shown_at_all(self):
+        """Team decision 2026-10-30: the portal shows only cases a citation has been issued for."""
+        uncited = self.case()
+        self.assertEqual([i["id"] for i in self.listing()["items"]], [self.vid])
+        self.assertEqual(self.call("GET", f"/api/portal/violation/{uncited}", self.drv)[0], 404)
         self.store.x("DELETE FROM citations")
-        item = self.listing()["items"][0]
-        self.assertIsNone(item["citation"])
-        self.assertFalse(unquote(item["clip"]).endswith("_delivery.mp4"))
+        self.assertEqual(self.listing()["items"], [])
 
     def test_the_citation_is_shown_with_its_fine_in_words(self):
         c = self.listing()["items"][0]["citation"]
@@ -1441,9 +1452,10 @@ class PortalTests(ServerScratch):
             self.assertNotIn(hidden, item)
 
     def test_a_driver_cannot_reach_the_staff_routes_with_the_same_session(self):
-        for path in ("/api/violations", "/api/citations", f"/notice/{self.vid}",
+        for path in ("/api/violations", "/api/citations",
                      "/media/" + self.store.violation(self.vid)["snapshot"]):
             self.assertEqual(self.call("GET", path, self.drv)[0], 403, path)
+        self.assertEqual(self.call("GET", f"/notice/{self.vid}", self.drv)[0], 302)   # redirected to /portal
 
 
 if __name__ == "__main__":

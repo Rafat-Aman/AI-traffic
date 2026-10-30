@@ -93,14 +93,17 @@ class FrameResult:
 class Pipeline:
     def __init__(self, detector, camera, frame_size, start_time=None, is_live=False, helmet=None,
                  overrides=None, only=None, min_frames=3, auto_roi=True, display_width=1280, min_speed_fps=6.0,
-                 plates=None, reference=None, stabilize=True, tracklets=None):
+                 plates=None, reference=None, stabilize=True, tracklets=None, traffic=None):
         """plates: optional surveillance.anpr.PlateCollector - keeps each motor vehicle's best full-resolution
         crops so the plates of violating vehicles can be read.
         tracklets: optional surveillance.reid.TrackletCollector - summarises each vehicle's pass in road-plane
         metres so it can be recognised on another camera.
+        traffic: optional surveillance.traffic_state.TrafficStateCollector - measures queue, speed, occupancy, density
+        and waiting time per road zone, from the same observations the rules get.
         reference: the clean frame the zones were drawn on (BGR); without it the first frame is taken as the view
         the zones belong to. stabilize: follow camera movement (surveillance/camera_motion.py)."""
         self.det, self.camera, self.plates, self.tracklets = detector, camera, plates, tracklets
+        self.traffic, self._traffic_fault = traffic, False
         self.W, self.H = frame_size
         self.roi_ref = zones_roi(camera, self.W, self.H) if auto_roi else (0, 0, self.W, self.H)
         self.roi = self.roi_ref   # detection area in the current view (follows the camera when it moves)
@@ -222,13 +225,22 @@ class Pipeline:
                     areas=frozenset() if view_lost else self.camera.areas_at(point), heading=heading,
                     xy_coarse=coarse))
         self._boxes = [b for _, _, _, b, _ in shown]
+        wall_t = wall.timestamp() if wall else None
         if self.tracklets is not None:
             # after the loop, so every box of this frame is known: a crop is only worth keeping for colour
             # when no other vehicle overlaps it
-            wall_t = wall.timestamp() if wall else None
             for tid, box, major, road, xy, kph, heading, y_ref in tracklet_rows:
                 self.tracklets.observe(tid, frame, box, major, road, xy, kph, heading, t, wall_t, y_ref,
                                        self._boxes)
+        if self.traffic is not None:
+            # the very list the rules get, so what is measured and what is judged are one picture of the road; with
+            # the view lost an empty zone means "cannot see", not "empty", and nothing is sampled
+            try:
+                self.traffic.observe(observations, t, wall_t, valid=not view_lost)
+            except Exception as e:      # measuring traffic must never stop the rules: say so once, carry on
+                if not self._traffic_fault:
+                    print(f"traffic state not measured: {type(e).__name__}: {e}")
+                self._traffic_fault = True
         events = self.engine.process(observations, frame, self.frames, t, wall)
         for ev in events:
             if ev.frame is None:  # evidence is this frame: add where the vehicle came from

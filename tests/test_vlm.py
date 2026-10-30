@@ -41,12 +41,12 @@ class PromptTests(unittest.TestCase):
         self.assertIn("Mirpur Road southbound", p)
 
     def test_every_rule_code_has_a_claim(self):
-        for code in ("V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8"):
+        for code in [f"V{n}" for n in range(1, 12)]:
             claim, innocent = vlm.RULE_CLAIM[code]
             self.assertTrue(claim and innocent, code)
 
     def test_unknown_code_does_not_crash(self):
-        self.assertIn("V9", vlm.build_prompt(case(code="V9"), []))
+        self.assertIn("V99", vlm.build_prompt(case(code="V99"), []))
 
     def test_plate_is_offered_but_not_requested_back(self):
         p = vlm.build_prompt(case(plate_text_en="DHAKA METRO-GA 12-3456"), [])

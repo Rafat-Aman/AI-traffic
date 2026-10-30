@@ -42,6 +42,9 @@ Two ways in
 from __future__ import annotations
 
 import math
+import queue
+import threading
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
@@ -123,16 +126,37 @@ def signature(crops, two_wheel):
     return hist, (np.median(labs, 0).astype(np.float32) if labs else None)
 
 
+def _tag_of(model):
+    """What a stored vector was made by: the recorded tag, or MobileNet for rows older than the column."""
+    from .embed import MOBILENET_TAG
+    return model or MOBILENET_TAG
+
+
+def appearance(a, b):
+    """`(similarity, tag)` of the learned appearance vectors of two tracklets; `(NaN, "")` when there is no
+    pair of vectors made by the same model.
+
+    ReID vectors are used when both tracklets have one (and the same weights made them); otherwise the
+    MobileNet vectors; a ReID vector is never set against a MobileNet one. The tag names the number system
+    the score lives in, because the LLR cue is fitted separately for each: a ReID cosine of 0.6 and a
+    MobileNet cosine of 0.6 mean very different things."""
+    ra, rb = getattr(a, "embed_reid", None), getattr(b, "embed_reid", None)
+    if ra is not None and rb is not None and ra.shape == rb.shape \
+            and getattr(a, "embed_reid_model", None) == getattr(b, "embed_reid_model", None):
+        return float(np.dot(ra, rb)), "reid:" + str(getattr(a, "embed_reid_model", None) or "")
+    ea, eb = getattr(a, "embed", None), getattr(b, "embed", None)
+    if ea is not None and eb is not None and ea.shape == eb.shape \
+            and _tag_of(getattr(a, "embed_model", None)) == _tag_of(getattr(b, "embed_model", None)):
+        return float(np.dot(ea, eb)), _tag_of(getattr(a, "embed_model", None))
+    return float("nan"), ""
+
+
 def colour_similarity(a, b):
     """(histogram, lab, embedding) similarity of two signatures; NaN where either side is missing."""
     nan = float("nan")
     hist = (float(np.sum(np.sqrt(a.hist * b.hist))) if a.hist is not None and b.hist is not None else nan)
     lab = (-float(np.linalg.norm(a.lab - b.lab)) if a.lab is not None and b.lab is not None else nan)
-    emb = nan
-    if getattr(a, "embed", None) is not None and getattr(b, "embed", None) is not None \
-            and a.embed.shape == b.embed.shape:
-        emb = float(np.dot(a.embed, b.embed))
-    return hist, lab, emb
+    return hist, lab, appearance(a, b)[0]
 
 
 # ---------------------------------------------------------------- the tracklet
@@ -154,7 +178,10 @@ class Tracklet:
     id: Optional[int] = None         # row id once stored
     hist: Optional[np.ndarray] = None
     lab: Optional[np.ndarray] = None
-    embed: Optional[np.ndarray] = None     # appearance vector (surveillance.embed)
+    embed: Optional[np.ndarray] = None     # MobileNet appearance vector (surveillance.embed), always present
+    embed_model: Optional[str] = None      # Embedder tag of `embed`; None on rows older than the column
+    embed_reid: Optional[np.ndarray] = None  # ReID vector, attached later by the background worker
+    embed_reid_model: Optional[str] = None
     plate: str = ""
     global_id: Optional[int] = None
 
@@ -365,14 +392,15 @@ def pair_terms(a, b, P, llr=None):
     def q(r):
         return min(0.5 * r * r, MAX_TERM)
 
-    hist, lab, emb = colour_similarity(a, b)
+    hist, lab = colour_similarity(a, b)[:2]
+    emb, etag = appearance(a, b)
     g = a.group
     llr = llr if llr is not None else defaultdict(LLR)
     t = dict(dt=dt, dt_pred=dt_pred, hist=hist, lab=lab, embed=emb,
              c_time=q(rt) + math.log(sig_t / P["t_sig0"]),
              c_lane=q(rl), c_speed=q(rv), c_size=q(rw),
              c_hist=llr[("hist", g)].cost(hist), c_lab=llr[("lab", g)].cost(lab),
-             c_embed=llr[("embed", g)].cost(emb))
+             c_embed=llr[("embed:" + etag, g)].cost(emb) if etag else 0.0)
     t["c_motion"] = t["c_time"] + t["c_lane"] + t["c_speed"] + t["c_size"]
     t["c_colour"] = t["c_hist"] + t["c_lab"] + t["c_embed"]
     t["cost"] = t["c_motion"] + t["c_colour"]
@@ -487,11 +515,13 @@ def refit(src, dst, matches, P):
         for j, b in enumerate(dst):
             if a.cls != b.cls:
                 continue
-            hist, lab, emb = colour_similarity(a, b)
+            hist, lab = colour_similarity(a, b)[:2]
+            emb, etag = appearance(a, b)
             where = pos if (i, j) in matched else neg
             where[("hist", a.group)].append(hist)
             where[("lab", a.group)].append(lab)
-            where[("embed", a.group)].append(emb)
+            if etag:        # one distribution per model: ReID scores are never judged by MobileNet's fit
+                where[("embed:" + etag, a.group)].append(emb)
     for key in set(pos) | set(neg):
         llr[key] = LLR(pos.get(key), neg.get(key), weight=1.0)
     return P, llr
@@ -515,7 +545,8 @@ def unidentifiable(src, P, llr, ratio=0.5):
             continue
         group = "2w" if cls in TWO_WHEEL else "other"
         # .get, not [], so a plain dict works here as well as the defaultdict the matcher passes
-        if any(llr.get((cue, group), OFF).ok for cue in ("hist", "lab", "embed")):
+        if any(c.ok for (cue, g), c in list(llr.items()) if g == group and
+               (cue in ("hist", "lab") or cue.startswith("embed:"))):
             continue                                   # some appearance cue can still separate them
         headway = float(np.median(np.diff(sorted(times))))
         sig_t = P["t_sig0"] + P["t_sig1"] * P["gap"] / 8.0    # at a typical 8 m/s
@@ -634,6 +665,116 @@ def match_online(new, recent, params_by_flow, accept=ACCEPT_COST, margin=MIN_MAR
     return best
 
 
+# ---------------------------------------------------------------- the ReID model, off the video loop
+
+class ReIDWorker:
+    """Computes the slow ReID vector for finished tracklets on its own thread.
+
+    The MobileNet vector (8 ms) is made on the pipeline thread as before; the team's ReID network costs
+    about a second per vehicle, which would stall the frame loop, so its work is queued here instead. The
+    queue is bounded: when it is full the job is dropped and counted, never waited for - a tracklet
+    without a ReID vector simply keeps matching on its MobileNet one. One worker per process, because the
+    network already uses every core and a second would only compete with the first.
+
+    Threads: this runs torch on its own thread, and torch's intra-op pool is process-wide, so while a job runs
+    it competes with the detector for cores. torch.set_num_threads is global (it would also change the
+    detector's torch pool) and there is no safe per-thread limit, so none is set. The trade-off is accepted:
+    one job at a time, a bounded queue that drops instead of waiting, and the detector's onnxruntime pool is
+    separate. Watch `stats()["mean_ms"]` and `dropped` (shown on the camera page) if frame rate dips.
+
+    `submit(tracklet, crops, done)` calls `done(tracklet)` from the worker thread after
+    `tracklet.embed_reid` / `.embed_reid_model` are set (not called when the model is unavailable).
+    """
+
+    def __init__(self, maxsize=8):
+        self._q = queue.Queue(maxsize=maxsize)
+        self._lock = threading.Lock()
+        self._thread = None
+        self.queued = self.completed = self.dropped = self.failed = 0
+        self._ms = 0.0
+
+    def available(self):
+        from .embed import Embedder
+        return Embedder.reid_wanted()
+
+    def submit(self, tl, crops, done=None):
+        """Queue one tracklet. Returns False (and counts a drop) when the queue is full or ReID is off."""
+        if not crops or not self.available():
+            return False
+        try:
+            self._q.put_nowait((tl, list(crops), done))
+        except queue.Full:
+            with self._lock:
+                self.dropped += 1
+            return False
+        with self._lock:
+            self.queued += 1
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run, daemon=True, name="reid-embed")
+                self._thread.start()
+        return True
+
+    def _run(self):
+        from .embed import Embedder
+        while True:
+            try:
+                tl, crops, done = self._q.get(timeout=30)
+            except queue.Empty:
+                with self._lock:
+                    if self._q.empty():           # idle: let the thread go; submit() starts another
+                        self._thread = None
+                        return
+                continue
+            t0 = time.perf_counter()
+            try:
+                vec, tag = Embedder.encode_with("reid", crops)
+                if vec is not None:
+                    tl.embed_reid, tl.embed_reid_model = vec, tag
+                    if done is not None:
+                        done(tl)
+                else:
+                    with self._lock:
+                        self.failed += 1
+            except Exception as e:                # never let one vehicle end the worker
+                print(f"reid embedding failed: {e}")
+                with self._lock:
+                    self.failed += 1
+            else:
+                if vec is not None:
+                    with self._lock:
+                        self.completed += 1
+                        self._ms += (time.perf_counter() - t0) * 1000.0
+
+    def stats(self):
+        with self._lock:
+            return {"queued": self.queued, "done": self.completed, "dropped": self.dropped,
+                    "failed": self.failed, "waiting": self._q.qsize(),
+                    "mean_ms": round(self._ms / self.completed, 1) if self.completed else None}
+
+    def drain(self, timeout=60.0):
+        """Wait until the queue is empty and the job in hand is finished (tests, end of a run)."""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            with self._lock:
+                if self.completed + self.failed >= self.queued:
+                    return True
+            time.sleep(0.02)
+        return False
+
+
+_shared = None
+_shared_lock = threading.Lock()
+
+
+def reid_worker():
+    """The process-wide worker."""
+    global _shared
+    with _shared_lock:
+        if _shared is None:
+            _shared = ReIDWorker()
+        return _shared
+
+
 # ---------------------------------------------------------------- collecting tracklets online
 
 class TrackletCollector:
@@ -648,8 +789,10 @@ class TrackletCollector:
     """
 
     def __init__(self, camera_id, on_done, keep=CLEAR_FRAMES, min_samples=5, lost_sec=1.5,
-                 sample_sec=0.2, max_crop_px=128, embed=True):
+                 sample_sec=0.2, max_crop_px=128, embed=True, on_reid=None, reid_queue=None):
         self.camera_id, self.on_done, self.embed = camera_id, on_done, embed
+        self.on_reid = on_reid                # called with the tracklet once its ReID vector has arrived
+        self.reid_queue = reid_queue          # a ReIDWorker; None means the shared one
         self.keep, self.min_samples, self.lost_sec = keep, min_samples, lost_sec
         self.sample_sec, self.max_crop = sample_sec, max_crop_px
         self.samples = defaultdict(list)     # tid -> [(t, x_m, y_m)]
@@ -738,7 +881,10 @@ class TrackletCollector:
         tl = self.build(tid)
         self._forget(tid)
         if tl is not None:
-            self.on_done(tl)
+            crops = tl.__dict__.pop("pending_crops", None)
+            self.on_done(tl)                  # stored first, so the row exists when the ReID vector arrives
+            if crops:
+                (self.reid_queue or reid_worker()).submit(tl, crops, self.on_reid)
 
     def _forget(self, tid):
         for d in (self.samples, self.crops, self.meta, self.last_crop, self.seen):
@@ -783,6 +929,8 @@ class TrackletCollector:
             extrap_m=extrap, zone=m.get("zone", ""), hist=hist, lab=lab)
         if self.embed:
             from .embed import Embedder
-            tl.embed = Embedder.encode(kept)
+            tl.embed, tl.embed_model = Embedder.encode_with("mobilenet", kept)    # 8 ms, always
+            if Embedder.reid_wanted() and kept:
+                tl.pending_crops = kept          # the ReID vector follows from the background worker
         tl.video_t = t_cross
         return tl

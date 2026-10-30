@@ -1,0 +1,23 @@
+{
+ "item": "x1_detection",
+ "title": "X1 Detection AP@0.5 / mAP@0.5",
+ "provenance": {
+  "command": "tools/evaluate.py x1",
+  "inputs": [],
+  "git_commit": "80563e64840e02a82e8033035788c4fb0b1d9904 (+uncommitted changes)",
+  "timestamp_utc": "2026-10-29T19:07:24+00:00",
+  "python": "3.10.12",
+  "machine": "x86_64"
+ },
+ "tables": [],
+ "needs": [
+  {
+   "what": "Detection mAP@0.5 per class on a held-out Dhaka set",
+   "status": "not measured - needs a YOLO-format dataset yaml (evaluation/ground_truth/detection/data.yaml) with a val split of Dhaka frames NOT used to train bd_vehicles_best.pt, same 16 classes (docs/EVALUATION.md section 1). No vehicle-detector mAP exists anywhere in the repo (the only 'mAP50 0.968' in models/README.md is the plate-character model)"
+  }
+ ],
+ "notes": [
+  "models/README.md is silent on how bd_vehicles_best.pt was validated; SUPERVISION D1 says it is YOLOv8s, 80 epochs, 640 px, 16 classes."
+ ],
+ "raw": {}
+}

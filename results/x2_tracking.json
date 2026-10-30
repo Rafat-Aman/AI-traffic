@@ -1,0 +1,231 @@
+{
+ "item": "x2_tracking",
+ "title": "X2 Tracking MOTA / IDF1 / ID switches",
+ "provenance": {
+  "command": "tools/evaluate.py x2 --proxy-seconds 60",
+  "inputs": [
+   {
+    "path": "/home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/data/videos/20261025_092449_side1_1.mp4",
+    "bytes": 148436907,
+    "sha256_first_1MiB": "e246881dc02a58ee"
+   }
+  ],
+  "git_commit": "80563e64840e02a82e8033035788c4fb0b1d9904 (+uncommitted changes)",
+  "timestamp_utc": "2026-10-30T02:17:19+00:00",
+  "python": "3.10.12",
+  "machine": "x86_64"
+ },
+ "tables": [
+  {
+   "title": "ByteTrack vs BoT-SORT proxy, first 60 s of 20261025_092449_side1_1.mp4",
+   "columns": [
+    "Tracker",
+    "Tracks",
+    "Tracks >=5 frames",
+    "Median track length (s)",
+    "p25 (s)",
+    "p75 (s)",
+    "Longest (s)",
+    "Tracks < 1 s",
+    "Fragment candidates (heuristic)",
+    "Boxes/frame",
+    "Tracker ms/frame (mean)",
+    "Tracker ms/frame (median)",
+    "Status"
+   ],
+   "rows": [
+    [
+     "bytetrack",
+     152,
+     129,
+     "3.22",
+     "1.11",
+     "4.64",
+     "60.1",
+     35,
+     4,
+     "10.3",
+     "3.58",
+     "2.43",
+     "proxy (no GT) on Dhaka clip"
+    ],
+    [
+     "botsort",
+     147,
+     126,
+     "3.33",
+     "1.21",
+     "5.04",
+     "60.1",
+     32,
+     2,
+     "10.5",
+     "25.42",
+     "21.37",
+     "proxy (no GT) on Dhaka clip"
+    ]
+   ],
+   "source": "tools/evaluate.py x2 --proxy-seconds 60; 596 frames sampled every 3 native frames (9.92 fps effective of 29.77); 1242x1440; yolo imgsz 960; CPU i5-11400H; load average at end 19.4; configs in raw.tracker_configs"
+  },
+  {
+   "title": "Cost split on this CPU (same run)",
+   "columns": [
+    "Quantity",
+    "Value",
+    "Status"
+   ],
+   "rows": [
+    [
+     "Detector ms/frame (mean, imgsz 960)",
+     "1759.1",
+     "measured on Dhaka clip (CPU timing)"
+    ],
+    [
+     "Detector ms/frame (median)",
+     "1646.9",
+     "measured on Dhaka clip (CPU timing)"
+    ],
+    [
+     "bytetrack end-to-end fps (detector + tracker)",
+     "0.57",
+     "derived from measured means (Dhaka clip, CPU)"
+    ],
+    [
+     "botsort end-to-end fps (detector + tracker)",
+     "0.56",
+     "derived from measured means (Dhaka clip, CPU)"
+    ],
+    [
+     "Wall time for whole run (both trackers + decoding)",
+     "1073 s",
+     "measured on Dhaka clip (CPU timing)"
+    ]
+   ],
+   "source": "same run as above; per-frame times from time.perf_counter around model.predict and tracker.update"
+  },
+  {
+   "title": "Agreement of botsort with bytetrack treated as reference (NOT accuracy: neither is ground truth)",
+   "columns": [
+    "Quantity",
+    "Value",
+    "Status"
+   ],
+   "rows": [
+    [
+     "IDF1 of botsort against bytetrack",
+     "0.976",
+     "proxy (agreement only, not accuracy)"
+    ],
+    [
+     "ID switches of botsort relative to bytetrack",
+     5,
+     "proxy (agreement only, not accuracy)"
+    ],
+    [
+     "Fragmentations relative",
+     4,
+     "proxy (agreement only, not accuracy)"
+    ]
+   ],
+   "source": "evaluation.tracking.evaluate on the two tracker outputs, IoU 0.5"
+  }
+ ],
+ "needs": [
+  {
+   "what": "MOTA / IDF1 / ID switches for ByteTrack vs BoT-SORT",
+   "status": "not measured - needs MOT 1.1 ground truth of the clip (evaluation/ground_truth/tracking/gt.txt): CVAT track annotations of every vehicle, at least on every 3rd native frame, for a >=60 s stretch (docs/EVALUATION.md section 2). results/x2_tracks/*.txt can be imported into CVAT as pre-annotations to cut labelling time"
+  }
+ ],
+ "notes": [
+  "WHAT THE PROXY CAN SHOW: relative cost of the two association algorithms on identical detections on this CPU; how many tracks each makes and how long they live; whether one makes many more short tracks (a symptom of fragmentation) on the same footage.",
+  "WHAT IT CANNOT SHOW: which tracker has fewer ID switches or higher MOTA/IDF1. Fewer, longer tracks can mean better continuity OR identities merged across different vehicles (an ID swap leaves no trace in these counts). 'Fragment candidates' is a heuristic (end away from the border, same-class start within 2 s and 0.6 box diagonals) and can be inflated by coincidence. Choosing BoT-SORT over ByteTrack for accuracy needs MOT ground truth (DEC-3).",
+  "BoT-SORT here is Ultralytics' configuration WITHOUT appearance ReID (with_reid False, the pipeline default); its difference from ByteTrack is camera-motion compensation (sparseOptFlow) and score fusion. This clip comes from a fixed camera, so camera-motion compensation has little to compensate. BoT-SORT with ReID was not run."
+ ],
+ "raw": {
+  "agreement": {
+   "num_gt": 6168,
+   "tp": 6132,
+   "fp": 97,
+   "fn": 36,
+   "id_switches": 5,
+   "fragmentations": 4,
+   "mota": 0.9776264591439688,
+   "motp_iou": 0.9395604052943162,
+   "iou_thr": 0.5,
+   "idf1": 0.9760425909494232,
+   "idp": 0.9712634451757907,
+   "idr": 0.9808690012970168,
+   "idtp": 6050,
+   "idfp": 179,
+   "idfn": 118
+  },
+  "proxy": {
+   "bytetrack": {
+    "n_tracks": 152,
+    "n_tracks_ge5": 129,
+    "len_seconds": {
+     "p25": 1.1085104137739517,
+     "p50": 3.224757567342405,
+     "p75": 4.635589003054707,
+     "p90": 8.162667592335461
+    },
+    "max_s": 60.061109691752286,
+    "short_lt1s": 35,
+    "fragment_candidates": 4,
+    "track_ends_away_from_border": 85,
+    "tracker_ms_mean": 3.5805994379196355,
+    "tracker_ms_median": 2.43491400007656,
+    "tracker_ms_p95": 7.918270999994093,
+    "boxes_per_frame_mean": 10.348993288590604
+   },
+   "botsort": {
+    "n_tracks": 147,
+    "n_tracks_ge5": 126,
+    "len_seconds": {
+     "p25": 1.2092840877534017,
+     "p50": 3.3255312413218547,
+     "p75": 5.038683698972507,
+     "p90": 8.162667592335461
+    },
+    "max_s": 60.061109691752286,
+    "short_lt1s": 32,
+    "fragment_candidates": 2,
+    "track_ends_away_from_border": 83,
+    "tracker_ms_mean": 25.419932503355998,
+    "tracker_ms_median": 21.365497000090272,
+    "tracker_ms_p95": 48.453699999981836,
+    "boxes_per_frame_mean": 10.451342281879194
+   }
+  },
+  "tracker_configs": {
+   "bytetrack": {
+    "fuse_score": true,
+    "match_thresh": 0.8,
+    "new_track_thresh": 0.25,
+    "track_buffer": 20,
+    "track_high_thresh": 0.25,
+    "track_low_thresh": 0.1,
+    "tracker_type": "bytetrack"
+   },
+   "botsort": {
+    "appearance_thresh": 0.8,
+    "fuse_score": true,
+    "gmc_method": "sparseOptFlow",
+    "match_thresh": 0.8,
+    "model": "auto",
+    "new_track_thresh": 0.25,
+    "proximity_thresh": 0.5,
+    "track_buffer": 20,
+    "track_high_thresh": 0.25,
+    "track_low_thresh": 0.1,
+    "tracker_type": "botsort",
+    "with_reid": false
+   }
+  },
+  "det_ms_mean": 1759.0795155721494,
+  "frames": 596,
+  "step": 3,
+  "effective_fps": 9.923226578043794,
+  "tracks_dir": "results/x2_tracks"
+ }
+}

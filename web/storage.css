@@ -1,0 +1,35 @@
+/* Storage page. Colours come from the dashboard tokens in app.css. */
+.st-top { display: flex; align-items: center; gap: 12px; padding: 8px 16px; background: var(--surface-1); border-bottom: 1px solid var(--border); }
+.st-top h1 { font-size: 16px; }
+.st-body { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: 12px; padding: 12px; align-items: start; }
+.st-body .wide { grid-column: 1 / -1; }
+.st-body > * { min-width: 0; }
+.st-body table { display: block; max-width: 100%; overflow-x: auto; }
+.st-body h2 { font-size: 14px; }
+.meter { height: 14px; border-radius: 7px; background: var(--surface-3); overflow: hidden; display: flex; margin: 8px 0; }
+.meter > i { display: block; height: 100%; background: var(--good); }
+.meter > i.warn { background: var(--warning); } .meter > i.pause { background: var(--critical); }
+.meter .mark { width: 2px; background: var(--text-muted); }
+.st-big { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.banner { padding: 8px 12px; border-radius: 8px; margin-top: 8px; font-size: 13px; border: 1px solid var(--border-strong); }
+.banner.warn { border-color: var(--warning); color: var(--warning-ink); }
+.banner.pause { border-color: var(--critical); color: var(--critical-ink); }
+.cat-row { display: grid; grid-template-columns: 170px 1fr 90px 70px; gap: 8px; align-items: center; font-size: 13px; padding: 3px 0; }
+.cat-row .bar { height: 8px; background: var(--surface-3); border-radius: 4px; overflow: hidden; }
+.cat-row .bar i { display: block; height: 100%; background: var(--series-1); }
+.cat-row .num { text-align: right; font-variant-numeric: tabular-nums; }
+.pol-grid { display: grid; grid-template-columns: 1fr 110px; gap: 8px 12px; align-items: center; font-size: 13px; }
+.pol-grid .why { grid-column: 1 / -1; color: var(--text-muted); font-size: 12px; margin-top: -4px; }
+.pol-grid input[type=number] { width: 100%; padding: 4px 6px; }
+.err { color: var(--critical-ink); font-size: 12px; margin: 6px 0 0; }
+.tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11.5px; background: var(--surface-3); border: 1px solid var(--border); }
+.tag.running { color: var(--good-ink); } .tag.failed { color: var(--critical-ink); } .tag.queued { color: var(--warning-ink); }
+.plan-sum { display: flex; gap: 24px; flex-wrap: wrap; margin: 8px 0; }
+.plan-sum div span { display: block; font-size: 12px; color: var(--text-muted); }
+.plan-items { max-height: 380px; overflow: auto; margin-top: 8px; }
+.plan-items td { font-size: 12.5px; }
+.plan-items td.path { font-family: ui-monospace, monospace; word-break: break-all; }
+.st-toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--surface-3); border: 1px solid var(--border-strong); padding: 8px 14px; border-radius: 8px; z-index: 10; }
+.growth-bars { display: flex; align-items: flex-end; gap: 3px; height: 70px; margin: 8px 0; }
+.growth-bars i { flex: 1; background: var(--series-1); min-height: 1px; border-radius: 2px 2px 0 0; }
+.st-body .card-head { flex-wrap: wrap; }

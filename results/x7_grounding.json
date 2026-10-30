@@ -1,0 +1,21 @@
+{
+ "item": "x7_grounding",
+ "title": "X7 Grounding retrieval MRR / Recall@k",
+ "provenance": {
+  "command": "tools/evaluate.py x7",
+  "inputs": [],
+  "git_commit": "80563e64840e02a82e8033035788c4fb0b1d9904 (+uncommitted changes)",
+  "timestamp_utc": "2026-10-29T19:05:27+00:00",
+  "python": "3.10.12",
+  "machine": "x86_64"
+ },
+ "tables": [],
+ "needs": [
+  {
+   "what": "MRR and Recall@k of the natural-language query panel",
+   "status": "not measured - needs the query panel (WP3, not built yet) and a set of >=30 queries (text) each with the ids of the true matching segments labelled by hand from the same footage (docs/EVALUATION.md section 7). Interface: evaluation.retrieval.mrr(rankings, relevant), recall_at_k(rankings, relevant, k); rankings = {query: [segment_id best-first]}, relevant = {query: {segment_id}}"
+  }
+ ],
+ "notes": [],
+ "raw": {}
+}

@@ -1,0 +1,345 @@
+{
+ "item": "x3_rules",
+ "title": "X3 Rule precision / recall / coverage",
+ "provenance": {
+  "command": "tools/evaluate.py x3",
+  "inputs": [
+   {
+    "path": "/home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/tools/bench_accuracy.py",
+    "bytes": 22122,
+    "sha256_first_1MiB": "92035c538120d771"
+   },
+   {
+    "path": "/home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/training/score_accuracy.py",
+    "bytes": 3424,
+    "sha256_first_1MiB": "0851404f1050e003"
+   }
+  ],
+  "git_commit": "80563e64840e02a82e8033035788c4fb0b1d9904 (+uncommitted changes)",
+  "timestamp_utc": "2026-10-29T19:07:42+00:00",
+  "python": "3.10.12",
+  "machine": "x86_64"
+ },
+ "tables": [
+  {
+   "title": "Rule decisions against simulated ground truth (tools/bench_accuracy.py)",
+   "columns": [
+    "Scenario",
+    "Rule",
+    "True events",
+    "Caught",
+    "False alarms",
+    "Recall",
+    "Precision",
+    "Legal vehicles that could have been false alarms",
+    "Status"
+   ],
+   "rows": [
+    [
+     "default (detector errors on)",
+     "V2 speeding",
+     6,
+     6,
+     0,
+     "1.00",
+     "1.00",
+     122,
+     "synthetic"
+    ],
+    [
+     "default (detector errors on)",
+     "V1/V7 standing in a lane",
+     2,
+     2,
+     0,
+     "1.00",
+     "1.00",
+     158,
+     "synthetic"
+    ],
+    [
+     "default (detector errors on)",
+     "V4 wrong side",
+     2,
+     2,
+     0,
+     "1.00",
+     "1.00",
+     158,
+     "synthetic"
+    ],
+    [
+     "clean (geometry floor)",
+     "V2 speeding",
+     10,
+     9,
+     0,
+     "0.90",
+     "1.00",
+     117,
+     "synthetic"
+    ],
+    [
+     "clean (geometry floor)",
+     "V1/V7 standing in a lane",
+     4,
+     4,
+     0,
+     "1.00",
+     "1.00",
+     164,
+     "synthetic"
+    ],
+    [
+     "clean (geometry floor)",
+     "V4 wrong side",
+     12,
+     12,
+     0,
+     "1.00",
+     "1.00",
+     156,
+     "synthetic"
+    ]
+   ],
+   "source": "`/home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/.venv/bin/python tools/bench_accuracy.py` (26.8 s); `/home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/.venv/bin/python tools/bench_accuracy.py --clean` (30.0 s); seed 0, 180 s of simulated traffic at 15 fps through the real Pipeline with a simulated detector. Counts are tiny (2-6 events per rule): treat as a regression check, not an accuracy estimate"
+  },
+  {
+   "title": "Speed estimation error vs simulated truth",
+   "columns": [
+    "Scenario",
+    "Vehicle-samples",
+    "MAE km/h",
+    "Bias km/h",
+    "p95 abs error km/h",
+    "MAPE %",
+    "Status"
+   ],
+   "rows": [
+    [
+     "default (detector errors on)",
+     4907,
+     2.08,
+     0.77,
+     7.11,
+     12.4,
+     "synthetic"
+    ],
+    [
+     "clean (geometry floor)",
+     5024,
+     0.5,
+     -0.18,
+     2.54,
+     4.5,
+     "synthetic"
+    ]
+   ],
+   "source": "same runs as above (bench_accuracy.py 'speed')"
+  },
+  {
+   "title": "Synthetic scenario tests per rule module",
+   "columns": [
+    "Test module",
+    "Tests",
+    "Failures+errors",
+    "Seconds",
+    "Status"
+   ],
+   "rows": [
+    [
+     "tests.test_violations",
+     54,
+     0,
+     22.4,
+     "synthetic"
+    ],
+    [
+     "tests.test_bus_lane",
+     50,
+     0,
+     5.3,
+     "synthetic"
+    ],
+    [
+     "tests.test_accuracy",
+     9,
+     0,
+     19.2,
+     "synthetic"
+    ],
+    [
+     "tests.test_behaviour",
+     38,
+     1,
+     2.5,
+     "synthetic"
+    ]
+   ],
+   "source": "unittest run in-process by tools/evaluate.py x3; these are scripted scenarios (pass/fail), not accuracy on real traffic"
+  }
+ ],
+ "needs": [
+  {
+   "what": "Per-rule precision / recall / FP rate on real Dhaka footage",
+   "status": "not measured - needs a hand-labelled violation CSV (evaluation/ground_truth/violations/events.csv; schema in docs/EVALUATION.md section 3) for the same video, plus the system's Export CSV of cases for that video passed as --cases. training/score_accuracy.py needs exactly this; only the blank training/ground_truth_template.csv exists"
+  }
+ ],
+ "notes": [],
+ "raw": {
+  "bench": {
+   "default (detector errors on)": {
+    "speed": {
+     "n": 4907,
+     "mae_kph": 2.08,
+     "bias_kph": 0.77,
+     "p95_abs_kph": 7.11,
+     "mape_pct": 12.4
+    },
+    "speed_by_distance": {
+     "near <40 m": {
+      "n": 3066,
+      "mae_kph": 2.21,
+      "bias_kph": 1.05
+     },
+     "mid 40-75 m": {
+      "n": 1841,
+      "mae_kph": 1.87,
+      "bias_kph": 0.32
+     }
+    },
+    "standing": {
+     "n": 1032,
+     "mean_kph": 1.09,
+     "p95_kph": 3.77
+    },
+    "decisions": {
+     "V2 speeding": {
+      "truth": 6,
+      "caught": 6,
+      "false_alarms": 0,
+      "of_legal": 122,
+      "threshold_kph": 63.0
+     },
+     "V1/V7 standing in a lane": {
+      "truth": 2,
+      "caught": 2,
+      "false_alarms": 0,
+      "of_moving": 158
+     },
+     "V4 wrong side": {
+      "truth": 2,
+      "caught": 2,
+      "false_alarms": 0,
+      "of_legal": 158
+     }
+    },
+    "tracks_per_vehicle": 1.6,
+    "vehicles": 162,
+    "other_codes": {},
+    "_cmd": "/home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/.venv/bin/python tools/bench_accuracy.py",
+    "_seconds": 26.8
+   },
+   "clean (geometry floor)": {
+    "speed": {
+     "n": 5024,
+     "mae_kph": 0.5,
+     "bias_kph": -0.18,
+     "p95_abs_kph": 2.54,
+     "mape_pct": 4.5
+    },
+    "speed_by_distance": {
+     "near <40 m": {
+      "n": 3149,
+      "mae_kph": 0.56,
+      "bias_kph": -0.17
+     },
+     "mid 40-75 m": {
+      "n": 1875,
+      "mae_kph": 0.4,
+      "bias_kph": -0.18
+     }
+    },
+    "standing": {
+     "n": 1335,
+     "mean_kph": 0.01,
+     "p95_kph": 0.0
+    },
+    "decisions": {
+     "V2 speeding": {
+      "truth": 10,
+      "caught": 9,
+      "false_alarms": 0,
+      "of_legal": 117,
+      "threshold_kph": 63.0
+     },
+     "V1/V7 standing in a lane": {
+      "truth": 4,
+      "caught": 4,
+      "false_alarms": 0,
+      "of_moving": 164
+     },
+     "V4 wrong side": {
+      "truth": 12,
+      "caught": 12,
+      "false_alarms": 0,
+      "of_legal": 156
+     }
+    },
+    "tracks_per_vehicle": 1.0,
+    "vehicles": 169,
+    "other_codes": {},
+    "_cmd": "/home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/.venv/bin/python tools/bench_accuracy.py --clean",
+    "_seconds": 30.0
+   }
+  },
+  "tests": {
+   "tests.test_violations": {
+    "ran": 54,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "seconds": 22.4,
+    "classes": {
+     "NoneType": 11
+    },
+    "failed": []
+   },
+   "tests.test_bus_lane": {
+    "ran": 50,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "seconds": 5.3,
+    "classes": {
+     "NoneType": 6
+    },
+    "failed": []
+   },
+   "tests.test_accuracy": {
+    "ran": 9,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "seconds": 19.2,
+    "classes": {
+     "NoneType": 5
+    },
+    "failed": []
+   },
+   "tests.test_behaviour": {
+    "ran": 38,
+    "failures": 1,
+    "errors": 0,
+    "skipped": 0,
+    "seconds": 2.5,
+    "classes": {
+     "NoneType": 5
+    },
+    "failed": [
+     "test_60_vehicles_for_300_frames_cost_well_under_a_second (tests.test_behaviour.CostTests)"
+    ]
+   }
+  }
+ }
+}

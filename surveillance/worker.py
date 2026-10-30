@@ -17,18 +17,22 @@ from .autozone_job import AutoZoneJob
 from .camera_motion import load_reference
 from .clips import ClipRecorder
 from .detector import MODELS_DIR, Detector, HelmetDetector, find_helmet_model
+from .impact import ImpactTracker, load_impact, load_weights, priority_for, save_impact
 from .pipeline import Pipeline
-from .reid import TrackletCollector
+from .reid import TrackletCollector, reid_worker
 from .sources import FileSource, LiveSource
+from .traffic_state import Baseline, TrafficStateCollector
 
 JPEG_QUALITY = 80
 
 
 class CameraWorker(threading.Thread):
-    def __init__(self, store, camera, data_dir, notify=None, start_sec=0.0, linker=None):
+    def __init__(self, store, camera, data_dir, notify=None, start_sec=0.0, linker=None, baseline=None):
         super().__init__(daemon=True, name=f"camera-{camera['id']}")
         self.store, self.cam, self.data_dir = store, camera, Path(data_dir)
-        self.linker = linker
+        self.linker, self.baseline = linker, baseline
+        self.traffic = None    # TrafficStateCollector: queue / speed / occupancy per road zone
+        self.impacts = None    # ImpactTracker: scores each violation once 30 s of video after it have been seen
         self.notify = notify or (lambda msg: None)
         self.start_sec = start_sec
         self.stop_event = threading.Event()
@@ -41,6 +45,8 @@ class CameraWorker(threading.Thread):
         self.tracklets = None
         self.run_id = None
         self.out_dir = None
+        self._index_last = time.time()      # first live build after LIVE_INDEX_S
+        self._index_thread = None
 
     def stop(self):
         self.stop_event.set()
@@ -77,18 +83,22 @@ class CameraWorker(threading.Thread):
             if cam["kind"] == "file" and cam.get("start_time"):
                 start_time = datetime.fromisoformat(cam["start_time"])
             if s.get("reid", True):
-                self.tracklets = TrackletCollector(cam["id"], self._tracklet_done)
+                self.tracklets = TrackletCollector(cam["id"], self._tracklet_done, on_reid=self._reid_ready)
+            if s.get("impact", True):
+                self._start_impact(camera_cfg)
             self.pipeline = Pipeline(detector, camera_cfg, frame_size, start_time, source.is_live, helmet,
                                      auto_roi=s["auto_roi"], plates=self.plates,
                                      reference=load_reference(self.data_dir, cam["id"], zones["version"]),
-                                     stabilize=s.get("stabilize", True), tracklets=self.tracklets)
+                                     stabilize=s.get("stabilize", True), tracklets=self.tracklets,
+                                     traffic=self.traffic)
             clips = ClipRecorder(s["clip_pre_sec"], s["clip_post_sec"])
             run_id = self.store.start_run(cam["id"], zones["id"], "live" if source.is_live else
                                           ("realtime" if s["realtime"] else "full"))
             self.run_id = run_id
             out_dir = self.out_dir = self.data_dir / "evidence" / f"cam{cam['id']}" / f"run{run_id}"
             self._set(state="running", message="", backend=f"{detector.backend.upper()} {detector.imgsz}px",
-                      features={"anpr": self.plates is not None, "helmet": helmet is not None},
+                      features={"anpr": self.plates is not None, "helmet": helmet is not None,
+                                "impact": self.impacts is not None},
                       inactive=self.pipeline.engine.inactive, run_id=run_id, roi=self.pipeline.roi,
                       frame_size=frame_size)
             last_learn = time.time()
@@ -121,12 +131,15 @@ class CameraWorker(threading.Thread):
                 clips.add(jpeg, t)
                 for ev in res.events:
                     self._record(ev, frame, wall, out_dir, clips, run_id, zones["id"], t)
+                self._poll_impacts(t)
                 self._set(fps=round(proc_fps, 1), stream_fps=round(res.fps, 1),
                           speed_x=round(proc_fps / source.fps, 2) if not source.is_live else None,
                           lag=round(source.lag(), 2), progress=source.progress(),
                           frames=frames, tracks=res.tracks, video_time=round(t, 1),
                           speed_paused=self.pipeline.speed_paused, view=self.pipeline.view_status(),
-                          state="running", message="", reconnects=getattr(source, "reconnects", 0))
+                          state="running", message="", reconnects=getattr(source, "reconnects", 0),
+                          **self._embed_status())
+                self._index_live(source.is_live)
                 if time.time() - last_learn > 5:
                     self._save_learning()
                     last_learn = time.time()
@@ -141,6 +154,7 @@ class CameraWorker(threading.Thread):
         finally:
             if self.tracklets:
                 self.tracklets.finish_all()
+            self._finish_impact()
             if self.plates:
                 self._set(message="Reading the last number plates...")
                 self.plates.flush()
@@ -154,10 +168,41 @@ class CameraWorker(threading.Thread):
             if run_id:
                 elapsed = max(1e-6, time.time() - t_begin)
                 self.store.end_run(run_id, status, frames, t, frames / elapsed, self.status.get("error", ""))
+                self._index_run(run_id)
             for obj in (detector, source):
                 if obj:
                     obj.close()
             self.notify({"type": "status", "camera_id": cam["id"], "status": self.status})
+
+    # ---- segment index: runs are indexed when they end; a long live run every LIVE_INDEX_S as well
+    LIVE_INDEX_S = 300.0    # 5 min: the index window is minutes wide, and a build touches only new rows
+
+    def _index_run(self, run_id):
+        """Index the finished run (segment_index.on_run_finished never raises; the guard covers an import fault)."""
+        try:
+            from . import segment_index
+            segment_index.on_run_finished(self.store, run_id)
+        except Exception:                           # noqa: BLE001
+            traceback.print_exc()
+
+    def _index_live(self, is_live):
+        """Start an incremental build for this camera on a helper thread; never two at once, never blocks."""
+        if not is_live:
+            return
+        now = time.time()
+        busy = self._index_thread is not None and self._index_thread.is_alive()
+        if busy or now - self._index_last < self.LIVE_INDEX_S:
+            return
+        self._index_last = now
+        self._index_thread = threading.Thread(target=self._index_build, daemon=True, name=f"index-{self.cam['id']}")
+        self._index_thread.start()
+
+    def _index_build(self):
+        try:
+            from . import segment_index
+            segment_index.build_for_camera(self.store, self.cam["id"])
+        except Exception:                           # noqa: BLE001
+            traceback.print_exc()
 
     def _record(self, ev, frame, wall, out_dir, clips, run_id, zone_version_id, t):
         if ev.frame is not None:  # decided after the vehicle left: its evidence is an earlier frame
@@ -169,7 +214,7 @@ class CameraWorker(threading.Thread):
         when = wall_text or f"video {int(ev.obs.time_s // 60)}:{ev.obs.time_s % 60:05.2f}"
         snap, crop = save_images(ev, frame, out_dir, stem, when)
         clip = out_dir / f"{stem}.mp4"
-        clips.trigger(clip, t)
+        clips.trigger(clip, t, ev.started_s if ev.code in ClipRecorder.EARLY_CODES else None)
         rel = lambda p: str(p.relative_to(self.data_dir)) if p else None
         start = self.pipeline.start_time
         wall_of = lambda ts: ((start + timedelta(seconds=ts)).strftime("%Y-%m-%d %H:%M:%S") if start and
@@ -186,8 +231,55 @@ class CameraWorker(threading.Thread):
                                        rel(snap), rel(crop), rel(clip), "pending" if self.plates else "", extra)
         if self.plates:
             self.plates.request(ev.obs.tid, vid, t)
+        self._schedule_impact(vid, ev)
         self.status["violations"] += 1
         self.notify({"type": "violation", "camera_id": self.cam["id"], "violation": self.store.violation(vid)})
+
+    # ---- traffic impact: none of this may stop the analysis, so each step answers for its own faults
+    def _start_impact(self, camera_cfg):
+        try:
+            self.traffic = TrafficStateCollector(self.cam["id"], camera_cfg.roads, baseline=self.baseline)
+            self.impacts = ImpactTracker(self.traffic, self.baseline, self.cam["id"],
+                                         weights=load_weights(self.store))
+        except Exception as e:
+            print(f"traffic impact switched off: {e}")
+            self.traffic = self.impacts = None
+
+    def _schedule_impact(self, vid, ev):
+        """A case's effect on traffic can only be scored once the seconds after it have been seen."""
+        if self.impacts is None:
+            return
+        try:
+            self.impacts.schedule(vid, ev.obs.road, ev.code, ev.started_s, ev.obs.time_s, ev.obs.tid)
+        except Exception as e:
+            print(f"impact of case {vid} not scheduled: {e}")
+
+    def _poll_impacts(self, t):
+        if self.impacts is not None and self.impacts.pending:
+            for vid, impact in self.impacts.poll(t):
+                self._store_impact(vid, impact)
+
+    def _store_impact(self, vid, impact):
+        """Keep a scored case's impact and tell the open dashboards."""
+        try:
+            save_impact(self.store, vid, impact)
+            v = self.store.violation(vid)
+            self.notify({"type": "impact", "camera_id": self.cam["id"], "violation_id": vid,
+                         "impact": load_impact(self.store, vid),
+                         "priority": priority_for(self.store, v) if v else None})
+        except Exception as e:          # a case cleared meanwhile, a full disk, ...
+            print(f"impact of case {vid} not stored: {e}")
+
+    def _finish_impact(self):
+        """End of the run: score what is still waiting on the part of its window that exists; keep the baseline."""
+        try:
+            if self.impacts is not None:
+                for vid, impact in self.impacts.flush():
+                    self._store_impact(vid, impact)
+            if self.traffic is not None:
+                self.traffic.close()
+        except Exception as e:
+            print(f"traffic impact not finished: {e}")
 
     def _tracklet_done(self, tl):
         """A vehicle has left this camera: store its pass, and link it straight away if another camera
@@ -203,11 +295,39 @@ class CameraWorker(threading.Thread):
         try:
             gid = self.linker.link(tl)
             if gid:
+                tl.global_id = gid          # so a later ReID vector does not link it a second time
                 self.status["linked"] = self.status.get("linked", 0) + 1
                 self.notify({"type": "vehicle_linked", "camera_id": self.cam["id"], "global_id": gid,
                              "tracklet_id": tl.id, "cls": tl.cls})
         except Exception as e:
             print(f"online link failed: {e}")
+
+    def _embed_status(self):
+        """Counters of the background ReID embedding (queued / done / dropped / mean ms); {} when it is off."""
+        if self.tracklets is None:
+            return {}
+        w = reid_worker()
+        return {"embed": w.stats()} if w.available() or w.queued else {}
+
+    def _reid_ready(self, tl):
+        """The ReID vector of a stored tracklet has arrived (worker thread): store it, then let the online
+        linker look again if the vehicle is still unlinked. Never raises into the embedding thread."""
+        try:
+            if tl.id is not None:
+                self.store.set_tracklet_reid(tl.id, tl.embed_reid, tl.embed_reid_model)
+        except Exception as e:
+            print(f"ReID vector not stored: {e}")
+            return
+        if self.linker is None or tl.global_id:
+            return
+        try:
+            gid = self.linker.link(tl)
+            if gid:
+                self.status["linked"] = self.status.get("linked", 0) + 1
+                self.notify({"type": "vehicle_linked", "camera_id": self.cam["id"], "global_id": gid,
+                             "tracklet_id": tl.id, "cls": tl.cls})
+        except Exception as e:
+            print(f"online re-link failed: {e}")
 
     def _plate_result(self, vid, result):
         """Called from the plate-reading thread."""
@@ -229,6 +349,7 @@ class WorkerManager:
     def __init__(self, store, data_dir, notify=None, linker=None):
         self.store, self.data_dir, self.notify = store, data_dir, notify
         self.linker = linker
+        self.baseline = Baseline(store)   # one time-of-day baseline, shared by every camera's collector
         self.workers = {}
         self.autozone = {}   # cid -> AutoZoneJob (learning the zones automatically)
 
@@ -278,7 +399,7 @@ class WorkerManager:
         cam = self.store.camera(cid)
         if cam is None:
             raise KeyError(cid)
-        w = CameraWorker(self.store, cam, self.data_dir, self.notify, start_sec, self.linker)
+        w = CameraWorker(self.store, cam, self.data_dir, self.notify, start_sec, self.linker, self.baseline)
         self.workers[cid] = w
         w.start()
         return w

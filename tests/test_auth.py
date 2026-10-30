@@ -4,8 +4,14 @@ The security-relevant behaviour is pinned here rather than described, because th
 is somebody reading another person's violation history. In particular: a licence number must not be enough
 to sign in, an unknown licence must look exactly like a known one, and a driver must never reach the
 operator surface.
+
+Importing the dashboard server opens its database, so the server is pointed at a scratch folder before anything
+imports it (EnumerationTests does, further down); no test here touches data/surveillance.db.
 """
 
+import atexit
+import os
+import shutil
 import sys
 import tempfile
 import time
@@ -13,6 +19,11 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+if "surveillance.server" not in sys.modules:
+    _SCRATCH = tempfile.mkdtemp(prefix="auth-server-")
+    os.environ["TRAFFIC_DATA_DIR"] = _SCRATCH
+    atexit.register(shutil.rmtree, _SCRATCH, ignore_errors=True)
 
 from surveillance import auth  # noqa: E402
 from surveillance.store import Store  # noqa: E402
@@ -175,7 +186,9 @@ class StoreTests(unittest.TestCase):
     def test_a_driver_sees_only_their_own_plates(self):
         uid = self.driver()
         mine = self.confirmed("DHAKA METRO-GA 12-3456")
-        self.confirmed("DHAKA METRO-KA 77-7777")
+        other = self.confirmed("DHAKA METRO-KA 77-7777")
+        for vid in (mine, other):       # the portal lists cited cases only
+            self.store.create_citation(vid, {"user_id": 1, "name": "Admin"}, None, "h" * 64, "{}")
         keys = [v["plate_key"] for v in self.store.vehicles_of(uid, verified_only=True)]
         rows, total = self.store.violations_for_plates(keys)
         self.assertEqual(total, 1)
@@ -183,7 +196,8 @@ class StoreTests(unittest.TestCase):
 
     def test_plate_matching_ignores_spacing_and_case(self):
         uid = self.driver(plate=auth.normalise_plate("dhaka metro ga 123456"))
-        self.confirmed("DHAKA METRO-GA 12-3456")
+        vid = self.confirmed("DHAKA METRO-GA 12-3456")
+        self.store.create_citation(vid, {"user_id": 1, "name": "Admin"}, None, "h" * 64, "{}")
         keys = [v["plate_key"] for v in self.store.vehicles_of(uid, verified_only=True)]
         self.assertEqual(self.store.violations_for_plates(keys)[1], 1)
 

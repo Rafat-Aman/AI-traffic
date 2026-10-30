@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ask the cameras - Traffic Surveillance</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/query.css">
+</head>
+<body class="query-page">
+  <header class="q-top">
+    <a class="btn small ghost" href="/">&larr; Dashboard</a>
+    <h1>Ask the cameras</h1>
+    <span class="muted small" id="index-note">Loading index&hellip;</span>
+    <span class="spacer"></span>
+    <button class="btn small hidden" id="rebuild" type="button" title="Recompute the index from stored tracklets and violations (no detection is run)">Rebuild index</button>
+    <a class="btn small ghost" href="/map">Map</a>
+    <span class="small secondary" id="who"></span>
+  </header>
+  <main class="q-main">
+    <section class="card" aria-labelledby="ask-h">
+      <h2 id="ask-h" class="sr">Question</h2>
+      <form id="ask" class="q-ask" autocomplete="off">
+        <input id="question" type="text" maxlength="500" placeholder="e.g. how many buses stopped at camera 2 between 5 and 6 pm?" aria-label="Your question">
+        <button class="btn primary" id="go" type="submit">Ask</button>
+      </form>
+      <div class="q-opts small secondary">
+        <label>Treat as
+          <select id="intent"><option value="">decide automatically</option><option value="descriptive">descriptive (count / list from the index)</option><option value="causal">causal (look at the video)</option></select></label>
+        <label title="Sends your question text to the configured language model to help read it. The rule parse is still the validator."><input type="checkbox" id="use-llm"> let the language model help read the question</label>
+      </div>
+      <div class="q-examples" id="examples" aria-label="Example questions"></div>
+    </section>
+
+    <section class="card hidden" id="parsed-card" aria-labelledby="parsed-h">
+      <div class="card-head"><h2 id="parsed-h">What was understood</h2><span class="spacer"></span>
+        <button class="btn small" id="rerun" type="button">Run with these edits</button></div>
+      <div id="understood" class="q-chips"></div>
+      <ul id="notes" class="q-notes"></ul>
+      <details id="editor"><summary>Edit the structured query</summary><div class="q-form" id="form"></div></details>
+    </section>
+
+    <section class="card hidden" id="answer-card" aria-live="polite"></section>
+
+    <section class="hidden" id="results-wrap">
+      <div class="card-head"><h2 id="results-h">Segments</h2><span class="muted small" id="results-note"></span></div>
+      <div id="results" class="q-results"></div>
+    </section>
+  </main>
+  <div id="toast" class="q-toast hidden" role="status"></div>
+  <script src="/static/query.js"></script>
+</body>
+</html>

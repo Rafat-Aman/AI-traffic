@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Storage - Traffic Surveillance</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/storage.css">
+</head>
+<body class="storage-page">
+  <header class="st-top">
+    <a class="btn small ghost" href="/">&larr; Dashboard</a>
+    <h1>Storage and ingest</h1>
+    <span class="spacer"></span>
+    <span class="small secondary" id="who"></span>
+  </header>
+  <main class="st-body">
+    <section class="card" id="disk"></section>
+    <section class="card"><div class="card-head"><h2>Usage by category</h2></div><div id="usage"></div></section>
+    <section class="card"><div class="card-head"><h2>Growth</h2></div><div id="growth"></div></section>
+    <section class="card"><div class="card-head"><h2>Ingest queue</h2><span class="spacer"></span><span class="small muted" id="ingest-note"></span></div><div id="ingest"></div></section>
+    <section class="card"><div class="card-head"><h2>Retention policy</h2></div><div id="policy"></div></section>
+    <section class="card wide"><div class="card-head"><h2>Retention plan</h2><span class="spacer"></span>
+      <button class="btn small" id="make-plan" disabled>Preview what would be deleted</button>
+      <button class="btn small bad" id="apply-plan" disabled>Apply this plan</button></div>
+      <p class="muted small">A preview deletes nothing. Applying deletes only the files listed, after checking each one again.</p>
+      <div id="plan"></div></section>
+  </main>
+  <div id="toast" class="st-toast hidden" role="status"></div>
+  <script src="/static/storage.js"></script>
+</body>
+</html>

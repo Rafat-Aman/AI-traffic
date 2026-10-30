@@ -128,8 +128,9 @@ PyTorch eager, no GPU), all cores busy and the machine shared with other work, s
 | MobileNetV3-Small, either crop size | 1.76 / 75.8% | 0.012 s |
 
 * The collector's 128 px cap costs the ReID network nothing measurable (one vehicle of 62 in rank-1), and the
-  crops are small to begin with: the median long side is 83 px.
-* Mirror averaging doubles the time and changed no same-class result, so it is off. The notebook uses it.
+  crops are small to begin with: the median long side of the ones the test uses is 83 px.
+* Mirror averaging nearly doubles the time and moved the same-class separation by 0.03 and no vehicle, so it
+  is off. The notebook uses it.
 * 256 and 224 px are 40% and 55% cheaper and score the same or a little lower overall, but the CNG rank-1
   falls from 8 of 8 to 6 of 8 at both (two vehicles). That is noise-sized, and 320 px is the size the weights
   were fitted to, so 320 stays the default; `embed.REID_SIZE` changes it if the CPU budget demands.

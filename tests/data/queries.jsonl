@@ -1,0 +1,16 @@
+# SYNTHETIC labelled queries for X7 (tests/test_query.py::build_world). "gold" is a predicate over the generator's
+# own ground truth, not over what the index inferred. They show the pipeline and the metrics run; they are not real
+# operator questions and say nothing about accuracy on real footage.
+{"id": "q01", "question": "how many buses stopped at camera 2 between 5 and 6 pm?", "gold": {"cls": ["Bus"], "stopped": true, "camera": 2, "t": ["17:00", "18:00"]}}
+{"id": "q02", "question": "show white cars going wrong way yesterday", "gold": {"cls": ["Car"], "colour": "white", "codes": ["V4"]}}
+{"id": "q03", "question": "wrong way vehicles at Farmgate", "gold": {"codes": ["V4"], "camera": 1}}
+{"id": "q04", "question": "white car wrong way at Mirpur 10", "gold": {"cls": ["Car"], "colour": "white", "codes": ["V4"], "camera": 3}}
+{"id": "q05", "question": "trucks blocking the lane at camera 2", "gold": {"cls": ["Truck"], "codes": ["V7"], "camera": 2}}
+{"id": "q06", "question": "speeding motorbikes at Mirpur 10", "gold": {"cls": ["Motorbike"], "codes": ["V2"], "camera": 3}}
+{"id": "q07", "question": "bus with plate 11-2233", "gold": {"plate": "11-2233"}}
+{"id": "q08", "question": "show vehicle 5", "gold": {"gid": 5}}
+{"id": "q09", "question": "vehicle #300 yesterday", "gold": {"gid": 300}}
+{"id": "q10", "question": "bus stopped outside the bus stop at camera 2", "gold": {"codes": ["V1"], "camera": 2}}
+{"id": "q11", "question": "stopped buses at camera 1", "gold": {"cls": ["Bus"], "stopped": true, "camera": 1}}
+{"id": "q12", "question": "stopped red buses at camera 2 between 5 and 6 pm", "gold": {"cls": ["Bus"], "stopped": true, "colour": "red", "camera": 2, "t": ["17:00", "18:00"]}}
+{"id": "q13", "question": "why did traffic back up at 5:40 at camera 2?", "gold": {"camera": 2, "stopped": true, "t": ["17:38", "17:42"]}}

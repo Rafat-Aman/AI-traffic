@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from surveillance import vlm                      # noqa: E402
+from surveillance import vlm, vlm_cascade         # noqa: E402
 from surveillance.store import Store              # noqa: E402
 
 DATA = ROOT / "data"
@@ -44,7 +44,7 @@ def rss_of(pattern):
         if not p.name.isdigit():
             continue
         try:
-            if pattern not in (p / "cmdline").read_bytes().decode(errors="ignore"):
+            if pattern not in (p / "cmdline").read_bytes().decode(errors="ignore").replace("\0", " "):
                 continue
             for line in (p / "status").read_text().splitlines():
                 if line.startswith("VmRSS:"):
@@ -140,6 +140,26 @@ def verdict(mem, model_bytes, running_rss):
           "  unless you ask it to while a camera is analysing.")
 
 
+def tiers(mem):
+    """Per-tier memory check of the two-tier cascade: the 2B stays resident, the 8B is started on demand."""
+    avail = mem["MemAvailable"]
+    print("\nTiers (surveillance/vlm_cascade.py)")
+    need = {}
+    for tier, label, port in (("screen", "2B screen  (always on)", 8081), ("reason", "8B reason  (on demand)", 8082)):
+        ok = vlm_cascade.tier_installed(tier)
+        need[tier] = vlm_cascade.tier_need_bytes(tier) if ok else 0
+        up = vlm_cascade.http_health(f"http://127.0.0.1:{port}")
+        rss = rss_of(f"--port {port}") if up else 0
+        print(f"  {label:<24} {'installed' if ok else 'NOT installed (tools/setup_vlm.sh cascade)':<10}"
+              f" needs ~{need[tier] / GB:.1f} GB" + (f"  | serving on :{port}, {rss / GB:.1f} GB resident" if up else ""))
+    if all(need.values()):
+        # What is already resident counts as available only if it is one of these servers.
+        both = need["screen"] + need["reason"]
+        print(f"  available now: {avail / GB:.1f} GB.  8B alone: {'fits' if need['reason'] <= avail else 'DOES NOT FIT'}"
+              f"; 2B + 8B together need ~{both / GB:.1f} GB: {'fits' if both <= avail else 'does not fit - the dashboard will refuse to start the 8B and say so'}")
+    return need
+
+
 def run_case(vid, backend, settings):
     store = Store(DATA / "surveillance.db")
     v = store.violation(vid)
@@ -200,6 +220,7 @@ def main():
     print(f"  would use      {st['backend'] or 'nothing - Explain will return 503'}")
 
     verdict(mem, total, running)
+    tiers(mem)
     return run_case(a.case, a.backend, settings) if a.case else 0
 
 

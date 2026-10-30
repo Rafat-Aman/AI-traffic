@@ -92,8 +92,17 @@ class ClipRecorder:
     A burst of violations (a jam, a rule misconfigured) queues its clips instead of starting an encoder each,
     and close() waits until every queued clip is written."""
 
+    # Codes whose event starts well before it is emitted (V11 waits 3-7 s of post-event stasis, V10 emits after
+    # the weave): their clip reaches back to started_s - EARLY_MARGIN_S, within what the ring holds.
+    EARLY_CODES = ("V10", "V11")
+    EARLY_MARGIN_S = 2.0
+    # Ring depth. 12 s of 1280x720 JPEG q80 (~100-150 KB) at 25 fps = 300 frames = ~30-45 MB per camera;
+    # at 640x360 about a quarter of that. Only the ring is larger: normal clips are still cut at pre_sec.
+    MAX_PRE_SEC = 12.0
+
     def __init__(self, pre_sec=5.0, post_sec=5.0, workers=2):
         self.pre_sec, self.post_sec = pre_sec, post_sec
+        self.keep_sec = max(pre_sec, self.MAX_PRE_SEC)
         self.ring = deque()       # (t, jpeg)
         self.pending = []         # [path, end_t, [(t, jpeg)]]
         self.jobs = queue.Queue()
@@ -104,7 +113,7 @@ class ClipRecorder:
 
     def add(self, jpeg, t):
         self.ring.append((t, jpeg))
-        while self.ring and t - self.ring[0][0] > self.pre_sec:
+        while self.ring and t - self.ring[0][0] > self.keep_sec:
             self.ring.popleft()
         still = []
         for clip in self.pending:
@@ -115,9 +124,17 @@ class ClipRecorder:
                 still.append(clip)
         self.pending = still
 
-    def trigger(self, path, t):
-        """Start a clip around time t (the current frame); it is written to `path` once post_sec have passed."""
-        self.pending.append([Path(path), t + self.post_sec, list(self.ring)])
+    def trigger(self, path, t, started_s=None):
+        """Start a clip around time t (the current frame); it is written to `path` once post_sec have passed.
+
+        `started_s` (the event's own start, same clock as t) extends the pre-roll back to started_s - 2 s when
+        that is earlier than t - pre_sec, limited to what the ring holds. Pass it only for the codes in
+        EARLY_CODES; everything else keeps the plain pre_sec."""
+        start = t - self.pre_sec
+        if started_s is not None and started_s < t:
+            start = min(start, started_s - self.EARLY_MARGIN_S)
+        start = max(start, t - self.keep_sec)
+        self.pending.append([Path(path), t + self.post_sec, [f for f in self.ring if f[0] >= start - 1e-9]])
 
     def _write(self, clip):
         path, _, frames = clip

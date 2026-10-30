@@ -59,6 +59,11 @@ Validation
     with a bootstrap interval and a permutation p-value because the sample will be small. NOTHING HAS BEEN VALIDATED
     YET: the only data so far is synthetic (tests/test_impact.py), which shows the machinery behaves; it says nothing
     about whether a real operator would agree with the ordering. The in-sample rho stored with a fit is optimistic.
+    Fitted weights are only put to use when they win `compare_weights`: on the cases a reviewer graded, scored again
+    under both weight sets from their stored departures, they must have a higher rho than equal weights, on at least
+    MIN_GRADED cases. Anything less - too few graded cases, a tie, an ordering that cannot be correlated - keeps equal
+    weights and says why. The fit saw excess delay and never a grade, so the grades are an independent check on it; the
+    units a fit gives (vehicle-seconds) are not a reason to adopt it.
 
 Limits
     * Synthetic only (see Validation). The floors, the shrinkage constant, the severity bands, the history cap and
@@ -99,7 +104,8 @@ DELTA_CAP = 10.0
 PER_VEHICLE = ("speed_kph", "wait_s")   # means over vehicles: noisy when few vehicles stand behind them
 SHRINK_N = 3.0                          # their delta is scaled by n / (n + 3), n = vehicles behind the mean
 MIN_EVENTS = 15                  # events needed to fit the weights (of one code, or pooled)
-POST_SEC = 30.0                  # the event window runs this long after the rule fired
+MIN_GRADED = 10                  # reviewer-graded cases needed before fitted weights can be shown to beat equal ones
+POST_SEC = 30.0                 # the event window runs this long after the rule fired
 PRE_SEC = 240.0                  # cold-start baseline: this long before the window ...
 PRE_GUARD_SEC = 2.0              # ... stopping just short of it
 MIN_PRE_SEC = 60.0               # ... and it needs at least this much measured
@@ -164,6 +170,9 @@ class Weights:
 
     def for_code(self, code):
         return self.by_code.get(code) or self.default
+
+    def any_calibrated(self):
+        return self.default.calibrated or any(w.calibrated for w in self.by_code.values())
 
     def to_dict(self):
         return {"default": self.default.to_dict(), "by_code": {c: w.to_dict() for c, w in self.by_code.items()},
@@ -336,6 +345,50 @@ def validate(scores, human_severity, n_boot=2000, n_perm=5000, seed=0):
     ra = ranks(a)
     hits = sum(abs(spearman(ra, rng.permutation(ranks(b)))) >= abs(rho) - 1e-12 for _ in range(n_perm))
     out["p_value"] = clean((hits + 1) / (n_perm + 1), 4)
+    return out
+
+
+def score_graded(graded, weights):
+    """(scores, grades) of reviewer-graded cases, each scored from its stored departures (`deltas`) under `weights`.
+    Scoring every case again with one weight set puts them all on one scale: the score stored with a case was made
+    with whichever weights were in force then, and calibrated and equal-weight scores cannot share one ordering."""
+    scores, grades = [], []
+    for impact, grade in graded:
+        deltas = impact.get("deltas")
+        if isinstance(deltas, dict) and ts.finite(grade):
+            scores.append(weights.for_code(impact.get("code")).score(deltas))
+            grades.append(float(grade))
+    return scores, grades
+
+
+def compare_weights(graded, candidate, min_graded=MIN_GRADED, **validate_kw):
+    """Do the `candidate` weights order the reviewer-graded cases better than equal weights do?
+
+    `graded`: [(impact, grade)] as graded_rows() reads them. The candidate was fitted to excess delay and never saw a
+    grade, so the grades are an independent check on both. It only counts as better with at least `min_graded` cases
+    and a strictly higher rho; a tie, too few cases, or an ordering that cannot be correlated (every grade or every
+    score equal) keeps equal weights, because the burden of proof is on the calibration.
+    Returns {adopt, reason, n_graded, min_graded, equal, candidate}; the last two are validate() results."""
+    equal = validate(*score_graded(graded, Weights()), **validate_kw)
+    fitted = validate(*score_graded(graded, candidate), **validate_kw)
+    n, rho_c, rho_e = fitted["n"], fitted["rho"], equal["rho"]
+    out = {"adopt": False, "n_graded": n, "min_graded": min_graded, "equal": equal, "candidate": fitted}
+    if not candidate.any_calibrated():
+        out["reason"] = ("no weights could be fitted (too few events, or none of them caused a measurable delay), "
+                         "so equal weights stay")
+    elif n < min_graded:
+        out["reason"] = (f"{n} graded case(s): at least {min_graded} are needed to tell the weights apart, so equal "
+                         "weights stay")
+    elif rho_c is None or rho_e is None:
+        out["reason"] = ("the grades or the scores are all equal, so the weights cannot be told apart and equal "
+                         "weights stay")
+    elif rho_c > rho_e:
+        out["adopt"] = True
+        out["reason"] = (f"on {n} graded cases the fitted weights agree with the reviewers better "
+                         f"(rho {rho_c:+.2f}, against {rho_e:+.2f} for equal weights)")
+    else:
+        out["reason"] = (f"on {n} graded cases equal weights agree with the reviewers as well or better "
+                         f"(rho {rho_e:+.2f}, against {rho_c:+.2f} for the fitted weights), so equal weights stay")
     return out
 
 
@@ -583,6 +636,13 @@ def validation_pairs(store):
     rows = store.q("SELECT score, human_severity FROM event_impact WHERE score IS NOT NULL AND "
                    "human_severity IS NOT NULL ORDER BY violation_id")
     return [r["score"] for r in rows], [r["human_severity"] for r in rows]
+
+
+def graded_rows(store):
+    """[(impact, grade)] of the cases a reviewer has graded, for compare_weights() (which scores them again)."""
+    return [(json.loads(r["impact"]), r["human_severity"]) for r in
+            store.q("SELECT impact, human_severity FROM event_impact WHERE score IS NOT NULL AND "
+                    "human_severity IS NOT NULL ORDER BY violation_id")]
 
 
 def save_weights(store, weights):

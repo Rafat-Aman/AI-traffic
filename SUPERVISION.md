@@ -33,8 +33,8 @@ Where the plan comes from:
 
 ## Snapshot — 2026-10-29
 
-- git: clean at `6e0fe26 second commit`; tests **219 passing** across 9 modules.
-- Running: dashboard `:8000` (`OTP_DELIVERY=echo INSECURE_COOKIES=1`), llama-server `:8081` (Qwen2.5-VL-3B Q4_K_M).
+- git: last commit `80563e6 agent working`; everything since is uncommitted. Tests **1096 passing** (`unittest discover -s tests`, 127 s).
+- Running: dashboard `:8000` via `./tools/run_dashboard.sh` (MEDIA_SECRET from `~/.config/dhaka-traffic/media_secret`, 0600, off the fuseblk mount). VLM: Qwen3-VL-2B screen on :8081 (`tools/vlm_server.sh --tier screen`), 8B started on demand on :8082.
 - Test accounts: `admin/admin`, `police/police`, driver licence `driver` (verified plate DHAKA METRO-GA 12-3456, demo case TV-1).
 - Machine: i5-11400H 6C/12T AVX-512+VNNI, 23 GB RAM, **no usable GPU** (GTX 1650 on nouveau, torch CPU build).
   Anything needing a GPU (YOLOv11 retrain, Q-LoRA) has to be prepared here and run on rented compute.
@@ -51,7 +51,7 @@ Where the plan comes from:
 |---|---|---|---|---|
 | D1 | YOLOv11 fine-tuned on BD classes (SDP 3.1.2, slides) | 🟡 | `bd_vehicles_best.pt` | **It is YOLOv8s** (80 ep, 640 px), 16 classes. Retrain on YOLOv11 or correct the report → DEC-2 |
 | D2 | Local classes (CNG, rickshaw, leguna, easy-bike, human hauler) | ✅ | detector names | No separate "human hauler" class (folded into Leguna) — say so in the report |
-| D3 | Edge deployment / optimisation (slides: JetPack) | ❌ | CoreML export (Mac only) | ONNX/OpenVINO export for x86 CPU edge; Jetson is hardware we don't have |
+| D3 | Edge deployment / optimisation (slides: JetPack) | 🟡 | CoreML (Mac), `Detector(backend="onnx")` opt-in | ONNX agreement 94–96 % vs torch, speed gain not established under load; GPU needed for hundreds of videos/day (`docs/CAPACITY.md`) |
 
 ### 2. TRACK
 | ID | Plan item | Status | Evidence | Gap / note |
@@ -60,7 +60,7 @@ Where the plan comes from:
 | T2 | Speed via homography | ✅ | `surveillance/speed.py`, `tools/bench_accuracy.py`, `tests/test_accuracy.py` | |
 | T3 | Road-context annotation (lanes, bus stops, no-parking, direction) | ✅ | `violations/zones.py`, `web/editor.js`, `surveillance/autozone.py` | `bus_lane` area type with operating hours added by WP6 |
 | T4 | Camera-motion compensation | ✅ | `surveillance/camera_motion.py` | |
-| T5 | Cross-camera linking + Re-ID (SDP 3.1.3) | ✅ | `surveillance/reid.py`, `link.py`, `embed.py`, `tests/test_reid.py` | Validated on synthetic traffic only; real-footage validation pending (X6) |
+| T5 | Cross-camera linking + Re-ID (SDP 3.1.3) | ✅ | `surveillance/reid.py`, `link.py`, `embed.py`, `reid_backbone.py`, `tests/test_reid*.py` | Team's CityFlow ResNet50-IBN-a is the default appearance model (async). Cross-camera accuracy on Dhaka unmeasured (X6) |
 | T6 | Trajectory database, queryable (SDP 3.1.3) | 🟡 | `tracklets` table | Summary per pass only (no per-frame boxes); SQLite not PostGIS (P1) |
 | T7 | Multi-video site upload | ✅ | `/api/sites/upload`, `SiteRun` | |
 
@@ -69,13 +69,13 @@ Where the plan comes from:
 |---|---|---|---|---|
 | U1 | Geometric rule engine | ✅ | `violations/*`: V1 bus stopping, V3 kerb parking, V4 wrong side, V5 solid line, V7 lane blocking, V8 banned vehicle | Extras beyond SDP: V2 speed, V6 helmet → C-3 |
 | U2 | Bus-lane violation (SDP Table 3.1 #5) | ✅ | `violations/bus_lane.py`, `tests/test_bus_lane.py` (50) | V9: ≥25 m and ≥4 s inside a drawn lane during its hours; jams excused. UI labels in INT-A |
-| U3 | Unsafe / erratic manoeuvre (SDP #7, VLM-decided) | 🔧 | WP2 | Candidate from kinematics → VLM decides. V10 |
-| U4 | Near-collision / collision (SDP #8, pipeline "accidents") | 🔧 | WP2 | TTC + post-event stasis → VLM decides. V11 |
+| U3 | Unsafe / erratic manoeuvre (SDP #7, VLM-decided) | ✅ | `violations/erratic.py`, `tests/test_behaviour.py` | Candidate from kinematics → VLM decides. V10 |
+| U4 | Near-collision / collision (SDP #8, pipeline "accidents") | ✅ | `violations/near_collision.py`, `tests/test_behaviour.py` | TTC + post-event stasis → VLM decides. V11 |
 | U5 | VLM reasoning, phase-aware, must decline | ✅ | `surveillance/vlm.py`, `tools/vlm_probe.py` (3/3), `tests/test_vlm.py` | 3B verdict is noisy — documented |
-| U6 | VLM cascade: light screen → large reasoner (SDP 3.1.4) | 🔧 | WP2 | CPU-feasible screen; one local model only |
+| U6 | VLM cascade: light screen → large reasoner (SDP 3.1.4) | ✅ | `surveillance/screening.py`, `vlm_cascade.py`, `tests/test_cascade.py` | Kinematic pre-screen → Qwen3-VL-2B → Qwen3-VL-8B on demand. Thresholds are policy (no labelled set, X5) |
 | U7 | Cross-camera journey given to the VLM | ✅ | `describe_journey` in `vlm.py` | |
-| U8 | NL query Stage A: verbalised motion, identity + time window (SDP 3.1.5) | 🔧 | WP3 | |
-| U9 | NL query Stage B: descriptive vs causal routing | 🔧 | WP3 | |
+| U8 | NL query Stage A: verbalised motion, identity + time window (SDP 3.1.5) | ✅ | `surveillance/query.py`, `segment_index.py` | |
+| U9 | NL query Stage B: descriptive vs causal routing | ✅ | `surveillance/query.py`, `api_query.py` | |
 | U10 | Instruction-tuning corpus (self-instruct) + RAG over Road Transport Act 2018 / DMP rules (SDP 3.2.2) | ❌ | — | Needs the real statute text; never fabricate provisions |
 | U11 | Q-LoRA rank 16 α 32 on 7B (SDP 3.3 step 5) | ❌ | — | Needs rented GPU → DEC-5 |
 
@@ -88,28 +88,28 @@ Where the plan comes from:
 | E4 | Citation generation for e-prosecution | ✅ | `POST /api/violations/{vid}/citation`, `/api/citations*`, `/notice/{vid}` | Number, issuer, withdraw (admin, reason). **Fine amounts unset** (`FINE_SCHEDULE_BDT`); `paid` has no flow |
 | E5 | Offender history + priority (impact + count + recency) | 🟡 | plate search | Priority depends on A6 |
 | E6 | Roles (driver / controller / admin) + audit trail | ✅ | `auth.py`, `webauth.py`, `tests/test_auth.py` | |
-| E7 | Driver portal | ✅ | `web/portal.html`, `/api/portal/*` | |
+| E7 | Driver portal | ✅ | `web/portal.html`, `/api/portal/*` | "My citations": issued citations only (withdrawn shown as void); IDOR-checked by sealed plate |
 | E8 | Signed, expiring media links for offenders | ✅ | `/m/{token}/{path}` (HMAC, 1 h), `/media/*` staff-only | Key: `MEDIA_SECRET` env or `data/.media_secret` (gitignored). `data/` is fuseblk here → chmod ignored → prefer the env var |
-| E9 | Dispute / appeal flow | ⛔ | — | Declined 2026-10-25; portal says contact the authority |
+| E9 | Dispute / appeal flow | ✅ | `surveillance/disputes.py`, `tests/test_disputes.py` (51) | Driver disputes within 30 d → 8B re-check (advisory, injection-hardened, never shown to driver) → controller/admin upholds or accepts (four-eyes: not the issuer/confirmer). No uploads, no second appeal |
 | E10 | Delivery transcode (≤720p) | ✅ | `clips.make_delivery_clip` (crf 28, veryfast, faststart) | 5.69→1.14 MB (1242×1440), 2.60→1.79 MB (720p). Originals kept for disputes. Stale `.part.mp4` blocks citing → WP13 cleanup |
 
 ### 5. ASSESS IMPACT — the SDP's central contribution
 | ID | Plan item | Status | Evidence | Gap / note |
 |---|---|---|---|---|
-| A1 | Rolling traffic state per approach: queue length, mean speed, lane occupancy, density, waiting time | 🟡 | `surveillance/traffic_state.py`, `tests/test_impact.py` (84) | Built + tested; wiring into pipeline/worker/UI = INT-A. 6–8 ms/frame at 80 vehicles |
-| A2 | Per-approach, time-of-day baseline | 🟡 | `traffic_state.Baseline` | Falls back to the camera's own recent median until a time-of-day bin has data |
-| A3 | Impact score S = Σ wᵢΔᵢ | 🟡 | `surveillance/impact.py` | Synthetic: busy stop 1.58 vs free road 0.34 vs quiet 0.11 |
-| A4 | Calibration: NNLS to excess vehicle-delay (veh·s), equal-weight fallback labelled uncalibrated | 🟡 | `impact.nnls`, `impact.calibrate` | Lawson–Hanson in numpy. On synthetic n=9 calibrated ρ 0.90 < equal 0.95 → equal weights kept |
-| A5 | Validation: Spearman ρ vs human severity ordering | 🟡 | `impact.spearman`, `impact.validate` | Needs human severity ratings of real cases (severity endpoint in INT-A) |
-| A6 | Severity / priority = rule + impact + history (history as context, never a trigger) | 🟡 | `impact.priority` | History contribution capped |
+| A1 | Rolling traffic state per approach: queue length, mean speed, lane occupancy, density, waiting time | ✅ | `surveillance/traffic_state.py`, `tests/test_impact.py` (84) | Wired by INT-A: pipeline → collector → worker → impact row + SSE → case view. 6–8 ms/frame at 80 vehicles |
+| A2 | Per-approach, time-of-day baseline | ✅ | `traffic_state.Baseline` | Falls back to the camera's own recent median until a time-of-day bin has data |
+| A3 | Impact score S = Σ wᵢΔᵢ | ✅ | `surveillance/impact.py` | Synthetic: busy stop 1.58 vs free road 0.34 vs quiet 0.11 |
+| A4 | Calibration: NNLS to excess vehicle-delay (veh·s), equal-weight fallback labelled uncalibrated | ✅ | `impact.nnls`, `impact.calibrate` | Lawson–Hanson in numpy. On synthetic n=9 calibrated ρ 0.90 < equal 0.95 → equal weights kept |
+| A5 | Validation: Spearman ρ vs human severity ordering | ✅ | `impact.spearman`, `impact.validate` | Needs human severity ratings of real cases (severity endpoint in INT-A) |
+| A6 | Severity / priority = rule + impact + history (history as context, never a trigger) | ✅ | `impact.priority` | History contribution capped |
 
 ### 6. OPTIMIZE
 | ID | Plan item | Status | Evidence | Gap / note |
 |---|---|---|---|---|
-| O1 | Signal control from measured state (SDP 2.2.1 review: MPLight pressure, CoLight, fog–cloud) | 🔧 | WP4 | SDP says design-only; pipeline wants it → simulation-validated controller → DEC-4 |
-| O2 | City routing on live travel times | 🔧 | WP4 | |
-| O3 | Emergency green corridor (EMVLight idea) | 🔧 | WP4 | |
-| O4 | Evaluation vs fixed-time | 🔧 | WP4 | |
+| O1 | Signal control from measured state (SDP 2.2.1 review: MPLight pressure, CoLight, fog–cloud) | ✅ | `surveillance/optimize/`, `tools/signal_sim.py`, `tests/test_optimize.py` | Max-pressure, min green 15 s; simulator only, no real signal. API + 3D UI = WP10 |
+| O2 | City routing on live travel times | 🟡 | `surveillance/optimize/`, `tools/signal_sim.py`, `tests/test_optimize.py` | |
+| O3 | Emergency green corridor (EMVLight idea) | 🟡 | `surveillance/optimize/`, `tools/signal_sim.py`, `tests/test_optimize.py` | |
+| O4 | Evaluation vs fixed-time | 🟡 | `surveillance/optimize/`, `tools/signal_sim.py`, `tests/test_optimize.py` | |
 
 ### 7. EVALUATE — SDP Chapter 4 is empty
 | ID | Metric (SDP 3.3) | Status | Evidence | Gap / note |
@@ -141,7 +141,7 @@ Where the plan comes from:
 | C-1 | YOLOv11 detector | YOLOv8s | DEC-2 |
 | C-2 | BoT-SORT | ByteTrack default | Measure; DEC-3 |
 | C-3 | Table 3.1 numbering; speed "never supports a speeding citation"; helmet listed as omitted | V1–V11 numbering differs; V2 now **advisory** (`ADVISORY_CODES`, never on a notice); V6 helmet implemented | Re-table the report to V-codes; say V6 was added |
-| C-4 | NL query panel is in the abstract | not built | WP3 |
+| C-4 | NL query panel is in the abstract | built (WP3), English only, rule parser + optional LLM parse | Report: say Bangla questions are not parsed |
 | C-5 | Impact score is the central argument | not built | WP1 |
 | C-6 | PostgreSQL + PostGIS | SQLite | P1, before hosting |
 | C-7 | Two-camera testbed | one camera loaded | Load `side2_1.mp4` and run a site |
@@ -157,8 +157,8 @@ V-code map, SDP Table 3.1 → code: #1 illegal parking → V3 · #2 bus stoppage
 | ID | Question | My recommendation |
 |---|---|---|
 | DEC-1 | V2 speed: citable or advisory? | **Advisory** (detected, shown, never on a notice) — matches SDP 3.1.2 and 5.1.3 |
-| DEC-2 | YOLOv11 retrain vs correct the report | Retrain on rented GPU *if* the training set is available; otherwise correct the report |
-| DEC-3 | BoT-SORT vs ByteTrack | Decide on measured MOTA/IDF1 + FPS (X2) |
+| DEC-2 | YOLOv11 retrain vs correct the report | Retrain on rented GPU *if* the training set is available; otherwise correct the report. **Team (2026-10-30): training-video provenance of `bd_vehicles_best.pt` unknown** → build any test set only from footage recorded after the model (weights dated 2026-10-24), e.g. the 2026-10-29 `videos/` drop, and confirm it was never given to whoever trained it |
+| DEC-3 | BoT-SORT vs ByteTrack | Proxy on 60 s of Dhaka footage (WP5): 152 vs 147 tracks, mutual IDF1 0.976, ByteTrack 3.6 ms vs BoT-SORT 25.4 ms/frame; detector dominates (~1.8 s/frame under load). Accuracy undecidable without MOT ground truth → keep ByteTrack, report BoT-SORT as equivalent here, or label 2 min in CVAT |
 | DEC-4 | OPTIMIZE scope | Simulation-validated max-pressure + routing + EV corridor; SUMO bridge later |
 | DEC-5 | Q-LoRA budget | Prepare corpus + scripts here; one rented run on Vast.ai |
 | DEC-6 | When to move to PostgreSQL | Before any hosting; after features freeze |
@@ -202,18 +202,21 @@ otherwise; 3D uses MapLibre GL + OpenFreeMap (free vector tiles with building he
 |---|---|---|---|---|
 | WP7 | E3 E4 E8 E10 citations, sealed evidence, signed links, delivery clips, V2 advisory | `server.py`, `store.py`, `clips.py`, `notice.html`, `portal.html`, `app.js` / `citation.py`, `tests/test_citation.py` | A | ✅ 288 tests across 5 modules; 42/42 headless-Chrome checks |
 | WP6 | U2 bus lane V9 | `violations/zones.py`, `engine.py`, `web/editor.js`, `vlm.py` (RULE_CLAIM only) / `violations/bus_lane.py`, test | A | ✅ 50 + 170 tests |
-| WP8 | R-1 trained ReID model in the matcher | `surveillance/embed.py`, `tools/reid_eval.py`, `.gitignore` / `reid_backbone.py`, `research/cityflow/`, `models/reid/`, test | A | 🔧 |
+| WP8 | R-1 trained ReID model in the matcher | `surveillance/embed.py`, `tools/reid_eval.py`, `.gitignore` / `reid_backbone.py`, `research/cityflow/`, `models/reid/`, test | A | ✅ 74 tests. On Dhaka footage (1 camera, 62 vehicles) same-class rank-1 98.4% vs MobileNet 75.8%, but ~1 s vs 8 ms per vehicle → opt-in `EMBED_MODEL=auto`. Default switch needs: `embed_model` column (store), tag in reid.py/link.py, embedding off the frame thread, test_reid:342 → INT-B |
 | WP1 | A1–A6 traffic state + impact | new files only | A | ✅ 84 tests; wiring = INT-A |
-| INT-A | wire WP1 into pipeline/worker/server/UI; V9–V11 labels, colours, candidate badge; `summary()` never prints "undefined"; tests never open the live DB | FS-A + `web/app.css`, `tests/test_auth.py` / `tests/test_impact_integration.py` | B | 🔧 |
-| WP4 | O1–O4 network (geo-aware), routing, max-pressure, EV corridor, simulator **+ R-8 Google Routes traffic provider** | new files (`surveillance/optimize/`, partial from wave 1) | B | 🔧 |
-| WP2 | U3 U4 V10/V11 kinematic candidates + asymmetric pre-screen (`surveillance/screening.py`) | new files + `engine.py` RULES, `vlm.py` RULE_CLAIM, `test_vlm.py`, docs tables | B | 🔧 |
-| WP5 | X1–X8 evaluation harness + CityFlow numbers into Chapter 4 | new files only | B | ⏳ |
-| WP9 | R-2 map, camera geolocation, inter-camera average speed | FS-A after WP7 | B | ⏳ |
-| WP11 | R-7 + U6 two-tier VLM (2B screen → 8B reasoner), escalation of V10/V11 | `vlm.py`, `tools/*vlm*` + server explain flow | C | ⏳ |
-| WP3 | R-3 R-4 U8 U9 X7 segment index at ingest, retrieve-then-reason query panel | new files, then FS-A | C | ⏳ |
-| WP13 | R-5 ingest queue, retention, compaction, disk monitor, storage page | FS-A | C | ⏳ |
-| WP10 | R-6 3D city, signals, densities, optimiser UI | FS-A + new web files | D | ⏳ |
+| INT-A | wire WP1 into pipeline/worker/server/UI; V9–V11 labels, colours, candidate badge; `summary()` never prints "undefined"; tests never open the live DB | FS-A + `web/app.css`, `tests/test_auth.py` / `tests/test_impact_integration.py` | B | ✅ 410 tests, 17/17 browser checks. Calibrated weights adopted only with ≥10 graded cases and strictly higher ρ |
+| INT-B | R-1 ReID model as default: MobileNet sync + ReID async (bounded queue, drop never block), per-tag cues, `embed_model` columns, measured FPS | `reid.py`, `link.py`, `embed.py`, `store.py`, `worker.py`, tests, docs | B | ✅ 297 tests. Default `auto`; 45 s Dhaka clip: 51/51 vehicles got ReID, 0 dropped (~2.2 s each under load). FPS comparison confounded by machine load |
+| INT-C | segment-index hook after runs + periodic live indexing; V10/V11 clip pre-roll from `started_s`; ReID thread vs detector cores; ReID queue line in camera view | `worker.py`, `pipeline.py`, `clips.py`, `reid.py` (doc), `app.js` (one line), tests | D | ✅ 7 tests. Index after each run + every 5 min live; V10/V11 clips reach back to contact −2 s (≤12 s ring, ~30–45 MB/camera at 720p). No per-thread torch cap exists → documented |
+| WP4 | O1–O4 network (geo-aware), routing, max-pressure, EV corridor, simulator **+ R-8 Google Routes traffic provider** | new files (`surveillance/optimize/`, partial from wave 1) | B | ✅ 138 tests. Synthetic 3×3 grid, 5 held-out seeds: max-pressure mean delay 43–52% below tuned fixed-time at every load; EV corridor −34…−44% EV time, others +2…4%. Google never called live. API router + UI → WP10 |
+| WP2 | U3 U4 V10/V11 kinematic candidates + asymmetric pre-screen (`surveillance/screening.py`) | new files + `engine.py` RULES, `vlm.py` RULE_CLAIM, `test_vlm.py`, docs tables | B | ✅ full suite 763 OK. 60 veh × 300 frames 0.46 s. V10/V11 advisory by default (never cited). FP rate on Dhaka unmeasured. V11 clip pre-roll fixed by INT-C |
+| WP5 | X1–X8 evaluation harness + CityFlow numbers into Chapter 4; DEC-3 proxy | new files only (`evaluation/`, `tools/evaluate.py`, `docs/EVALUATION.md`, `REPORT_RESULTS.md`) | B | ✅ 26 metric tests. Real Dhaka numbers only for X2 (proxy) and X6 (within-camera). Everything else "not measured — needs …" (labelling plan in `docs/EVALUATION.md`) |
+| WP9 | R-2 map, camera geolocation, section speed, Google keys (admin, server-side) | feature module: `geo.py`, `section_speed.py`, `api_map.py`, `web/map.*`, test | B | ✅ 30 tests; router mounted + nav link. Not yet opened in a browser; straight-line × 1.4 until a road network is defined; clocks per camera via manual `clock_offset_s` |
+| WP11 | R-7 + U6 two-tier VLM (2B screen → 8B reasoner on demand), pre-screen → screen → reason, contact frame first | `vlm.py`, `screening.py`, new `vlm_cascade.py`, server explain flow, app.js VLM block, `tools/*vlm*`, `docs/VLM.md` | C | ✅ 40 cascade tests; probes 8/8 (sycophancy 3/3 kept). Loaded machine: 2B ~85 s/case, 8B ~275 s/case, 8B RSS ~10 GB (needs ~10 GB free). 2B is noisy → nearly every case escalates under the asymmetric rule. Live: 2B on :8081, 8B on demand :8082 |
+| WP3 | R-3 R-4 U8 U9 X7 segment index (from stored tracklets/violations), Stage A parse + retrieval, Stage B descriptive vs causal (VLM via injected reason_fn) | feature module: `segment_index.py`, `query.py`, `api_query.py`, `web/query.*`, `tests/test_query.py`, `docs/QUERY.md` | C | ✅ 81 tests; router mounted + "Ask" nav. 10 s windows from stored analytics only. Synthetic X7: MRR 1.0, R@1 0.64, R@3 0.95. Worker hook wired by INT-C; reasoner should use the cascade's 8B tier after WP11 |
+| WP13 | R-5 ingest queue, retention (dry run → admin apply), compaction, disk monitor, storage page; D3 ONNX backend + capacity numbers | feature module: `storage_mgr.py`, `ingest.py`, `api_storage.py`, `web/storage.*`, tests, `docs/STORAGE.md`, `docs/CAPACITY.md`; edits `detector.py` | C | ✅ 46 tests; router + queue + 507 upload guard + nav wired. Raw video 7 d, dismissed 30 d, cited evidence never, confirmed evidence only after admin confirms legal period. Capacity: machine saturates ~3–4 fps at 960 px → ~3 video-h/day at 30 fps, ~9 at 10 fps; 300 × 10-min videos/day needs ~9–16 such CPUs or a GPU. ONNX not reliably faster → opt-in |
+| WP10 | R-6 3D city (MapLibre + OpenFreeMap), network editor, signals, densities, simulation playback, recommendation, routing; Google values never on MapLibre | feature module: `api_optimize.py`, `web/city.*`, `tests/test_city.py`, `docs/OPTIMIZE.md`; may edit `optimize/*`, `web/map.*` | C | ✅ 22 tests; router mounted + nav link; headless-Chrome render checked. Editor drag/click and Google overlay not exercised |
 | INT | wire WP1 / WP2 / WP4 into pipeline, worker, engine, UI | FS-A, FS-B | D | ⏳ |
+| WP14 | E7 + E9: portal shows only issued citations; driver disputes → 8B re-check (advisory, injection-safe) → human decides | `disputes.py` (new), FS-A, `citation.py`, `portal.html`, `app.js`, tests | E | ✅ 360 + 391 tests; not yet opened in a browser |
 
 FS-A = `surveillance/server.py`, `store.py`, `worker.py`, `pipeline.py`, `web/app.js`, `web/index.html` — one owner at a time.
 
@@ -221,8 +224,7 @@ FS-A is the bottleneck, so later packages (WP9, WP3, WP13, WP10, WP11) build as 
 `APIRouter` file (`make_router(store, auth, …)`), their own `ensure_schema(store)`, their own `web/*.js` page. The only
 FS-A edits are one `include_router` line and one nav entry, done by whoever holds FS-A at the time.
 
-Open items from WP7 for the team: drivers currently see every confirmed non-advisory case, cited or not (one-line
-change to show only cited ones); fines are unset until the authority supplies amounts; uvicorn's access log records
+Open items from WP7 for the team: (resolved 2026-10-30: drivers see only issued citations); fines are unset until the authority supplies amounts; uvicorn's access log records
 signed-link tokens (redact before hosting, P5).
 
 ---
@@ -273,3 +275,23 @@ WP6 → WP7 → WP2 (needs engine + vlm from WP6) → WP1 (store + worker + serv
 - 2026-10-29 — Team added R-8 (Google live traffic). WP1 ✅ (impact, 84 tests), WP6 ✅ (V9), WP7 ✅ (citations, signed
   links). WP4 relaunched with R-8; WP2 and INT-A dispatched. Added `data/.media_secret` and `.env` to `.gitignore`
   (WP7 found the signing key was not ignored).
+- 2026-10-30 — All agents hit the session limit, then the editor closed mid-run. Team committed `80563e6 agent working`.
+  WP8 ✅ (report received before the close). INT-A, WP2, WP4 resumed from their saved transcripts. `videos/` (team's
+  3.6 GB footage zips) added to `.gitignore`.
+- 2026-10-30 — WP4 ✅, INT-A ✅ (impact live in the UI after restart). Dispatched WP9 (map), WP5 (evaluation), INT-B (ReID default).
+- 2026-10-30 — WP2 ✅ (V10/V11 + pre-screen). Set V10/V11 advisory in `citation.DEFAULT_ADVISORY`. Dispatched WP11 (two-tier VLM).
+- 2026-10-30 — WP9 ✅ (map). Mounted `api_map` router in server.py, Map link in index.html.
+- 2026-10-30 — Dispatched WP10 (3D city + optimiser UI).
+- 2026-10-30 — Machine rebooted (servers down). WP10 ✅ (3D city). Mounted `api_optimize` router, 3D city nav link.
+- 2026-10-30 — Dispatched WP3 (query panel, retrieve-then-reason).
+- 2026-10-30 — WP5 ✅ (evaluation harness, `REPORT_RESULTS.md`). V10/V11 cost test now measures thread CPU time (was flaky under load). Dispatched WP13 (storage, ingest, capacity).
+- 2026-10-30 — WP3 ✅ (query panel). Mounted `api_query` router, "Ask" nav link.
+- 2026-10-30 — INT-B ✅ (ReID default `auto`). Dashboard restarted with `tools/run_dashboard.sh`; smoke test as admin/police: all new pages 200, admin-only endpoints 403 for police. Dispatched INT-C.
+- 2026-10-30 — INT-C ✅. Fixed a timing race in `test_mobilenet_now_reid_later` (gate the fake ReID job).
+- 2026-10-30 — WP13 ✅ (storage, ingest queue, capacity). Wired into server.py + nav. Full suite: **1031 tests OK** (214 s, loaded machine).
+- 2026-10-30 — WP11 ✅. Live switch-over done: 2B on :8081, dashboard restarted with all packages. Smoke test: admin/police/driver access correct (driver 403 on every staff API, 302 on staff pages). Single-model label set to qwen3-vl-2b. E2E browser check dispatched (read-only, live server).
+- 2026-10-30 — Team decisions: portal shows only issued citations; drivers may dispute (8B or human checks) → WP14 dispatched; fines + legal retention kept as is; detector training-data provenance unknown (see DEC-2).
+- 2026-10-30 — WP14 ✅ (cited-only portal + disputes). Restart pending the E2E browser check.
+- 2026-10-30 — E2E browser check (headless Chrome, live :8000, all roles, 1440 px + 390 px): every page loads, no uncaught exceptions; driver isolation correct. Found B1 /city 404 polling noise, B2 phone overflow (storage, admin tables, stats), B3 admin-only camera controls visible to police + start/stop/auto-zone routes without role check, B4 no Explain stage progress (escalated case 278.6 s; 8B contradicted demo case 1), B5 unexplained disabled buttons, B6 raw 403 on /notice for drivers, B7 no favicon. FIX-1 dispatched.
+- 2026-10-30 — FIX-1 ✅ (B1–B7): police lose all camera/zone/settings controls (server `require(ADMIN)` + UI `isAdmin()`), start/stop = controller; /city returns an empty state instead of 404 and camera columns now render (data-driven opacity was invalid); no overflow at 390 px; Explain shows 5 stages with measured ETAs over SSE; /notice redirects drivers; favicon. Made the simulation-timeout test deterministic. Full suite **1096 OK**. Dashboard restarted; all-role smoke test passed. Open judgement: `POST /api/link` stays staff-level.
+- 2026-10-30 — Compared with Shihab's repo (cloned read-only to `../Shihab-AI-Traffic-System`, not run): see `docs/COMPARISON_SHIHAB.md`. Same vision base; theirs is stronger on enforcement (payments, email, registry, plate for every vehicle, scalable cross-camera IDs, measured V3/V6 fixes, VLM prompt fixes), ours covers impact, optimisation, query, storage, two-tier VLM, trained ReID, V9–V11, disputes, tests. Ports P1–P6 proposed, none started.

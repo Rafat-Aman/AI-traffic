@@ -6,7 +6,7 @@ ground_truth.csv  (fill it in while watching the video, BEFORE looking at the sy
     time_s,code,class,note
     74.5,V2,Motorbike,red helmet rider weaving left lane
     102.0,V1,Bus,picks up passengers mid-road
-  time_s = seconds into the video when the violation is clearest; code = V1..V8; class optional.
+  time_s = seconds into the video when the violation is clearest; code = V1..V11; class optional.
 
 violations.csv = the dashboard's Export CSV (column video_time_s) or the command-line runner's violations.csv.
 

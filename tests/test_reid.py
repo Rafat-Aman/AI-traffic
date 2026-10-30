@@ -339,7 +339,7 @@ class SignatureTests(unittest.TestCase):
         a, b, c = Embedder.encode(red), Embedder.encode(red), Embedder.encode(blue)
         if a is None:
             self.skipTest("embedding weights not available offline")
-        self.assertEqual(a.shape, (576,))
+        self.assertEqual(a.shape, (Embedder.dim,))
         self.assertAlmostEqual(float(np.linalg.norm(a)), 1.0, places=3)
         self.assertGreater(similarity(a, b), similarity(a, c))
 

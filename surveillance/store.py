@@ -7,6 +7,9 @@ from datetime import datetime
 from pathlib import Path
 
 from .citation import ADVISORY_CODES
+from .disputes import ensure_schema as ensure_disputes_schema
+from .embed import MOBILENET_TAG
+from .impact import ensure_schema as ensure_impact_schema
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cameras (
@@ -152,7 +155,10 @@ CREATE TABLE IF NOT EXISTS tracklets (
     extrap_m REAL DEFAULT 0,
     hist BLOB,                      -- HSV colour histogram  (float32)
     lab BLOB,                       -- CIELAB mean/spread    (float32)
-    embed BLOB,                     -- appearance vector     (float32, surveillance.embed)
+    embed BLOB,                     -- MobileNet appearance vector (float32, surveillance.embed)
+    embed_model TEXT,               -- Embedder.tag that made `embed` (NULL on rows older than this column: MobileNet)
+    embed_reid BLOB,                -- ReID vector (float32), written later by the background worker
+    embed_reid_model TEXT,          -- Embedder.tag that made `embed_reid`
     global_id INTEGER,              -- the vehicle this is an observation of, across all cameras
     link_source TEXT DEFAULT '',    -- how it got that id: online / batch
     created_at TEXT NOT NULL
@@ -204,6 +210,7 @@ DEFAULT_SETTINGS = {
     "auto_roi": True,
     "anpr": True,                 # read number plates of violating vehicles (needs the plate models)
     "reid": True,                 # summarise each vehicle's pass so it can be linked across cameras
+    "impact": True,               # measure queue / speed / occupancy per road zone and score each violation's effect
     "helmet": True,               # V6 no-helmet detection (needs the helmet model)
     "clip_pre_sec": 5,
     "clip_post_sec": 5,
@@ -236,7 +243,16 @@ class Store:
             have_t = {r[1] for r in self.db.execute("PRAGMA table_info(tracklets)")}
             if have_t and "embed" not in have_t:
                 self.db.execute("ALTER TABLE tracklets ADD COLUMN embed BLOB")
+            for col, decl in (("embed_model", "TEXT"), ("embed_reid", "BLOB"), ("embed_reid_model", "TEXT")):
+                if have_t and col not in have_t:
+                    self.db.execute(f"ALTER TABLE tracklets ADD COLUMN {col} {decl}")
+            if have_t and "embed_model" not in have_t:
+                # every vector stored before the column existed was made by MobileNet (576 float32 numbers)
+                self.db.execute("UPDATE tracklets SET embed_model=? WHERE embed IS NOT NULL",
+                                (MOBILENET_TAG,))
             self.db.commit()
+        ensure_disputes_schema(self)  # drivers' disputes of citations
+        ensure_impact_schema(self)    # time-of-day baseline, event impacts, fitted weights: no-op once they exist
 
     def q(self, sql, args=()):
         with self.lock:
@@ -322,7 +338,9 @@ class Store:
         self.x("DELETE FROM vehicles WHERE id=?", (vid,))
 
     def violations_for_plates(self, plate_keys, limit=200, offset=0, exclude_codes=None):
-        """Confirmed cases against any of these plates. Drivers only ever see this, never the whole table.
+        """Cases against any of these plates FOR WHICH A CITATION HAS BEEN ISSUED (standing or withdrawn; a
+        withdrawn one stays so the driver sees the outcome). Drivers only ever see this, never the whole table:
+        a case that no citation was issued for is not theirs to see (team decision 2026-10-30).
 
         Matched on the normalised plate, the same way the search box does, because the stored text carries
         spaces and dashes that nobody types consistently.
@@ -335,7 +353,7 @@ class Store:
         skip = sorted(ADVISORY_CODES if exclude_codes is None else exclude_codes)
         norm = "REPLACE(REPLACE(UPPER(v.plate_text_en), ' ', ''), '-', '')"
         marks = ",".join("?" * len(plate_keys))
-        where = (f" WHERE v.status='confirmed' AND {norm} IN ({marks})")
+        where = (f" WHERE ct.citation_no IS NOT NULL AND {norm} IN ({marks})")
         args = list(plate_keys)
         if skip:
             where += f" AND v.code NOT IN ({','.join('?' * len(skip))})"
@@ -347,7 +365,7 @@ class Store:
             r["details"] = json.loads(r["details"] or "{}")
             r["evidence"] = json.loads(r.get("evidence") or "[]")
             r["vlm"] = json.loads(r["vlm"]) if r.get("vlm") else None
-        total = self.q(f"SELECT COUNT(*) AS n FROM violations v{where}", tuple(args))[0]["n"]
+        total = self.q(f"SELECT COUNT(*) AS n FROM violations v{CITATION_JOIN}{where}", tuple(args))[0]["n"]
         return rows, total
 
     # ------------------------------------------------------------ sessions
@@ -487,14 +505,23 @@ class Store:
         """Store one vehicle's pass through one camera. `t` is a surveillance.reid.Tracklet."""
         return self.x(
             "INSERT INTO tracklets (camera_id, run_id, track_id, cls, class_conf, zone, t_cross, video_t,"
-            " lateral, speed, width, direction, extrap_m, hist, lab, embed, global_id, link_source, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " lateral, speed, width, direction, extrap_m, hist, lab, embed, embed_model,"
+            " embed_reid, embed_reid_model, global_id, link_source, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (camera_id, run_id, t.track_id, t.cls, getattr(t, "class_conf", None), t.zone, t.t_cross,
              getattr(t, "video_t", None), t.lateral, t.speed, t.width, t.direction, t.extrap_m,
              None if t.hist is None else t.hist.astype("float32").tobytes(),
              None if t.lab is None else t.lab.astype("float32").tobytes(),
              None if getattr(t, "embed", None) is None else t.embed.astype("float32").tobytes(),
+             getattr(t, "embed_model", None) if getattr(t, "embed", None) is not None else None,
+             None if getattr(t, "embed_reid", None) is None else t.embed_reid.astype("float32").tobytes(),
+             getattr(t, "embed_reid_model", None) if getattr(t, "embed_reid", None) is not None else None,
              t.global_id, getattr(t, "link_source", ""), now()))
+
+    def set_tracklet_reid(self, tracklet_id, vec, model):
+        """Attach the ReID vector (made after the row was written) to a stored tracklet."""
+        self.x("UPDATE tracklets SET embed_reid=?, embed_reid_model=? WHERE id=?",
+               (vec.astype("float32").tobytes(), model, tracklet_id))
 
     def tracklets(self, camera_id=None, run_id=None, global_id=None, since=None, until=None, limit=100000):
         where, args = [], []

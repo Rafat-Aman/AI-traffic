@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>My violations · Dhaka Traffic Surveillance</title>
+<title>My citations · Dhaka Traffic Surveillance</title>
 <link rel="stylesheet" href="/static/app.css">
 <style>
   .p-wrap { max-width: 900px; margin: 0 auto; padding: 18px 16px 60px; }
@@ -21,11 +21,20 @@
   .ev { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; margin: 12px 0; }
   .ev img, .ev video { width: 100%; border-radius: 8px; background: #000; }
   .ev figcaption { font-size: 11.5px; color: var(--text-muted); margin-top: 4px; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11.5px; font-weight: 600;
+           background: var(--surface-3); margin-left: 6px; }
+  .badge.void { background: #f3d6d6; color: #8a1f1f; }
+  .badge.review { background: #fff0c9; color: #7a5600; }
+  .badge.ok { background: #d9efd9; color: #1d5c25; }
+  .dispute textarea { width: 100%; min-height: 110px; box-sizing: border-box; font: inherit; padding: 8px;
+                      border-radius: 8px; border: 1px solid var(--border); background: var(--surface); color: inherit; }
+  .dispute .quote { white-space: pre-wrap; border-left: 3px solid var(--border); padding: 4px 10px; margin: 6px 0; }
   @media (max-width: 560px) { .case { grid-template-columns: 1fr; } .case img { width: 100%; height: 170px; } }
-</style></head>
+</style>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg"></head>
 <body><div class="p-wrap">
   <div class="p-head">
-    <h1>My violations</h1><span class="spacer" style="flex:1"></span>
+    <h1>My citations</h1><span class="spacer" style="flex:1"></span>
     <span class="small muted" id="who"></span>
     <button class="btn small" id="out">Sign out</button>
   </div>
@@ -69,11 +78,11 @@
           authority has verified that it is yours.</div>
       </div>
       <div class="card">
-        <div class="card-head"><h2>Violations</h2><span class="spacer" style="flex:1"></span>
-          <span class="small muted">${r.total} case${r.total === 1 ? "" : "s"}</span></div>
+        <div class="card-head"><h2>Citations</h2><span class="spacer" style="flex:1"></span>
+          <span class="small muted">${r.total} citation${r.total === 1 ? "" : "s"}</span></div>
         <div class="p-note">${esc(r.note)}</div>
         <div id="cases">${r.items.length ? r.items.map(card).join("")
-          : '<div class="empty">No violations recorded against your registered vehicles.</div>'}</div>
+          : '<div class="empty">No citations have been issued against your registered vehicles.</div>'}</div>
       </div>`;
 
     $("#add").onclick = async () => {
@@ -85,19 +94,51 @@
     document.querySelectorAll(".case").forEach((el) => el.onclick = () => detail(+el.dataset.id));
   }
 
-  const citedLine = (v) => !v.citation ? "" : `<br><b>Citation ${esc(v.citation.number)}</b>${
-    v.citation.status === "withdrawn" ? " (withdrawn)" : ""}`;
+  // One line for a list row: the citation, and where a dispute stands. Withdrawn citations stay listed as void.
+  const badge = (c) => c.status === "withdrawn" ? '<span class="badge void">withdrawn</span>'
+    : c.dispute && c.dispute.status === "open" ? '<span class="badge review">dispute under review</span>'
+    : c.dispute && c.dispute.status === "upheld" ? '<span class="badge ok">dispute decided</span>' : "";
+  const citedLine = (v) => !v.citation ? "" : `<br><b>Citation ${esc(v.citation.number)}</b>${badge(v.citation)}`;
 
   // The citation as the driver reads it. "Set by the authority" is the honest fine text until the authority's
   // schedule is loaded: the system does not guess an amount.
-  const citationBox = (v) => !v.citation
-    ? '<div class="small muted" style="margin-top:12px">No citation has been issued for this case yet.</div>'
-    : `<div class="card" style="background:var(--surface-2)">
-        <div class="small"><b>Citation ${esc(v.citation.number)}</b>${v.citation.status === "withdrawn" ? " — withdrawn" : ""}</div>
-        <div class="small secondary" style="margin-top:5px">Issued ${esc((v.citation.issued_at || "").replace("T", " "))}.
-          Fine: ${esc(v.citation.fine_text)}.${v.citation.status === "withdrawn"
-            ? " The authority has withdrawn this citation; it no longer applies." : ""}</div>
-        <div class="small muted" style="margin-top:7px">Quote this number when you contact the traffic authority.</div></div>`;
+  const citationBox = (v) => {
+    const c = v.citation;
+    if (!c) return "";
+    return `<div class="card" style="background:var(--surface-2)">
+        <div class="small"><b>Citation ${esc(c.number)}</b>${badge(c)}</div>
+        <div class="small secondary" style="margin-top:5px">Issued ${esc((c.issued_at || "").replace("T", " "))}.
+          Fine: ${esc(c.fine_text)}.${c.status === "withdrawn"
+            ? " The authority has withdrawn this citation; it is void and no longer applies." : ""}</div>
+        <div class="small muted" style="margin-top:7px">Quote this number when you contact the traffic authority.</div></div>
+      ${disputeBox(c)}`;
+  };
+
+  // Dispute: status and the final reason are all a driver is shown of the review. What the authority's tools
+  // made of the pictures is working material for the reviewer and is not displayed here.
+  const disputeBox = (c) => {
+    const d = c.dispute;
+    if (d) {
+      const done = d.status !== "open";
+      return `<div class="card dispute"><div class="small"><b>Your dispute</b><span class="badge ${
+        d.status === "accepted" ? "ok" : d.status === "open" ? "review" : ""}">${esc(d.label)}</span></div>
+        <div class="small muted" style="margin-top:4px">Filed ${esc((d.filed_at || "").replace("T", " "))}</div>
+        <div class="small quote">${esc(d.statement)}</div>
+        ${done && d.reason ? `<div class="small" style="margin-top:8px"><b>Decision${d.decided_at ? " (" + esc(d.decided_at.replace("T", " ")) + ")" : ""}</b></div>
+          <div class="small secondary quote">${esc(d.reason)}</div>` : ""}
+        ${!done ? '<div class="small muted" style="margin-top:6px">A member of staff will review the evidence and your statement. You will see the decision here.</div>' : ""}
+        ${d.status === "upheld" ? '<div class="small muted" style="margin-top:6px">The citation stands. There is no further dispute in this system; contact the traffic authority if you wish to take it further.</div>' : ""}
+      </div>`;
+    }
+    if (!c.can_dispute) return c.cannot_reason ? `<div class="small muted" style="margin:10px 0">${esc(c.cannot_reason)}</div>` : "";
+    return `<div class="card dispute"><div class="small"><b>Dispute this citation</b></div>
+      <div class="small muted" style="margin:4px 0 8px">You can dispute it until <b>${esc(c.until)}</b> (${c.window_days} days from the day it was issued),
+        once. Write what you believe is wrong, in plain text, 20 to 2000 characters. Look at the pictures and the video above first and say what
+        they do or do not show. A member of staff decides; you cannot attach files in this version.</div>
+      <textarea id="stmt" maxlength="2000" placeholder="Why do you believe this citation is wrong?"></textarea>
+      <div class="row" style="margin-top:6px"><span class="small muted" id="cnt">0 / 2000</span><span class="spacer" style="flex:1"></span>
+        <button class="btn" id="send">Submit dispute</button></div><div class="small errors" id="derr"></div></div>`;
+  };
 
   const card = (v) => `<div class="case" data-id="${v.id}">
       <img src="${esc(v.crop || v.snapshot || "")}" alt="" loading="lazy">
@@ -133,10 +174,24 @@
         <div class="small secondary" style="margin-top:5px">${esc(x.summary)}</div>
         <div class="small muted" style="margin-top:7px">Written automatically from the images above. The
           images and the video are the evidence; this description is a summary of them.</div></div>` : ""}
-      <div class="small muted" style="margin-top:14px">If you believe this is wrong — the plate was misread,
-        or the vehicle is not yours — contact the traffic authority quoting case TV-${v.id}.</div>
+      <div class="small muted" style="margin-top:14px">If you believe this is wrong, use the dispute form above. If the vehicle is not yours, contact the traffic authority quoting case TV-${v.id}.</div>
     </div>`;
     $("#back").onclick = load;
+    const send = $("#send");
+    if (send) {
+      const box = $("#stmt");
+      box.oninput = () => { $("#cnt").textContent = `${box.value.trim().length} / 2000`; };
+      send.onclick = async () => {
+        const statement = box.value.trim();
+        if (statement.length < 20) { $("#derr").textContent = "Please write at least 20 characters."; return; }
+        if (!confirm("Submit this dispute? You can dispute a citation only once.")) return;
+        send.disabled = true;
+        try { await api(`/api/portal/citations/${encodeURIComponent(v.citation.number)}/dispute`,
+                        { method: "POST", body: JSON.stringify({ statement }) });
+              detail(id); }
+        catch (e) { $("#derr").textContent = e.message; send.disabled = false; }
+      };
+    }
   }
 
   load().catch((e) => { $("#body").innerHTML = `<div class="card errors">${esc(e.message)}</div>`; });

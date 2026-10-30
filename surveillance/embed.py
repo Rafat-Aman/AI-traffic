@@ -26,13 +26,15 @@ Measured on this project's footage
         mobilenet             2.52      71.0%         1.76       75.8%
         reid                  4.38      96.8%         3.35       98.4%
 
-    The ReID model is ahead in every class (same-class separation / rank-1, reid against mobilenet): Car
+    The ReID model is ahead or level in every class (same-class separation / rank-1, reid against mobilenet): Car
     3.63 / 100% against 1.41 / 64%, Motorbike 4.60 / 94% against 3.33 / 94%, MPV 2.84 / 100% against 0.95 /
     50%, CNG 2.30 / 100% against 1.98 / 88%. Eight CNGs or MPVs are few: for CNGs read "no worse", not
     "better". No rickshaw was tracked cleanly enough to be tested. Shrunk to the 128 px the tracklet
-    collector keeps, ReID scores 4.42 / 95.2% and 3.39 / 96.8% - the same within one vehicle - and at 256
-    or 224 px instead of 320 it is also unchanged (3.35 and 3.27 same-class, rank-1 96.8%); mirror averaging
-    (`REID_FLIP`) changed nothing either (3.32 same-class).
+    collector keeps, ReID scores 4.42 / 95.2% and 3.39 / 96.8% - the same within one vehicle. At 256 or
+    224 px instead of 320 (`REID_SIZE`, on those 128 px crops) the same-class figures are 3.35 and 3.27
+    against 3.39 with rank-1 at 96.8% throughout, but CNG rank-1 falls from 8 of 8 to 6 of 8 at both, so
+    the trained 320 stays. Mirror averaging (`REID_FLIP`) moved same-class separation by 0.03 for twice
+    the time, so it is off. `tools/reid_eval.py` has a flag for each of these.
 
     What this cannot show: both halves of a vehicle come from one camera. How the model copes with another
     camera's viewpoint, light and background - what it was trained for, and where the team measured mAP 0.427
@@ -48,13 +50,15 @@ Choosing the model
     model `encode` is using; read them after the first `encode`, because that is when a failed load falls
     back.
 
-    The default (`DEFAULT_POLICY`) is still "mobilenet", although the ReID model is the better cue. That is
-    about cost and about what gets stored, not accuracy. `reid.TrackletCollector` calls `encode` on the
-    pipeline thread when a vehicle leaves the view, and the ReID model takes about a second for six crops
-    (below) against 8 ms: on the 50 s test clip, 62 vehicles would add about a minute to the two the
-    detector needs, in short stalls. It also writes 2048-number vectors and needs the store to say which
-    model made each one. Whoever owns those should arrange both, then set `DEFAULT_POLICY = "auto"`;
-    until then `EMBED_MODEL=auto` turns it on for a deployment without touching code.
+    The default (`DEFAULT_POLICY`) is "auto". Cost used to be the objection - the ReID model takes about a
+    second per vehicle against 8 ms - so `reid.TrackletCollector` now makes the MobileNet vector on the
+    pipeline thread as before and hands the crops to one background thread (`reid.ReIDWorker`, bounded queue,
+    drops and counts when full) for the ReID vector, which is stored later (`tracklets.embed_reid`,
+    `embed_reid_model`) and used by the matcher when both tracklets have one. Measured through the real
+    Pipeline + TrackletCollector on 45 s of `side1_1.mp4` (10 fps analysis, 51 vehicles, a machine shared with
+    other jobs at load ~15): all 51 vehicles embedded, none dropped, 2.2 s each at 320 px (1.4 s at 256);
+    the frame loop ran at 2.07 fps with ReID against 1.47 without, the difference being the other jobs'
+    load, not a speed-up: the ReID work did not visibly slow it. `EMBED_MODEL=mobilenet` turns ReID off.
 
 Vectors from different models must never be compared
     A MobileNet vector and a ReID vector are unrelated number systems, and tracklets already in the store
@@ -67,7 +71,7 @@ Vectors from different models must never be compared
 Cost
     Once per vehicle, when it has left the view, on its clearest crops (`reid.CLEAR_FRAMES`, six).
     MobileNet: 12 ms for ten crops. ReID, all six cores busy: 1.0 s for six crops and 1.9 s for ten at its
-    trained 320 px, about 150 times as much; mirror averaging doubles that; 256 px takes 0.7 s for six. A
+    trained 320 px, over a hundred times as much; mirror averaging doubles that; 256 px takes 0.7 s for six. A
     forward pass is 25 GFLOPs per crop, and this CPU delivers about 135 GFLOPS. Concurrent calls are
     serialised, because two at once would only fight over the cores.
 """
@@ -82,7 +86,7 @@ import numpy as np
 MODELS = ("reid", "mobilenet")
 POLICIES = ("auto",) + MODELS
 MOBILENET_TAG = "mobilenet:v3-small-imagenet1k"     # what every vector stored before the ReID model existed is
-DEFAULT_POLICY = "mobilenet"        # what "nothing chosen" means; the reason is in the measurements above
+DEFAULT_POLICY = "auto"             # ReID when its weights load, else MobileNet; ReID runs off the video loop
 EMBED_DIM = 576                     # MobileNet's width, kept for callers that imported it; use Embedder.dim
 CROP_SIZE = 128                     # MobileNet's input; the crops kept for colour are already about this size
 MEAN = np.array([0.485, 0.456, 0.406], np.float32)
@@ -92,7 +96,7 @@ WEIGHTS_DIR = Path(__file__).resolve().parents[1] / "models" / "reid"
 WEIGHTS_FILE = "reid_resnet50_ibn_a_320_syn_exclS02.pth"
 REID_FLIP = False                   # the notebook adds each crop's mirror image; doubles the CPU time and
                                     # bought nothing measurable on Dhaka footage (see the table above)
-REID_SIZE = None                    # None: the 320 px the network was trained at; 256 is ~40% faster
+REID_SIZE = None                    # None: the 320 px the network was trained at (kept: 256 lost CNG rank-1, 8 of 8 to 6 of 8)
 
 
 def weights_path():
@@ -178,6 +182,7 @@ class Embedder(metaclass=_Meta):
     _failed = set()         # model names that could not be loaded; never retried
     _choice = None          # chosen with use(); None means the environment, then DEFAULT_POLICY
     _active = None
+    _loading = {}           # model name -> lock held while that model loads
 
     @classmethod
     def use(cls, model=None):
@@ -193,35 +198,79 @@ class Embedder(metaclass=_Meta):
         """Forget what was loaded and what failed (tests, or after the weights were replaced)."""
         with cls._lock:
             cls._backends, cls._failed, cls._choice, cls._active = {}, set(), None, None
+            cls._loading = {}
+
+    @classmethod
+    def _policy(cls):
+        policy = cls._choice or os.environ.get("EMBED_MODEL", "").strip().lower() or DEFAULT_POLICY
+        return policy if policy in POLICIES else DEFAULT_POLICY
 
     @classmethod
     def _order(cls):
         """Models to try, best first, for the current choice."""
-        policy = cls._choice or os.environ.get("EMBED_MODEL", "").strip().lower() or DEFAULT_POLICY
-        if policy not in POLICIES:
-            policy = DEFAULT_POLICY
+        policy = cls._policy()
         if policy == "mobilenet" or (policy == "auto" and weights_path() is None):
             return ["mobilenet"]
         return ["reid", "mobilenet"]
 
     @classmethod
+    def reid_wanted(cls):
+        """True when the policy asks for the ReID model, its weights exist and it has not failed to load.
+        Cheap: loads nothing. Whether the weights really fit is only known once `encode_with("reid", ...)`
+        has tried them."""
+        return (cls._policy() != "mobilenet" and weights_path() is not None
+                and "reid" not in cls._failed)
+
+    @classmethod
+    def _named(cls, name):
+        """The loaded backend called `name`, loading it on first use; None when it cannot be loaded."""
+        with cls._lock:
+            if name in cls._failed:
+                return None
+            if name in cls._backends:
+                return cls._backends[name]
+            slot = cls._loading.setdefault(name, threading.Lock())
+        with slot:          # one lock per model, so loading ReID (seconds) never holds up MobileNet (ms)
+            with cls._lock:
+                if name in cls._backends:
+                    return cls._backends[name]
+                if name in cls._failed:
+                    return None
+            try:
+                backend = _BUILD[name]()
+            except Exception as e:
+                print(f"appearance model {name!r} unavailable ({e})")
+                with cls._lock:
+                    cls._failed.add(name)
+                return None
+            with cls._lock:
+                cls._backends[name] = backend
+            return backend
+
+    @classmethod
+    def encode_with(cls, name, crops):
+        """`(vector, tag)` from one named model whatever the policy says, `(None, None)` when it is
+        unavailable. The tracklet collector uses this: MobileNet for every vehicle at once, ReID later."""
+        backend = cls._named(name)
+        if backend is None:
+            return None, None
+        v = cls._run(backend, crops)
+        return (v, backend.tag) if v is not None else (None, None)
+
+    @classmethod
     def _backend(cls):
         if cls._active is not None:
             return cls._active
-        with cls._lock:
-            for name in cls._order():
-                if name in cls._failed:
-                    continue
-                if name not in cls._backends:
-                    try:
-                        cls._backends[name] = _BUILD[name]()
-                    except Exception as e:      # no weights / no network / torch missing / wrong checkpoint
-                        later = "colour only" if name == "mobilenet" else "the next model"
-                        print(f"appearance model {name!r} unavailable ({e}); matching will use {later}")
-                        cls._failed.add(name)
-                        continue
-                cls._active = cls._backends[name]
-                return cls._active
+        for name in cls._order():
+            if name in cls._failed:
+                continue
+            backend = cls._named(name)
+            if backend is None:
+                later = "colour only" if name == "mobilenet" else "the next model"
+                print(f"matching will use {later}")
+                continue
+            cls._active = backend
+            return backend
         return None
 
     @classmethod
@@ -229,11 +278,9 @@ class Embedder(metaclass=_Meta):
         """False only once every model that could be used has failed to load."""
         return not set(cls._order()) <= cls._failed
 
-    @classmethod
-    def encode(cls, crops):
-        """One L2-normalised vector for a vehicle, averaged over its crops. None when unavailable."""
-        backend = cls._backend()
-        if backend is None or not crops:
+    @staticmethod
+    def _run(backend, crops):
+        if not crops:
             return None
         try:
             good = [c for c in crops if c is not None and c.size and min(c.shape[:2]) >= 8]
@@ -244,6 +291,12 @@ class Embedder(metaclass=_Meta):
         except Exception as e:
             print(f"embedding failed: {e}")
             return None
+
+    @classmethod
+    def encode(cls, crops):
+        """One L2-normalised vector for a vehicle, averaged over its crops. None when unavailable."""
+        backend = cls._backend()
+        return None if backend is None else cls._run(backend, crops)
 
 
 def similarity(a, b, *, model_a=None, model_b=None):

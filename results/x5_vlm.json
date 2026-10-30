@@ -1,0 +1,84 @@
+{
+ "item": "x5_vlm",
+ "title": "X5 VLM explanation quality",
+ "provenance": {
+  "command": "tools/evaluate.py x5",
+  "inputs": [
+   {
+    "path": "/home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/tools/vlm_probe.py",
+    "bytes": 4565,
+    "sha256_first_1MiB": "164fb9c29e2716bb"
+   },
+   {
+    "path": "/home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/models/README.md",
+    "bytes": 14247,
+    "sha256_first_1MiB": "df31907829bb02ae"
+   }
+  ],
+  "git_commit": "80563e64840e02a82e8033035788c4fb0b1d9904 (+uncommitted changes)",
+  "timestamp_utc": "2026-10-29T19:05:25+00:00",
+  "python": "3.10.12",
+  "machine": "x86_64"
+ },
+ "tables": [
+  {
+   "title": "Insufficient-evidence probe set as it exists (tools/vlm_probe.py)",
+   "columns": [
+    "Probe",
+    "Photograph",
+    "Must answer",
+    "Status"
+   ],
+   "rows": [
+    [
+     "unrelated-evidence",
+     "zidane.jpg (Ultralytics sample)",
+     "insufficient / contradicted",
+     "defined"
+    ],
+    [
+     "wrong-class",
+     "bus.jpg (Ultralytics sample)",
+     "insufficient / contradicted",
+     "defined"
+    ],
+    [
+     "plausible-case",
+     "bus.jpg",
+     "any verdict; prose must read sensibly",
+     "defined"
+    ]
+   ],
+   "source": "parsed from tools/vlm_probe.py (3 probes found); NOT re-run: the harness never calls the live VLM server"
+  },
+  {
+   "title": "Last recorded result (copied, not re-run)",
+   "columns": [
+    "Run",
+    "Result",
+    "Status"
+   ],
+   "rows": [
+    [
+     "First attempt, Qwen2.5-VL-3B Q4_K_M",
+     "1/3 passed: confirmed both impossible findings at 90% confidence",
+     "measured (3 synthetic probes, not Dhaka cases)"
+    ],
+    [
+     "After prompt change + verdict guard (to_explanation)",
+     "3/3 passed",
+     "measured (3 synthetic probes, not Dhaka cases)"
+    ]
+   ],
+   "source": "models/README.md section 'Measured: the insufficient-evidence probe' and README.md (VLM section, 'It now passes 3/3'); 3 probes cannot estimate a refusal rate and the three prompt/guard changes were not ablated"
+  }
+ ],
+ "needs": [
+  {
+   "what": "Refusal rate on insufficient evidence; explanation accuracy",
+   "status": "not measured - needs a probe set of >=40 cases: ~20 insufficient-evidence (crop of the wrong vehicle class, blank/blurred crop, wrong time, other-lane vehicle) and ~20 supported, taken from real Dhaka cases, each with a hand label in {supported, contradicted, insufficient}; score = confusion matrix + 'false support' rate (docs/EVALUATION.md section 5). Free-text quality needs 2 human raters (1-5 faithfulness) on ~30 explanations; no model-based scoring exists"
+  }
+ ],
+ "notes": [],
+ "raw": {}
+}

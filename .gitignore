@@ -46,6 +46,7 @@ speeds.csv
 
 # Vision-language reasoner: multi-GB weights and the llama.cpp binaries (./tools/setup_vlm.sh fetches them)
 models/vlm/*.gguf
+models/vlm/*.sha256ok
 vendor/
 
 # Vehicle re-identification weights (~94 MB, trained in research/cityflow/): copy the notebook's reid_*.pth here
@@ -60,3 +61,12 @@ data/.media_secret
 
 # Team's raw footage drops (multi-GB zips) — upload through the dashboard, never commit
 videos/
+
+
+API
+
+# ONNX exports of the vehicle detector (tools re-create them from the .pt)
+models/bd_vehicles_*.onnx
+
+# Per-instance VLM settings written by the admin page
+data/vlm_settings.json

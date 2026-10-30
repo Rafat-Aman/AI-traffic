@@ -1,0 +1,66 @@
+{
+ "item": "x4_impact",
+ "title": "X4 Impact score vs severity (Spearman rho)",
+ "provenance": {
+  "command": "tools/evaluate.py x4",
+  "inputs": [
+   {
+    "path": "/home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/tests/test_impact.py",
+    "bytes": 65719,
+    "sha256_first_1MiB": "4cb3e0c136e69378"
+   }
+  ],
+  "git_commit": "80563e64840e02a82e8033035788c4fb0b1d9904 (+uncommitted changes)",
+  "timestamp_utc": "2026-10-29T19:09:32+00:00",
+  "python": "3.10.12",
+  "machine": "x86_64"
+ },
+ "tables": [
+  {
+   "title": "Impact score vs SIMULATED excess delay (WP1 synthetic validation; not human severity)",
+   "columns": [
+    "Quantity",
+    "Value",
+    "Status"
+   ],
+   "rows": [
+    [
+     "Events (fit 18 / held-out 9)",
+     "27",
+     "synthetic"
+    ],
+    [
+     "Spearman rho, calibrated score vs simulated delay",
+     "0.90",
+     "synthetic"
+    ],
+    [
+     "Spearman rho, equal-weight score vs simulated delay",
+     "0.95",
+     "synthetic"
+    ],
+    [
+     "Held-out MAE (veh*s) / mean delay (veh*s)",
+     "58 / 172",
+     "synthetic"
+    ]
+   ],
+   "source": "`/home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/.venv/bin/python -m unittest -v tests.test_impact.CalibrationTests.test_weights_fitted_to_simulated_events_predict_their_delay_in_vehicle_seconds` (6.1 s) prints: 27 simulated events, fitted on 18, scored on 9 unseen: weights {'queue_m': 0.0, 'speed_kph': 114.1, 'occupancy': 27.0, 'density': 0.0, 'wait_s': 100.8}, in-sample R2 0.734, held-out MAE 58 veh*s (mean delay 172), rho(calibrated, delay) 0.90, rho(equal weights,. The 'truth' is the simulator's own excess delay, so this checks the score tracks congestion in a model the team wrote, nothing about human judgement of severity"
+  }
+ ],
+ "needs": [
+  {
+   "what": "Spearman rho between the impact score and human severity",
+   "status": "not measured - needs human severity ratings of real cases (evaluation/ground_truth/severity/ratings.csv: case_id,rater1,rater2 on a 1-5 scale, >=30 cases covering several rule codes and impact levels, protocol in docs/EVALUATION.md section 4) and the system's impact scores for those cases (--scores CSV: case_id,impact_score). No human rating exists in the repo"
+  }
+ ],
+ "notes": [],
+ "raw": {
+  "impact_test": {
+   "cmd": "/home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/.venv/bin/python -m unittest -v tests.test_impact.CalibrationTests.test_weights_fitted_to_simulated_events_predict_their_delay_in_vehicle_seconds",
+   "returncode": 0,
+   "seconds": 6.1,
+   "line": "  27 simulated events, fitted on 18, scored on 9 unseen: weights {'queue_m': 0.0, 'speed_kph': 114.1, 'occupancy': 27.0, 'density': 0.0, 'wait_s': 100.8}, in-sample R2 0.734, held-out MAE 58 veh*s (mean delay 172), rho(calibrated, delay) 0.90, rho(equal weights, delay) 0.95"
+  }
+ }
+}

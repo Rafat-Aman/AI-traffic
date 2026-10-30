@@ -5,9 +5,11 @@ from collections import defaultdict
 from .base import Context, Scene
 from .bus_blocking import BusBlocking
 from .bus_lane import BusLaneViolation
+from .erratic import ErraticManoeuvre
 from .helmet import NoHelmet
 from .illegal_parking import IllegalParking
 from .lane_change import LaneLineCrossing
+from .near_collision import NearCollision
 from .restricted_vehicle import RestrictedVehicle
 from .road_blocking import RoadBlocking
 from .speed_violation import SpeedViolation
@@ -24,6 +26,8 @@ RULES = {
     "restricted_vehicle": RestrictedVehicle,
     "helmet": NoHelmet,
     "bus_lane": BusLaneViolation,
+    "erratic": ErraticManoeuvre,           # V10, V11: kinematic candidates that the VLM decides; always active
+    "near_collision": NearCollision,
 }
 CODES = {cls.code: key for key, cls in RULES.items()}
 
@@ -32,7 +36,7 @@ class ViolationEngine:
     def __init__(self, camera, overrides=None, only=None, helmet_detector=None, forget_sec=10.0, flow_kph=10.0,
                  lost_sec=1.0):
         """overrides: {rule key: {setting: value}} applied on top of the camera's "rules" settings.
-        only: rule keys or codes (V1..V9) to run; default all that can run."""
+        only: rule keys or codes (V1..V11) to run; default all that can run."""
         self.camera, self.flow_kph, self.forget_sec, self.lost_sec = camera, flow_kph, forget_sec, lost_sec
         self.lost_done = set()              # tids whose "left the view" decision has been made
         wanted = None if not only else {CODES.get(k.upper(), k) for k in only}

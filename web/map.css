@@ -1,0 +1,52 @@
+/* Camera map page. Colours come from the dashboard tokens in app.css. */
+body.map-page { height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+.map-top { display: flex; align-items: center; gap: 12px; padding: 8px 16px; background: var(--surface-1);
+           border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.map-top h1 { font-size: 16px; }
+.map-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 1fr 360px; }
+#map { min-height: 300px; background: var(--surface-2); z-index: 0; }
+.map-panel { overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 12px; background: var(--bg);
+             border-left: 1px solid var(--border); }
+.map-panel .card { padding: 12px; }
+.map-panel h2 { font-size: 14px; }
+.cam-list { display: flex; flex-direction: column; gap: 2px; }
+.cam-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 8px; cursor: pointer;
+           border: 1px solid transparent; }
+.cam-row:hover { background: var(--surface-2); }
+.cam-row.sel { background: var(--surface-3); border-color: var(--border-strong); }
+.cam-row .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sdot { width: 9px; height: 9px; border-radius: 50%; background: var(--text-muted); flex: none; }
+.sdot.running { background: var(--good); }
+.sdot.starting, .sdot.reconnecting { background: var(--warning); }
+.sdot.error, .sdot.stopped { background: var(--critical); }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 10px; margin: 10px 0; }
+.form-grid label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--text-secondary); }
+.form-grid input { width: 100%; padding: 5px 7px; }
+.form-grid .wide { grid-column: 1 / -1; }
+.warn { color: var(--warning-ink); font-size: 12px; margin: 6px 0 0; }
+.err { color: var(--critical-ink); font-size: 12px; margin: 6px 0 0; }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 13px; margin: 8px 0; }
+.kv dt { color: var(--text-muted); } .kv dd { margin: 0; text-align: right; }
+.legend-row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; margin: 3px 0; }
+.swatch { width: 26px; height: 5px; border-radius: 3px; flex: none; }
+.cam-pin { width: 18px; height: 18px; border-radius: 50%; border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,.6);
+           background: var(--text-muted); }
+.cam-pin.running { background: var(--good); } .cam-pin.error, .cam-pin.stopped { background: var(--critical); }
+.cam-pin.sel { outline: 3px solid var(--accent); }
+.cam-pin.draft { border-style: dashed; }
+.aim-pin { width: 14px; height: 14px; background: var(--accent); border: 2px solid #fff; transform: rotate(45deg);
+           box-shadow: 0 1px 4px rgba(0,0,0,.6); cursor: grab; }
+.pair-label { background: var(--surface-1); color: var(--text-primary); border: 1px solid var(--border-strong);
+              border-radius: 10px; padding: 1px 7px; font: 600 11.5px var(--font); white-space: nowrap; cursor: pointer;
+              box-shadow: 0 1px 4px rgba(0,0,0,.4); transform: translate(-50%, -50%); }
+.pair-label.grey { color: var(--text-muted); font-weight: 500; }
+.leaflet-div-icon-clean { background: transparent !important; border: 0 !important; }
+.hist { width: 100%; height: 90px; display: block; }
+.hist rect { fill: var(--accent); } .hist line { stroke: var(--text-primary); stroke-width: 1.5; }
+.hist text { fill: var(--text-muted); font-size: 9px; }
+.map-toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--surface-3);
+             border: 1px solid var(--border-strong); border-radius: 8px; padding: 8px 14px; z-index: 2000; box-shadow: var(--shadow); }
+@media (max-width: 800px) {
+  .map-body { grid-template-columns: 1fr; grid-template-rows: 55vh 1fr; }
+  .map-panel { border-left: 0; border-top: 1px solid var(--border); }
+}

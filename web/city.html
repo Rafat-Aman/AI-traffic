@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>3D city - Traffic Surveillance</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css"
+        integrity="sha384-MinO0mNliZ3vwppuPOUnGa+iq619pfMhLVUXfC4LHwSCvF9H+6P/KO4Q7qBOYV5V" crossorigin="anonymous">
+  <link rel="stylesheet" href="/static/city.css">
+</head>
+<body class="city-page">
+  <header class="city-top">
+    <a class="btn small ghost" href="/">&larr; Dashboard</a>
+    <h1>3D city &amp; signal optimiser</h1>
+    <span class="chip small hidden" id="synthetic-chip">SYNTHETIC demo layout</span>
+    <span class="spacer"></span>
+    <label class="small secondary">Colour links by
+      <select id="metric">
+        <option value="density">camera density (veh/km/lane)</option>
+        <option value="speed">camera speed (km/h)</option>
+        <option value="ratio">delay vs free flow</option>
+      </select></label>
+    <span class="small secondary" id="who"></span>
+  </header>
+  <div class="city-body">
+    <div class="city-map-wrap">
+      <div id="city-map" role="application" aria-label="3D map of the city with cameras, signals and traffic"></div>
+      <div class="city-banner" id="banner"></div>
+      <div class="city-legend" id="legend"></div>
+      <div class="city-play hidden" id="play"></div>
+    </div>
+    <aside class="city-panel">
+      <nav class="tabs" id="tabs" role="tablist">
+        <button class="tab sel" data-tab="live" role="tab">Live</button>
+        <button class="tab" data-tab="rec" role="tab">Signals</button>
+        <button class="tab" data-tab="sim" role="tab">Simulate</button>
+        <button class="tab" data-tab="route" role="tab">Route</button>
+        <button class="tab hidden" data-tab="edit" id="tab-edit" role="tab">Edit</button>
+      </nav>
+      <section class="card" id="p-live"></section>
+      <section class="card hidden" id="p-rec"></section>
+      <section class="card hidden" id="p-sim"></section>
+      <section class="card hidden" id="p-route"></section>
+      <section class="card hidden" id="p-edit"></section>
+      <section class="card" id="p-info"></section>
+      <section class="card small muted" id="p-honest"></section>
+    </aside>
+  </div>
+  <div id="toast" class="map-toast hidden" role="status"></div>
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"
+          integrity="sha384-SYKAG6cglRMN0RVvhNeBY0r3FYKNOJtznwA0v7B5Vp9tr31xAHsZC0DqkQ/pZDmj" crossorigin="anonymous"></script>
+  <script src="/static/city.js"></script>
+</body>
+</html>

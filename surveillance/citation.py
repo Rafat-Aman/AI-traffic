@@ -72,7 +72,9 @@ from urllib.parse import quote
 
 # ------------------------------------------------------------------ what may be cited
 
-DEFAULT_ADVISORY = ("V2",)
+# V2: the report says speed "never supports a speeding citation". V10/V11 are kinematic candidates that the
+# vision-language model decides (report Table 3.1 #7, #8); their false-positive rate on Dhaka footage is unmeasured.
+DEFAULT_ADVISORY = ("V2", "V10", "V11")
 CITABLE_PLATE = ("read", "partial")       # a citation needs a vehicle to name; "partial" is the six-digit number
 NUMBER_RE = re.compile(r"^[A-Z]{2,8}-\d{4}-\d{6,}$")
 

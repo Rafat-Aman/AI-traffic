@@ -12,13 +12,16 @@ handy for batch-processing recordings on the command line.
     V5     Crossing a solid lane line
     V6     Motorbike rider without helmet (needs --helmet-model)
     V8     Vehicle class banned on this road (rickshaw on a VIP road, CNG on a flyover, ...)
+    V9     Non-bus vehicle driving along a bus lane
+    V10    Unsafe / erratic manoeuvre: abrupt swerve at speed (candidate for the VLM)
+    V11    Near-collision or collision (candidate for the VLM)
 
 Usage
     Zones: draw them in the dashboard's zone editor and use "Export JSON", or click them here with OpenCV:
         python violation_tracker.py --source video.mp4 --calibrate violation_zones.json --at 60 \
             --import-speed-zones speed_zones.json
        Keys: r = road zone, k = no-parking kerb, i = intersection, b = bus stop, g = signal queue area,
-             p = legal parking, t = U-turn opening
+             p = legal parking, t = U-turn opening, a = bus lane
              (click points, Enter to close), l = solid lane line, u = undo, s = save, q = quit.
     Recorded video (every frame analysed):
         python violation_tracker.py --source video.mp4 --zones violation_zones.json --start-time "2026-09-22 17:38:17"
@@ -50,7 +53,7 @@ from violations import (MOTORISED, NON_MOTORISED, AreaZone, CameraConfig, Eviden
 from violations.zones import AREA_COLORS, DIRECTIONS, ROAD_CATEGORIES, draw_label
 
 AREA_KEYS = {ord("b"): "bus_stop", ord("g"): "signal", ord("p"): "parking", ord("t"): "uturn", ord("k"): "no_parking",
-             ord("i"): "intersection"}
+             ord("i"): "intersection", ord("a"): "bus_lane"}
 AREA_MODES = set(AREA_KEYS.values())
 # Typical Dhaka office/school rush; edit per location in the zone file (null = enforce all day).
 DEFAULT_PEAK_HOURS = [["07:00", "10:30"], ["16:00", "20:30"]]

@@ -39,6 +39,9 @@ def to_tracklet(row):
     t.hist = np.frombuffer(row["hist"], np.float32) if row["hist"] else None
     t.lab = np.frombuffer(row["lab"], np.float32) if row["lab"] else None
     t.embed = np.frombuffer(row["embed"], np.float32) if row.get("embed") else None
+    t.embed_model = (row.get("embed_model") or None) if t.embed is not None else None
+    t.embed_reid = np.frombuffer(row["embed_reid"], np.float32) if row.get("embed_reid") else None
+    t.embed_reid_model = (row.get("embed_reid_model") or None) if t.embed_reid is not None else None
     return t
 
 

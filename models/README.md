@@ -6,7 +6,8 @@
 | `helmet_cls.pt` / `.mlpackage` | Is anyone on this motorbike bare-headed? (image classifier) | V6 |
 | `plate_detector.onnx` | Number-plate detection | plate reading |
 | `bd_plate_chars.pt` | Bangla plate character detection (digits, city, "metro", class letter) | plate reading |
-| MobileNetV3-Small (torchvision, cached in `~/.cache/torch`) | The appearance vector used to recognise a vehicle on another camera | cross-camera Re-ID |
+| `reid/reid_resnet50_ibn_a_320_syn_exclS02.pth` (team's CityFlowV2 ReID, ResNet50-IBN-a) | The better appearance vector for recognising a vehicle on another camera; computed in the background, ~1 s per vehicle | cross-camera Re-ID |
+| MobileNetV3-Small (torchvision, cached in `~/.cache/torch`) | The fast appearance vector (8 ms), made for every vehicle at once; the fallback when the ReID weights are absent | cross-camera Re-ID |
 | `vlm/Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf` + `vlm/mmproj-*.gguf` | Explaining a case: what happened, why, and whether the photographs support the finding | **Explain** button |
 
 All numbers below were measured on data **not used for training or threshold tuning**, unless stated otherwise.
@@ -197,10 +198,24 @@ one). `tools/vlm_check.py` measures both on any machine.
 
 ## Appearance vector for cross-camera Re-ID (`surveillance/embed.py`)
 
-**Model:** torchvision's `mobilenet_v3_small`, ImageNet weights (2.5M parameters, ~10 MB, fetched to
+**Two models, both stored.** Every vehicle gets a MobileNet vector the moment it leaves view; when the team's
+ReID weights are present it also gets a ReID vector a moment later, from a single background thread
+(`reid.ReIDWorker`, a bounded queue: a full queue drops the job and counts it, it never holds up the video).
+The matcher uses ReID when both tracklets have one, MobileNet otherwise, and never compares vectors of
+different models; its likelihood-ratio cue is fitted separately for each. The store records which model made
+each vector (`tracklets.embed_model`, `embed_reid_model`). `EMBED_MODEL=reid|mobilenet|auto` chooses; `auto`
+(the default) means "ReID when the weights load".
+
+**MobileNet:** torchvision's `mobilenet_v3_small`, ImageNet weights (2.5M parameters, ~10 MB, fetched to
 `~/.cache/torch` on first use). The 576-dimension penultimate feature is averaged over a vehicle's clearest
-crops and L2-normalised. It runs once per vehicle when it leaves view - about 90 ms for six crops on the
-development CPU - and never on the per-frame path.
+crops and L2-normalised. It costs about 8 ms per vehicle on the development CPU (measured), once, when the
+vehicle leaves view - never on the per-frame path.
+
+**ReID:** ResNet50-IBN-a trained on CityFlowV2 and synthetic VehicleX (`surveillance/reid_backbone.py`), 2048
+numbers, about 1 s per six-crop vehicle at its trained 320 px. On the same footage (same-class rivals only,
+which is what the matcher faces) it ranks the other half of a vehicle first 98.4% of the time against 75.8%
+for MobileNet, separation 3.35 against 1.76. See the docstring of `surveillance/embed.py` for the per-class
+table. Across cameras it is still unmeasured on Dhaka.
 
 **It is not a vehicle re-identification model.** It was trained to name a thousand kinds of object, not to
 tell one car from another car. Nothing here claims otherwise. It is used because the matcher scores every
@@ -219,6 +234,5 @@ against its late crops and against every other vehicle):
 So on real Dhaka traffic it is the strongest single appearance cue, though none of them is decisive alone -
 geometry still does most of the identification, which is the point of matching in metres rather than pixels.
 
-**The upgrade path** is a trained ReID backbone (OSNet, ResNet50-IBN) in place of this one. `Embedder.encode`
-is the only thing that would change. That needs a GPU and a labelled vehicle corpus; the AI City Challenge
-work in the team's `models/` folder already has both and its weights would drop straight in.
+**The upgrade path is done:** the team's trained ReID backbone is wired in beside MobileNet (see above). The
+table below is MobileNet's, kept as the fallback's measured value.

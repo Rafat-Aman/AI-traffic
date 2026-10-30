@@ -48,7 +48,7 @@
     brain: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 4a3 3 0 00-3 3 3 3 0 00-1 5.8V15a3 3 0 003 3 2 2 0 004 0V6a2 2 0 00-3-2z"/><path d="M15 4a3 3 0 013 3 3 3 0 011 5.8V15a3 3 0 01-3 3 2 2 0 01-4 0"/></svg>',
   };
   // Short names for the violation types (the full titles come from the server).
-  const VSHORT = { V1: "Bus stopping", V2: "Speeding", V3: "Kerb parking", V4: "Wrong side", V5: "Solid line", V6: "No helmet", V7: "Lane blocking", V8: "Banned vehicle" };
+  const VSHORT = { V1: "Bus stopping", V2: "Speeding", V3: "Kerb parking", V4: "Wrong side", V5: "Solid line", V6: "No helmet", V7: "Lane blocking", V8: "Banned vehicle", V9: "Bus lane", V10: "Erratic", V11: "Near-collision" };
   const vcode = (c) => `<span class="code" data-v="${esc(c)}">${esc(c)}</span>`;
   // Codes the project report keeps out of enforcement (speed): detected, reviewed and shown here, never cited.
   // The server decides and refuses; this only settles what the page offers.
@@ -89,17 +89,58 @@
     return "";
   }
   function media(p) { return p ? "/media/" + p.split("/").map(encodeURIComponent).join("/") : ""; }
+  // A number from a detail field, or null: summary() must never print "undefined" or "NaN".
+  const fin = (x) => (x !== null && x !== undefined && x !== "" && Number.isFinite(+x) ? +x : null);
+  const n0 = (x) => { const n = fin(x); return n === null ? null : String(Math.round(n)); };
+  const n1 = (x) => { const n = fin(x); return n === null ? null : String(Math.round(n * 10) / 10); };
+  const joined = (...parts) => parts.filter(Boolean).join(" · ");
   function summary(v) {
     const d = v.details || {};
-    if (v.code === "V2") return `${Math.round(d.kph ?? v.kph)} km/h in a ${d.limit_kph} km/h zone`;
-    if (v.code === "V1") return `stood ${Math.round(d.dwell_s)} s · ${d.where || "no bus stop"}`;
-    if (v.code === "V3") return `parked ${Math.round(d.dwell_s)} s at the kerb${d.enforced_because ? " · " + d.enforced_because : ""}`;
-    if (v.code === "V7") return `stood ${Math.round(d.dwell_s)} s in a lane · ${d.vehicles_passed} vehicles went round`;
-    if (v.code === "V4") return `${d.wrong_way_m} m against traffic`;
-    if (v.code === "V5") return `crossed ${d.line}`;
-    if (v.code === "V6") return `${d.bare_head_sightings} bare-head sightings`;
-    if (v.code === "V8") return `banned on ${v.zone}`;
+    switch (v.code) {
+      case "V2": {
+        const k = n0(d.kph ?? v.kph), lim = n0(d.limit_kph);
+        return k && lim ? `${k} km/h in a ${lim} km/h zone` : k ? `${k} km/h, over the limit` : "over the speed limit";
+      }
+      case "V1": { const s = n0(d.dwell_s); return joined(s ? `stood ${s} s` : "stood outside a bus stop", d.where || (s ? "no bus stop" : "")); }
+      case "V3": { const s = n0(d.dwell_s); return joined(s ? `parked ${s} s at the kerb` : "parked at the kerb", d.enforced_because); }
+      case "V7": {
+        const s = n0(d.dwell_s), p = n0(d.vehicles_passed);
+        return joined(s ? `stood ${s} s in a lane` : "stood in a running lane", p ? `${p} vehicles went round` : "");
+      }
+      case "V4": { const m = n1(d.wrong_way_m); return m ? `${m} m against traffic` : "driving against the traffic"; }
+      case "V5": return d.line ? `crossed ${d.line}` : "crossed a solid line";
+      case "V6": { const n = n0(d.bare_head_sightings); return n ? `${n} bare-head sighting${n === "1" ? "" : "s"}` : "rider without a helmet"; }
+      case "V8": return v.zone ? `banned on ${v.zone}` : "banned on this road";
+      case "V9": {
+        const m = n0(d.metres_in_lane), s = n0(d.seconds_in_lane);
+        return m && s ? `drove ${m} m along the bus lane in ${s} s` : s ? `in the bus lane for ${s} s` : "drove in a bus lane";
+      }
+      case "V10": {
+        const lat = n1(d.lateral_m), win = n1(d.window_s), peak = n1(d.peak_lateral_mps), sp = n0(d.speed_kph);
+        const what = lat && win ? `swerved ${lat} m sideways in ${win} s` : lat ? `swerved ${lat} m sideways`
+          : peak ? `sideways at up to ${peak} m/s` : "unsafe or erratic movement";
+        return joined(what, sp ? `at ${sp} km/h` : "");
+      }
+      case "V11": {
+        const head = d.kind === "collision" ? "collision" : d.kind === "near_collision" ? "near-collision" : "near-collision or collision";
+        const other = d.other_cls ? ` with ${d.other_cls}${fin(d.other_tid) !== null ? " #" + d.other_tid : ""}` : "";
+        const ttc = n1(d.ttc_s), cl = fin(d.closing_speed_mps), dec = n1(d.decel_mps2);
+        return joined(head + other, ttc ? `${ttc} s to impact` : "", cl !== null ? `closing at ${Math.round(cl * 3.6)} km/h` : "", dec ? `braked ${dec} m/s²` : "");
+      }
+    }
     return v.zone || "";
+  }
+  const QNAMES = { queue_m: "Queue", speed_kph: "Mean speed", occupancy: "Occupancy", density: "Density", wait_s: "Waiting time" };
+  // V10 / V11 start as candidates from motion measurements; the vision-language model decides whether they are real.
+  const isCandidate = (v) => { const d = v.details || {}; return d.decided_by === "vlm" || !!d.needs_review; };
+  const candidateChip = (v) => (isCandidate(v) ? ' <span class="chip candidate" title="Found from motion measurements alone. Press Explain: the vision-language model decides whether it is real.">candidate — the VLM decides</span>' : "");
+  // Priority for the operator (surveillance/impact.py): a band from the measured impact, history only moves it inside the band.
+  function prioChip(v) {
+    const p = v.priority, i = v.impact;
+    if (!p) return "";
+    const scored = !!(i && i.meaningful !== false && i.score !== null && i.score !== undefined);
+    if (!scored && p.severity === "low") return `<span class="chip prio none" title="${esc(i ? "The traffic impact could not be measured for this case" : "No traffic impact has been measured for this case")}">not scored</span>`;
+    return `<span class="chip prio ${esc(p.severity)}" title="${esc(p.reason)}">${esc(p.severity[0].toUpperCase() + p.severity.slice(1))} ${Math.round(p.priority)}${scored ? "" : " · rule only"}</span>`;
   }
 
   function toast(msg, kind = "", onclick = null, ms = 5000) {
@@ -165,6 +206,7 @@
       if (msg.type === "plate") {  // a feed item on any page gets its plate as soon as it is read
         $$(`.feed-item[data-vid="${msg.violation.id}"]`).forEach((el) => { el.outerHTML = feedItem(msg.violation); });
       }
+      if (msg.type === "dispute") refreshDisputes();
       listeners.forEach((fn) => fn(msg));
     };
   }
@@ -180,6 +222,16 @@
     const el = $("#pending-count");
     el.textContent = state.pending;
     el.classList.toggle("hidden", !state.pending);
+  }
+
+  // Open disputes waiting for a decision: the badge in the nav, like Review's.
+  async function refreshDisputes() {
+    try {
+      const r = await api("/api/disputes?status=open&limit=1");
+      const el = $("#dispute-count");
+      el.textContent = r.open;
+      el.classList.toggle("hidden", !r.open);
+    } catch (e) { /* server restarting */ }
   }
 
   // Poll camera status while a page shows cameras; pages register an update callback.
@@ -220,9 +272,13 @@
     try {
       if (name === "dashboard") await pageDashboard(main);
       else if (name === "cameras") await pageCameras(main);
-      else if (name === "camera" && parts[2] === "zones") await window.Editor.render(main, +parts[1], App);
+      else if (name === "camera" && parts[2] === "zones") {
+        if (!isAdmin()) { go(`#/camera/${+parts[1]}`); return; }   // the zone editor edits cameras: administrators only
+        await window.Editor.render(main, +parts[1], App);
+      }
       else if (name === "camera") await pageCamera(main, +parts[1]);
       else if (name === "review") await pageReview(main, parts[1] ? +parts[1] : null);
+      else if (name === "disputes") await pageDisputes(main, parts[1] ? +parts[1] : null);
       else if (name === "vehicles") await pageVehicles(main, parts[1] ? +parts[1] : null);
       else if (name === "admin") await pageAdmin(main);
       else if (name === "stats") await pageStats(main);
@@ -268,16 +324,17 @@
   }
   function camButtons(cam, st) {
     const running = st && ["running", "starting", "reconnecting"].includes(st.state);
-    if (isLearning(st)) return `<button class="btn small" data-act="cancel-learn" data-id="${cam.id}">${ICON.stop}Cancel learning</button>`;
+    if (isLearning(st)) return isAdmin() ? `<button class="btn small" data-act="cancel-learn" data-id="${cam.id}">${ICON.stop}Cancel learning</button>` : "";
     const startLabel = cam.kind === "file" ? (st && st.state === "done" ? "Analyse again" : "Analyse video") : "Start live";
     if (!running && !zonesReady(cam, st)) {
+      if (!isAdmin()) return '<span class="small muted">Zones not set up: ask an administrator</span>';
       return `<button class="btn small primary" data-act="learn" data-id="${cam.id}">${ICON.auto}Learn zones automatically</button>
         <a class="btn small" href="#/camera/${cam.id}/zones">${ICON.zones}Draw zones</a>`;
     }
     return `${running
       ? `<button class="btn small" data-act="stop" data-id="${cam.id}">${ICON.stop}Stop</button>`
       : `<button class="btn small primary" data-act="start" data-id="${cam.id}">${ICON.play}${startLabel}</button>`}
-      <a class="btn small" href="#/camera/${cam.id}/zones">${ICON.zones}Zones</a>`;
+      ${isAdmin() ? `<a class="btn small" href="#/camera/${cam.id}/zones">${ICON.zones}Zones</a>` : ""}`;
   }
   async function camAction(act, id) {
     try {
@@ -341,9 +398,40 @@
     return `<div class="feed-item${isNew ? " new" : ""}" data-vid="${v.id}" data-code="${esc(v.code)}">
       <img src="${media(v.crop || v.snapshot)}" alt="" loading="lazy">
       <div class="feed-body"><div class="t">${vcode(v.code)} ${esc(v.title)}${statusBadge(v.status)}</div>
-      <div class="m">${esc(v.cls)} · ${esc(summary(v))} ${plateChip(v)}</div>
+      <div class="m">${esc(v.cls)} · ${esc(summary(v))} ${plateChip(v)}${candidateChip(v)}</div>
       <div class="m">${ICON.pin.replace("<svg", '<svg class="i"')}${esc(v.camera_name)} · ${esc(when(v))} · ${n} evidence</div></div></div>`;
   }
+
+  // ------------------------------------------------------------------ live traffic state (surveillance/traffic_state.py)
+  function trafficHtml(t) {
+    if (!t || !t.running) return `<div class="small muted">${esc((t && t.message) || "Not running")}</div>`;
+    const zs = Object.entries(t.zones || {});
+    if (!zs.length) return '<div class="small muted">No road zone measured yet.</div>';
+    const num = (x, f) => (fin(x) === null ? "–" : f(+x));
+    return zs.map(([name, z]) => `<div class="tz"><div class="tz-head"><b>${esc(name)}</b><span class="muted small">${z.vehicles} in view</span></div>
+      <div class="tz-nums"><span><i>Queue</i>${num(z.queue_m, (x) => Math.round(x) + " m")}</span><span><i>Speed</i>${num(z.speed_kph, (x) => Math.round(x) + " km/h")}</span>
+        <span><i>Occupancy</i>${num(z.occupancy, (x) => Math.round(x * 100) + "%")}</span><span><i>Density</i>${num(z.density, (x) => Math.round(x))}<small>/km/lane</small></span>
+        <span><i>Waiting</i>${num(z.wait_s, (x) => Math.round(x) + " s")}</span></div>
+      <div class="small muted">${z.baseline && z.baseline.source === "history" ? `compared with ${z.baseline.days} day(s) of this time of day` : "no time-of-day baseline yet: events are compared with the minutes before them"}</div></div>`).join("");
+  }
+  // Poll the traffic endpoint of every running camera every few seconds, only while the tab is visible.
+  function watchTraffic(render, ms = 4000) {
+    const tick = async () => {
+      if (document.hidden) return;
+      const running = Object.entries(state.status).filter(([, st]) => st && st.state === "running").map(([id]) => +id);
+      const ids = new Set($$("[data-traffic]").map((el) => +el.dataset.traffic));
+      for (const id of ids) {
+        try { render(id, running.includes(id) ? await api(`/api/cameras/${id}/traffic`) : null); } catch (e) { /* ignore */ }
+      }
+    };
+    const timer = setInterval(tick, ms);
+    onLeave(() => clearInterval(timer));
+    setTimeout(tick, 1800);
+  }
+  const drawTraffic = (id, t) => $$(`[data-traffic="${id}"]`).forEach((el) => {
+    el.classList.toggle("hidden", !t && el.dataset.hide === "1");
+    el.innerHTML = trafficHtml(t);
+  });
 
   // ------------------------------------------------------------------ dashboard
   async function pageDashboard(main) {
@@ -367,7 +455,7 @@
     const plates = recent.items.filter((v) => v.plate_status === "read" || v.plate_status === "partial").length;
     main.innerHTML = `
       <div class="page-head"><div><h1>Control room</h1><p>Live cameras, recorded videos and violations as they are detected</p></div>
-        <span class="spacer"></span><a class="btn" href="#/review">${ICON.check}Review queue</a><a class="btn primary" href="#/cameras?add=1">${ICON.plus}Add camera</a></div>
+        <span class="spacer"></span><a class="btn" href="#/review">${ICON.check}Review queue</a>${isAdmin() ? `<a class="btn primary" href="#/cameras?add=1">${ICON.plus}Add camera</a>` : ""}</div>
       <div class="tiles">
         <div class="tile"><div class="label">Detected in the last 24 h</div><div class="value" id="k-today">${todayN}</div><div class="sub">excluding rejected</div></div>
         <div class="tile accent-warn"><div class="label">Waiting for review</div><div class="value" id="k-pending">${byStatus.pending || 0}</div><div class="sub"><a href="#/review">Open review queue</a></div></div>
@@ -386,12 +474,13 @@
         <div class="cams" id="cams">${cams.length ? cams.map((c) => `
           <div class="cam-tile">${camView(c, c.status)}
             <div class="cam-meta"><div class="cam-title"><a class="name" href="#/camera/${c.id}" data-cam-name="${c.id}">${esc(c.name)}</a>
-                <button class="btn ghost small" data-edit="${c.id}" title="Change the camera's name and location">${ICON.edit}Edit name &amp; location</button>
+                ${isAdmin() ? `<button class="btn ghost small" data-edit="${c.id}" title="Change the camera's name and location">${ICON.edit}Edit name &amp; location</button>` : ""}
                 <div class="small muted" data-cam-loc="${c.id}">${ICON.pin.replace("<svg", '<svg class="i"')}${esc(c.location || "No location set")}</div></div>
               <span class="spacer"></span>
               <span class="row" data-cam-btns="${c.id}" data-state="${esc(c.status.state)}">${camButtons(c, c.status)}</span>
-              <div class="stats" data-cam-stats="${c.id}">${esc(camStatsText(c, c.status))}</div></div></div>`).join("")
-          : `<div class="card empty">${ICON.cam}<br>No cameras yet.<br><br><a class="btn primary" href="#/cameras?add=1">${ICON.plus}Add a camera or video</a></div>`}
+              <div class="stats" data-cam-stats="${c.id}">${esc(camStatsText(c, c.status))}</div></div>
+            <div class="traffic-strip hidden" data-traffic="${c.id}" data-hide="1"></div></div>`).join("")
+          : `<div class="card empty">${ICON.cam}<br>No cameras yet.${isAdmin() ? `<br><br><a class="btn primary" href="#/cameras?add=1">${ICON.plus}Add a camera or video</a>` : "<br>An administrator adds them."}</div>`}
         </div>
         <div class="card feed-card"><div class="card-head"><h2>Live alerts</h2><span class="live-dot"></span><span class="spacer"></span><a class="small" href="#/review">Review all</a></div>
           <div class="chips" id="feed-filter"><button class="on" data-f="">All</button>${rules.map((r) => `<button data-f="${r.code}">${r.code}</button>`).join("")}</div>
@@ -418,6 +507,7 @@
       applyFilter();
     };
     $("#feed").addEventListener("click", (e) => { const it = e.target.closest("[data-vid]"); if (it) go(`#/review/${it.dataset.vid}`); });
+    watchTraffic(drawTraffic);
     pollStatus((status) => {
       updateCamViews(cams, status);
       const running = cams.filter((c) => status[c.id] && ["running", "starting", "reconnecting"].includes(status[c.id].state));
@@ -447,19 +537,19 @@
     const cams = await api("/api/cameras");
     main.innerHTML = `
       <div class="page-head"><div><h1>Cameras</h1><p>Each camera position has its own road zones. Recorded videos are analysed completely; live cameras in real time.</p></div>
-        <span class="spacer"></span><button class="btn primary" id="add">${ICON.plus}Add camera</button></div>
+        <span class="spacer"></span>${isAdmin() ? `<button class="btn primary" id="add">${ICON.plus}Add camera</button>` : ""}</div>
       <div class="card flush">${cams.length ? `<table class="list"><tr><th>Camera</th><th>Source</th><th>Zones</th><th>Status</th><th>Violations</th><th></th></tr>
         ${cams.map((c) => `<tr>
           <td><a href="#/camera/${c.id}"><b>${esc(c.name)}</b></a><div class="small muted">${esc(c.location || "No location set")}</div></td>
           <td><span class="chip">${c.kind === "file" ? "Video file" : "Live"}</span><div class="small muted" title="${esc(c.source)}">${esc(c.source.length > 46 ? "…" + c.source.slice(-45) : c.source)}</div></td>
-          <td>${c.zones_ready ? `v${c.zone_version} <span class="chip">${c.zone_mode === "auto" ? "automatic" : "manual"}</span>` : isLearning(c.status) ? '<span class="chip learning">learning…</span>' : `<a href="#/camera/${c.id}/zones">Set up zones</a>`}</td>
+          <td>${c.zones_ready ? `v${c.zone_version} <span class="chip">${c.zone_mode === "auto" ? "automatic" : "manual"}</span>` : isLearning(c.status) ? '<span class="chip learning">learning…</span>' : (isAdmin() ? `<a href="#/camera/${c.id}/zones">Set up zones</a>` : '<span class="muted">not set up</span>')}</td>
           <td data-state-of="${c.id}">${stateChip(c.status)}</td>
           <td class="mono">${c.total}${c.pending ? ` <span class="small muted">(${c.pending} pending)</span>` : ""}</td>
           <td><div class="row" style="justify-content:flex-end"><span class="row" data-cam-btns="${c.id}">${camButtons(c, c.status)}</span>
-            <button class="btn small ghost" data-edit="${c.id}" title="Rename / edit camera position">${ICON.edit}Edit</button>
-            <button class="btn small ghost danger" data-del="${c.id}" title="Delete camera">${ICON.trash}</button></div></td></tr>`).join("")}</table>`
+            ${isAdmin() ? `<button class="btn small ghost" data-edit="${c.id}" title="Rename / edit camera position">${ICON.edit}Edit</button>
+            <button class="btn small ghost danger" data-del="${c.id}" title="Delete camera">${ICON.trash}</button>` : ""}</div></td></tr>`).join("")}</table>`
         : `<div class="empty">${ICON.cam}<br>No cameras yet. Add a recorded video or a live phone camera to begin.</div>`}</div>`;
-    $("#add").onclick = () => addCameraModal();
+    if ($("#add")) $("#add").onclick = () => addCameraModal();
     bindCamButtons(main);
     main.addEventListener("click", async (e) => {
       const ed = e.target.closest("[data-edit]");
@@ -479,7 +569,7 @@
       const key = (st ? st.state : "idle") + (isLearning(st) ? "-learn" : "") + (zonesReady(c, st) ? "-z" : "");
       if (btns && btns.dataset.state !== key) { btns.innerHTML = camButtons(c, st); btns.dataset.state = key; }
     }));
-    if (location.hash.includes("add=1")) { history.replaceState(null, "", "#/cameras"); addCameraModal(); }
+    if (isAdmin() && location.hash.includes("add=1")) { history.replaceState(null, "", "#/cameras"); addCameraModal(); }
   }
 
   function addCameraModal() {
@@ -698,15 +788,15 @@
       body = `<div class="small">${esc(L.message || "Learning…")}</div>
         <div class="progress learn" style="margin:8px 0"><div style="width:${((L.progress || 0) * 100).toFixed(1)}%"></div></div>
         <div class="small muted">${L.moving_vehicles || 0} moving vehicles seen in ${Math.round(L.seconds || 0)} s (needs about 300 and 90 s).</div>
-        <button class="btn small" data-zact="cancel">${ICON.stop}Cancel</button>`;
+        ${isAdmin() ? `<button class="btn small" data-zact="cancel">${ICON.stop}Cancel</button>` : ""}`;
     } else {
       const err = L && L.state === "error" ? `<div class="errors">Automatic setup failed: ${esc(L.message)}</div>` : "";
       const mode = cam.zones_ready ? `<span class="chip">${cam.zone_mode === "auto" ? "Automatic" : "Manual"}</span> version ${cam.zone_version}` : "Not set up yet";
       body = `<div class="row small">${mode}</div>${err}
         ${cam.zone_mode === "auto" && cam.auto_preview ? `<img class="zone-preview" src="${media(cam.auto_preview)}" data-zoom="${media(cam.auto_preview)}" data-caption="Automatically learned zones" alt="Learned zones">` : ""}
         ${cam.zone_mode === "auto" ? autoReport(cam.auto_report, true) : ""}
-        <div class="row"><button class="btn small ${cam.zones_ready ? "" : "primary"}" data-zact="learn">${ICON.auto}${cam.zones_ready ? "Learn again automatically" : "Learn zones automatically"}</button>
-          <a class="btn small" href="#/camera/${cam.id}/zones">${ICON.zones}${cam.zones_ready ? "Open zone editor" : "Draw zones manually"}</a></div>`;
+        ${!isAdmin() ? "" : `<div class="row"><button class="btn small ${cam.zones_ready ? "" : "primary"}" data-zact="learn">${ICON.auto}${cam.zones_ready ? "Learn again automatically" : "Learn zones automatically"}</button>
+          <a class="btn small" href="#/camera/${cam.id}/zones">${ICON.zones}${cam.zones_ready ? "Open zone editor" : "Draw zones manually"}</a></div>`}`;
     }
     return `<div class="card-head"><h2>Road zones</h2></div><div class="stack" style="gap:10px">${body}</div>`;
   }
@@ -718,10 +808,10 @@
     const s = cam.settings;
     const ruleNames = Object.fromEntries(Object.values(state.meta.rules).map((r) => [r.code, r.title]));
     main.innerHTML = `
-      <div class="page-head"><div><h1 class="row" style="gap:6px">${esc(cam.name)}<button class="btn ghost small" id="edit-cam" title="Change the camera's name and location">${ICON.edit}Edit name &amp; location</button></h1>
+      <div class="page-head"><div><h1 class="row" style="gap:6px">${esc(cam.name)}${isAdmin() ? `<button class="btn ghost small" id="edit-cam" title="Change the camera's name and location">${ICON.edit}Edit name &amp; location</button>` : ""}</h1>
         <p>${ICON.pin.replace("<svg", '<svg class="i"')}${esc(cam.location || "No location set")} ${cam.kind === "file" ? "· recorded video" : "· live camera"}</p></div>
         <span class="spacer"></span><span class="row" data-cam-btns="${id}" data-state="${esc(cam.status.state)}">${camButtons(cam, cam.status)}</span>
-        <button class="btn danger" id="clear">${ICON.trash}Clear results</button></div>
+        ${isAdmin() ? `<button class="btn danger" id="clear">${ICON.trash}Clear results</button>` : ""}</div>
       <div class="cam-page">
         <div class="stack">
           <div class="card flush"><div>${camView(cam, cam.status, true)}</div>
@@ -731,6 +821,7 @@
         </div>
         <div class="stack">
           <div class="card" id="zones-card"></div>
+          <div class="card"><div class="card-head"><h2>Traffic now</h2></div><div data-traffic="${id}"></div></div>
           <div class="card"><div class="card-head"><h2>Status</h2></div><table class="kv" id="kv"></table></div>
           <div class="card"><div class="card-head"><h2>Rules</h2></div><div id="rules" class="small"></div></div>
           <div class="card"><div class="card-head"><h2>Settings</h2></div>
@@ -740,6 +831,7 @@
                 <span class="hint">960 px sees smaller, farther vehicles and measures more of each zone reliably (~30 FPS on an M5). 640 px runs ~60 FPS: best for live cameras.</span></label>
               <label class="field">Analysis resolution<select id="maxw">${[[0, "Full resolution (needed for helmets and plates)"], [1920, "1920 px (faster on 4K video)"], [1280, "1280 px (fastest)"]].map(([v, l]) => `<option value="${v}" ${s.max_width === v ? "selected" : ""}>${l}</option>`).join("")}</select></label>
               <label class="row small"><input type="checkbox" id="anpr" ${s.anpr ? "checked" : ""} ${state.meta.features.anpr ? "" : "disabled"}> Read number plates of violators${state.meta.features.anpr ? "" : " (plate models not installed)"}</label>
+              <label class="row small"><input type="checkbox" id="impact" ${s.impact !== false ? "checked" : ""}> Measure the traffic impact of each violation (queue, speed, occupancy)</label>
               <label class="row small"><input type="checkbox" id="helmet" ${s.helmet ? "checked" : ""} ${state.meta.features.helmet ? "" : "disabled"}> Detect riders without helmet (V6)${state.meta.features.helmet ? "" : " (helmet model not installed)"}</label>
               ${cam.kind === "file" ? `
               <label class="field">Recording start time<input type="datetime-local" step="1" id="start" value="${esc(cam.start_time || "")}">
@@ -747,7 +839,7 @@
               <label class="field">Frames analysed per second<select id="afps">${[15, 20, 25, 30].map((v) => `<option ${s.analysis_fps === v ? "selected" : ""}>${v}</option>`).join("")}</select>
                 <span class="hint">30 recommended. Lower is faster; below 15 speeds become less precise.</span></label>
               <label class="row small"><input type="checkbox" id="realtime" ${s.realtime ? "checked" : ""}> Play at real speed (behave like a live camera)</label>` : ""}
-              <div class="row"><button class="btn primary small" id="save-set">Save settings</button><span class="small muted" id="set-msg"></span></div>
+              ${isAdmin() ? '<div class="row"><button class="btn primary small" id="save-set">Save settings</button><span class="small muted" id="set-msg"></span></div>' : '<div class="small muted">Only an administrator can change these settings.</div>'}
             </div></div>
           <div class="card"><div class="card-head"><h2>Analysis runs</h2></div>${cam.runs.length ? `<table class="list small"><tr><th>Started</th><th>Mode</th><th>Frames</th><th>Result</th></tr>
             ${cam.runs.map((r) => `<tr><td>${esc(r.started_at.replace("T", " "))}</td><td>${esc(r.mode)}</td><td class="mono">${r.frames}</td>
@@ -755,11 +847,12 @@
         </div>
       </div>`;
     bindCamButtons(main);
-    $("#edit-cam").onclick = () => editCameraModal(cam, () => route());
+    if (!isAdmin()) $$(".cam-page #imgsz button, .cam-page .card input, .cam-page .card select").forEach((el) => { el.disabled = true; });
+    if ($("#edit-cam")) $("#edit-cam").onclick = () => editCameraModal(cam, () => route());
     let imgsz = s.imgsz;
     $$("#imgsz button").forEach((b) => b.onclick = () => { imgsz = +b.dataset.v; $$("#imgsz button").forEach((x) => x.classList.toggle("on", x === b)); });
-    $("#save-set").onclick = async () => {
-      const body = { settings: { imgsz, max_width: +$("#maxw").value, anpr: $("#anpr").checked, helmet: $("#helmet").checked } };
+    if (isAdmin()) $("#save-set").onclick = async () => {
+      const body = { settings: { imgsz, max_width: +$("#maxw").value, anpr: $("#anpr").checked, helmet: $("#helmet").checked, impact: $("#impact").checked } };
       if (cam.kind === "file") {
         body.settings.analysis_fps = +$("#afps").value;
         body.settings.realtime = $("#realtime").checked;
@@ -768,17 +861,22 @@
       try { await api(`/api/cameras/${id}`, { method: "PATCH", body }); $("#set-msg").textContent = "Saved – used from the next start"; }
       catch (e) { $("#set-msg").textContent = e.message; }
     };
-    $("#clear").onclick = async () => {
+    if (isAdmin()) $("#clear").onclick = async () => {
       if (await confirmBox(`Delete all ${cam.total} violations, runs and evidence files of <b>${esc(cam.name)}</b>? Zones are kept.`, "Clear")) {
         try { await api(`/api/cameras/${id}/violations`, { method: "DELETE" }); route(); } catch (e) { fail(e); }
       }
     };
     $("#feed").addEventListener("click", (e) => { const it = e.target.closest("[data-vid]"); if (it) go(`#/review/${it.dataset.vid}`); });
+    watchTraffic(drawTraffic);
     const renderStatus = (st) => {
       const rows = [["State", STATE_LABEL[st.state] || st.state], ["Detector", st.backend || "–"],
         ["Processing", st.fps ? `${st.fps} FPS${st.speed_x ? ` (${st.speed_x}× real time)` : ""}` : "–"],
         [cam.kind === "live" ? "Delay" : "Video time", cam.kind === "live" ? (st.lag != null ? st.lag + " s" : "–") : (st.video_time != null ? st.video_time + " s" : "–")],
         ["Vehicles in view", st.tracks ?? "–"], ["Violations this run", st.violations ?? "–"]];
+      if (st.embed && (st.embed.queued || st.embed.done || st.embed.waiting)) {
+        const e = st.embed;
+        rows.push(["Re-ID", `${e.done} done, ${e.dropped} dropped, ~${e.mean_ms != null ? (e.mean_ms / 1000).toFixed(1) : "?"} s/vehicle`]);
+      }
       if (st.message) rows.push(["Message", st.message]);
       $("#kv").innerHTML = rows.map(([k, v]) => `<tr><th>${esc(k)}</th><td>${esc(v)}</td></tr>`).join("");
       const inactive = st.state === "idle" || !st.inactive ? (cam.rules || {}) : st.inactive;
@@ -786,7 +884,7 @@
       $("#rules").innerHTML = `<ul class="reasons">${codes.map((c) => inactive[c]
           ? `<li class="off">${vcode(c)} ${esc(ruleNames[c])}<div class="small muted">off: ${esc(inactive[c])}</div></li>`
           : `<li>${vcode(c)} ${esc(ruleNames[c])}${c === "V2" && st.speed_paused ? ' <b style="color:var(--warning-ink)">paused: frame rate too low</b>' : ""}</li>`).join("")}</ul>
-        <a class="small" href="#/camera/${id}/zones">Change zones to switch rules on</a>`;
+        ${isAdmin() ? `<a class="small" href="#/camera/${id}/zones">Change zones to switch rules on</a>` : ""}`;
     };
     renderStatus(cam.status);
     let lastLearn = JSON.stringify(cam.status.learning || {});
@@ -838,6 +936,7 @@
         <select id="f-cam"><option value="">All cameras</option>${cams.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join("")}</select>
         <select id="f-code"><option value="">All violation types</option>${codes.map(([c, t]) => `<option value="${c}">${c} ${esc(t)}</option>`).join("")}</select>
         <span class="seg" id="f-status">${["pending", "confirmed", "rejected", ""].map((s) => `<button data-v="${s}">${s ? s[0].toUpperCase() + s.slice(1) : "All"}</button>`).join("")}</span>
+        <span class="seg" id="f-sort" title="Order of the list">${[["new", "Newest"], ["prio", "Priority"]].map(([v, l]) => `<button data-v="${v}">${l}</button>`).join("")}</span>
         <input id="f-plate" type="search" placeholder="Search plate (Bangla or e.g. 12-3456)" style="width:250px">
         <span class="muted small" id="f-count"></span>
       </div>
@@ -845,7 +944,17 @@
     $("#f-cam").value = f.camera_id;
     $("#f-code").value = f.code;
     $("#f-plate").value = f.plate;
-    let items = [], sel = null;
+    let items = [], sel = null, sortBy = "new";
+    const setSort = () => $$("#f-sort button").forEach((b) => b.classList.toggle("on", b.dataset.v === sortBy));
+    setSort();
+    // Client-side, over the cases loaded: the highest priority first; cases with no impact measurement come after
+    // the scored ones (a rule-only priority is shown but ranks below a measured one of the same value).
+    const prioKey = (v) => (v.priority ? v.priority.priority + (v.impact && v.impact.meaningful !== false && v.impact.score != null ? 0.05 : 0) : -1);
+    const sortItems = () => items.sort(sortBy === "prio" ? (a, b) => prioKey(b) - prioKey(a) || b.id - a.id : (a, b) => b.id - a.id);
+    const renderList = () => {
+      $("#list").innerHTML = items.length ? items.map((v) => rvItem(v)).join("") : `<div class="card empty">Nothing ${f.status ? esc(f.status) : ""} here.</div>`;
+      $$(".rv-item").forEach((el) => el.classList.toggle("sel", !!sel && +el.dataset.vid === sel.id));
+    };
     const setSeg = () => $$("#f-status button").forEach((b) => b.classList.toggle("on", b.dataset.v === f.status));
     setSeg();
 
@@ -856,11 +965,11 @@
       items = r.items;
       $("#f-count").textContent = `${r.total} case${r.total === 1 ? "" : "s"}`;
       $("#export").href = "/api/export.csv?" + new URLSearchParams(Object.fromEntries(Object.entries({ camera_id: f.camera_id, status: f.status }).filter(([, v]) => v)));
-      $("#list").innerHTML = items.length ? items.map((v) => rvItem(v)).join("")
-        : `<div class="card empty">Nothing ${f.status ? esc(f.status) : ""} here.</div>`;
+      sortItems();
+      renderList();
       let target = items.find((v) => v.id === keepId) || items[0];
       if (keepId && !items.find((v) => v.id === keepId)) {
-        try { const v = await api(`/api/violations/${keepId}`); items.unshift(v); target = v; } catch (e) { /* deleted */ }
+        try { const v = await api(`/api/violations/${keepId}`); items.unshift(v); target = v; sortItems(); renderList(); } catch (e) { /* deleted */ }
       }
       select(target ? target.id : null);
     }
@@ -874,8 +983,8 @@
     function rvItem(v) {
       return `<div class="rv-item" data-vid="${v.id}"><img src="${media(v.crop || v.snapshot)}" alt="" loading="lazy">
         <div><div class="small">${vcode(v.code)} <b>${esc(v.cls)}</b> ${statusBadge(v.status)}${citeChip(v)}</div>
-        <div class="small muted">${esc(summary(v))}</div><div class="small muted">${esc(v.camera_name)} · ${esc(when(v))}</div>
-        <div class="small" data-plate-of="${v.id}">${plateChip(v)}</div></div></div>`;
+        <div class="small muted">${esc(summary(v))}${candidateChip(v)}</div><div class="small muted">${esc(v.camera_name)} · ${esc(when(v))}</div>
+        <div class="small" data-plate-of="${v.id}">${plateChip(v)}</div><div class="small" data-prio-of="${v.id}">${prioChip(v)}</div></div></div>`;
     }
 
     function plateBlock(v) {
@@ -899,12 +1008,30 @@
       contradicted: { label: "Evidence contradicts the finding", cls: "bad" },
     };
 
+    // Latest progress event per case ("explain_stage" over /api/events); cleared when the answer arrives.
+    const stageOf = {};
+    const STAGE_STEPS = ["prescreen_done", "screening", "escalated", "loading_reasoner", "reasoning"];
+    function stageLine(g) {
+      if (!g) return `<div class="small">Waiting for the reasoning queue…</div>
+        <div class="small muted">A case screened out by the small model finishes in about 15 s; one sent to the large model takes minutes. This line updates as it moves.</div>`;
+      const n = STAGE_STEPS.indexOf(g.stage) + 1;
+      const eta = g.eta_s ? `<span id="vlm-eta" data-at="${g.at}" data-eta="${g.eta_s}"></span>
+        <span class="muted"> (${esc(g.eta_basis || "estimate")}; the real time can be longer)</span>` : "";
+      return `<div class="small"><b>Step ${n} of ${STAGE_STEPS.length}:</b> ${esc(g.message)}</div>
+        <div class="small muted">${eta}</div>`;
+    }
+    function tickEta() {
+      const el = $("#vlm-eta");
+      if (!el) return;
+      const run = Math.max(0, Date.now() / 1000 - (+el.dataset.at)), eta = +el.dataset.eta;
+      el.textContent = `running ${Math.round(run)} s · usually about ${eta} s for this step` + (run > eta * 1.5 ? " · taking longer than usual, still working" : "");
+    }
+
     function vlmBlock(v) {
       const st = v.vlm_status || "";
       if (st === "pending") {
         return `<div class="vlm-box pending"><div class="vlm-head">${ICON.brain}<b>Reading the evidence…</b></div>
-          <div class="small muted">The model is looking at the photographs. On the local CPU model this takes
-          roughly 20–60 seconds; the answer appears here by itself.</div></div>`;
+          ${stageLine(stageOf[v.id])}</div>`;
       }
       const x = v.vlm;
       if (!x) return "";
@@ -912,24 +1039,116 @@
         return `<div class="vlm-box bad"><div class="vlm-head">${ICON.brain}<b>Could not explain this case</b></div>
           <div class="small muted">${esc(x.error || "unknown error")}</div></div>`;
       }
+      const again = `<button class="btn small" id="vlm-again" title="Ask again">${ICON.auto}Again</button>`;
+      const stages = vlmStages(x);
+      // The two-tier cascade: a case that never reached the reasoner must not look like the reasoner's verdict.
+      if (x.decided_by === "prescreen" || x.decided_by === "screen") {
+        const unavailable = !!x.reasoner_unavailable;
+        const title = x.decided_by === "prescreen" ? "Screened out — no model was asked"
+          : unavailable ? "Reasoner unavailable — not reasoned" : "Screened out by the screening model";
+        return `<div class="vlm-box ${unavailable ? "warn" : ""}">
+          <div class="vlm-head">${ICON.brain}<b>${esc(title)}</b><span class="spacer"></span>${again}</div>
+          <div class="vlm-summary">${esc(x.summary || "")}</div>${stages}
+          <div class="small muted vlm-foot">No reasoned verdict exists for this case. ${unavailable
+            ? "Start the reasoning model or free memory, then press Again."
+            : "A screening decision is weaker than a reasoned one: review the photographs yourself."}</div></div>`;
+      }
       const verdict = VERDICT[x.assessment] || VERDICT.insufficient;
       const part = (label, text) => text ? `<div class="vlm-part"><span>${label}</span><p>${esc(text)}</p></div>` : "";
       return `<div class="vlm-box ${verdict.cls}">
         <div class="vlm-head">${ICON.brain}<b>${esc(verdict.label)}</b>
           <span class="vlm-conf">confidence ${Math.round((x.confidence || 0) * 100)}%</span>
-          <span class="spacer"></span>
-          <button class="btn small" id="vlm-again" title="Ask again">${ICON.auto}Again</button></div>
+          <span class="spacer"></span>${again}</div>
         ${x.downgraded ? `<div class="vlm-overruled">${esc(x.downgraded)}</div>` : ""}
         <div class="vlm-summary">${esc(x.summary || "")}</div>
         ${part("In the photos", x.visible)}
         ${x.other_cameras && !/^(nothing|not applicable|n\/a)\.?$/i.test(x.other_cameras.trim())
             ? part("Other cameras", x.other_cameras) : ""}
         ${part("Before", x.pre_event)}${part("The event", x.event)}
-        ${part("After", x.aftermath)}${part("Probable cause", x.cause)}
+        ${part("After", x.aftermath)}${part("Probable cause", x.cause)}${stages}
         <div class="small muted vlm-foot">${esc(x.model || "model")} · ${esc(x.backend || "")} ·
           ${esc(String(x.seconds || 0))} s · ${esc(String(x.images || 0))} photo(s).
           Written by a language model from the photographs and the measurements above. Check it against the
           evidence before relying on it; it is not itself evidence.</div></div>`;
+    }
+
+    // Which stages looked at this case, with each model and its time. Empty on the single-model path.
+    function vlmStages(x) {
+      const st = x.stages || [];
+      if (!st.length) return "";
+      const rows = st.map((g) => {
+        if (g.stage === "prescreen") {
+          return `<tr><td>Motion pre-screen</td><td>no model</td><td>${g.send ? "passed on" : "stopped"} · score ${esc(String(g.score))}</td><td></td></tr>`;
+        }
+        if (g.stage === "screen") {
+          const said = { yes: "event shown", no: "no event seen", cannot_tell: "cannot tell", unavailable: "no answer" }[g.verdict] || g.verdict;
+          return `<tr><td>Screen</td><td>${esc(g.model || "")}</td><td>${esc(said)}${g.verdict !== "unavailable" ? ` · ${Math.round((g.confidence || 0) * 100)}%` : ""}${g.image_label ? ` · looked at: ${esc(g.image_label)}` : ""}${g.error ? ` · ${esc(g.error)}` : ""}</td><td>${esc(String(g.seconds))} s</td></tr>`;
+        }
+        const vv = g.verdict ? (VERDICT[g.verdict] || {}).label || g.verdict : (g.error ? "not run: " + g.error : "");
+        return `<tr><td>Reasoner</td><td>${esc(g.model || "–")}</td><td>${esc(vv)}${g.started_server ? ` · model loaded in ${esc(String(g.load_seconds))} s` : ""}</td><td>${g.seconds ? esc(String(g.seconds)) + " s" : ""}</td></tr>`;
+      }).join("");
+      const route = x.decided_by === "reasoner" ? "Escalated to the reasoner" : x.decided_by === "screen" ? (x.escalated ? "Escalated, reasoner not reached" : "Stopped at the screen") : "Stopped before any model";
+      return `<details class="vlm-stages"><summary>${esc(route)}</summary>
+        <table class="kv"><tr><th>Stage</th><th>Model</th><th>Result</th><th>Time</th></tr>${rows}</table>
+        <div class="small muted">${esc(x.escalation_reason || "")}</div></details>`;
+    }
+
+    // The effect of the event on the traffic around it (surveillance/impact.py): measured against what is normal for
+    // this approach at this time of day, scored once the seconds after the event had been seen.
+    const qfmt = (q, x) => (fin(x) === null ? "–" : q === "occupancy" ? Math.round(x * 100) + "%" : q === "speed_kph" ? Math.round(x) + " km/h"
+      : q === "queue_m" ? Math.round(x) + " m" : q === "wait_s" ? Math.round(x) + " s" : (Math.round(x * 10) / 10) + " /km/lane");
+    const SOURCES = { history: (i) => `the usual traffic at this time of day (${(i.baseline_detail && i.baseline_detail.days) || "?"} day(s) of history)`,
+      "pre-event": () => "the minutes just before the event (no time-of-day history yet)", none: () => "none" };
+    function impactBlock(v) {
+      const i = v.impact;
+      const head = (extra = "") => `<div class="vlm-head"><b>Traffic impact</b>${extra}</div>`;
+      if (!i) return `<div class="vlm-box"> ${head()}<div class="small muted">Not measured yet. The effect on traffic is scored 30 s of video after the event; a case recorded before this was switched on, or outside the road zones, has none.</div></div>`;
+      if (i.error || i.meaningful === false) {
+        return `<div class="vlm-box warn">${head()}<div class="small muted">No score for this case: ${esc(i.error || (i.notes || []).join("; ") || "nothing could be compared")}</div>${severityBox(i)}</div>`;
+      }
+      const after = i.window && fin(v.video_time_s) !== null ? Math.round(i.window.t1 - v.video_time_s) : null;
+      const seen = i.during && i.during.samples, span = i.window && i.window.seconds;
+      const cut = fin(seen) !== null && fin(span) !== null && seen < span - 3;
+      const p = v.priority;
+      const rows = Object.keys(QNAMES).map((q) => `<tr><th>${QNAMES[q]}</th><td>${qfmt(q, i.during && i.during[q])}</td><td>${qfmt(q, i.baseline && i.baseline[q])}</td>
+        <td>${fin(i.deltas && i.deltas[q]) === null ? "–" : (i.deltas[q] > 0 ? "+" : "") + i.deltas[q].toFixed(1)}</td></tr>`).join("");
+      return `<div class="vlm-box ${p && p.severity === "high" ? "bad" : p && p.severity === "medium" ? "warn" : "ok"}">
+        ${head(`<span class="spacer"></span>${prioChip(v)}`)}
+        <div class="vlm-summary">Score ${i.score} <span class="muted small">· ${i.calibrated ? `calibrated (${esc(i.weights_source)}), in vehicle-seconds of excess delay` : "equal weights (uncalibrated): a mean departure, good for ranking only"}</span></div>
+        ${p ? `<div class="small secondary">${esc(p.reason)}</div>` : ""}
+        <table class="kv impact-kv"><tr><th></th><th>During</th><th>Typical</th><th>Worse by</th></tr>${rows}</table>
+        <div class="small muted">“Worse by” is in units of this approach's normal variation; a fall in speed counts as worse. Typical = ${SOURCES[i.baseline_source] ? SOURCES[i.baseline_source](i) : esc(i.baseline_source)}.</div>
+        ${fin(i.excess_delay_veh_s) !== null ? `<div class="small">Excess vehicle-delay: <b>${Math.round(i.excess_delay_veh_s)} veh·s</b> over ${fin(i.vehicles_seen) !== null ? i.vehicles_seen : "?"} other vehicles (${i.vehicles_affected || 0} stood still for 3 s or more).
+          <span class="muted">A single event's delay is a noisy estimate (it depends on the baseline speed): use it to rank and to fit, not as a measurement to the vehicle-second.</span></div>` : ""}
+        <div class="small muted">Zone ${esc(i.zone)} · ${after !== null ? `scored ${after} s after the event` : "scored after the event"}${cut ? `; only ${seen} of ${Math.round(span)} s of that window were seen (the video ended)` : ""}.
+          The vehicle that is the event is left out of its own impact.</div>
+        ${severityBox(i)}</div>`;
+    }
+    function severityBox(i) {
+      const cur = i.human_severity;
+      const names = ["minor", "noticeable", "moderate", "serious", "severe"];
+      return `<div class="sev-box"><span class="small secondary">Your severity rating <span class="muted">(1 minor … 5 severe; checks the score, never changes it)</span></span>
+        <span class="seg" id="sev">${[1, 2, 3, 4, 5].map((g) => `<button data-g="${g}" title="${names[g - 1]}" class="${cur === g ? "on" : ""}">${g}</button>`).join("")}</span></div>`;
+    }
+    function bindImpact() {
+      $$("#sev button").forEach((b) => b.onclick = async () => {
+        if (!sel) return;
+        const g = +b.dataset.g, id = sel.id, again = sel.impact && sel.impact.human_severity === g;
+        try {
+          const v = await api(`/api/violations/${id}/severity`, { method: "POST", body: { grade: again ? null : g } });
+          mergeImpact(id, v.impact, v.priority);
+        } catch (e) { fail(e); }
+      });
+    }
+    // An impact (or a changed rating) arrived for a case: show it in the list and the open pane, keep the order.
+    function mergeImpact(id, impact, priority) {
+      const i = items.findIndex((x) => x.id === id);
+      if (i < 0) return;
+      items[i] = { ...items[i], impact, priority };
+      const chip = $(`[data-prio-of="${id}"]`);
+      if (chip) chip.innerHTML = prioChip(items[i]);
+      if (sel && sel.id === id) { sel = items[i]; const box = $("#impact-block"); if (box) { box.innerHTML = impactBlock(sel); bindImpact(); } }
+      if (sortBy === "prio") { sortItems(); renderList(); }
     }
 
     function select(id) {
@@ -978,7 +1197,7 @@
           ${!v.vlm && v.vlm_status !== "pending"
             ? `<button class="btn small" id="explain">${ICON.brain}Explain</button>` : ""}
           ${isAdvisory(v.code) ? "" : `<a class="btn small" href="/notice/${v.id}" target="_blank" rel="noopener">${ICON.print}Notice</a>`}</div>
-        <div class="small secondary">${esc(summary(v))}</div>
+        <div class="small secondary">${esc(summary(v))}${candidateChip(v)}</div>
         <div id="cite-block"></div>
         <div class="evidence">
           <div class="ev-main" id="ev-main"></div>
@@ -989,6 +1208,7 @@
         </div>
         ${timeline(v)}
         <div id="vlm-block">${vlmBlock(v)}</div>
+        <div id="impact-block">${impactBlock(v)}</div>
         <div id="plate-block">${plateBlock(v)}</div>
         <div class="grid2"><table class="kv">
             <tr><th>Vehicle</th><td>${esc(v.cls)} #${v.track_id} <span class="muted">(class ${Math.round(v.class_conf * 100)}% consistent)</span></td></tr>
@@ -1020,6 +1240,7 @@
       if ($("#explain")) $("#explain").onclick = () => explain(false);
       if ($("#vlm-again")) $("#vlm-again").onclick = () => explain(true);
       renderCite();
+      bindImpact();
     }
 
     // ---- e-prosecution: what this case can be as a citation, and what has been done with it.
@@ -1167,6 +1388,7 @@
     $("#list").addEventListener("click", (e) => { const it = e.target.closest("[data-vid]"); if (it) select(+it.dataset.vid); });
     $("#f-cam").onchange = () => { f.camera_id = $("#f-cam").value; f.run_id = ""; load(); };
     $("#f-code").onchange = () => { f.code = $("#f-code").value; load(); };
+    $$("#f-sort button").forEach((b) => b.onclick = () => { sortBy = b.dataset.v; setSort(); sortItems(); renderList(); });
     let pt = null;
     $("#f-plate").oninput = () => { clearTimeout(pt); pt = setTimeout(() => { f.plate = $("#f-plate").value.trim(); if (f.plate) f.status = ""; setSeg(); load(); }, 300); };
     $$("#f-status button").forEach((b) => b.onclick = () => { f.status = b.dataset.v; setSeg(); load(); });
@@ -1179,7 +1401,8 @@
       else if (e.key === "ArrowUp" || e.key === "k") { if (items[idx - 1]) select(items[idx - 1].id); e.preventDefault(); }
     };
     document.addEventListener("keydown", onKey);
-    onLeave(() => document.removeEventListener("keydown", onKey));
+    const etaTimer = setInterval(tickEta, 1000);
+    onLeave(() => { document.removeEventListener("keydown", onKey); clearInterval(etaTimer); });
     listeners.add((msg) => {
       if (msg.type === "plate") {
         const v = msg.violation, i = items.findIndex((x) => x.id === v.id);
@@ -1189,7 +1412,16 @@
         if (chip) chip.innerHTML = plateChip(v);
         if (sel && sel.id === v.id) { sel = items[i]; $("#plate-block").innerHTML = plateBlock(sel); }
       }
-      if (msg.type === "explanation") patch(msg.violation);
+      if (msg.type === "explanation") { delete stageOf[msg.violation.id]; patch(msg.violation); }
+      if (msg.type === "explain_stage") {
+        stageOf[msg.violation_id] = msg;
+        const box = $("#vlm-block");
+        if (sel && sel.id === msg.violation_id && sel.vlm_status === "pending" && box) { box.innerHTML = vlmBlock(sel); tickEta(); }
+      }
+      if (msg.type === "impact") {
+        mergeImpact(msg.violation_id, msg.impact, msg.priority);
+        if (msg.priority && msg.priority.severity === "high") toast(`<b>High-impact case TV-${msg.violation_id}</b><br><span class="muted">${esc(msg.priority.reason)}</span>`, "violation", () => go(`#/review/${msg.violation_id}`), 9000);
+      }
     });
     listeners.add((msg) => {
       if (msg.type === "violation" && (!f.status || f.status === "pending") && (!f.camera_id || +f.camera_id === msg.camera_id)) {
@@ -1205,11 +1437,99 @@
 
   // ------------------------------------------------------------------ statistics
   // ---------------------------------------------------------------- vehicles across cameras
+  // ------------------------------------------------------------------ disputes
+  // A driver contests an issued citation. The model's reading is advisory (it only orders this list); a controller
+  // or administrator decides, with a reason the driver is shown.
+  const D_MODEL = { evidence_supports_driver: ["bad", "Model: the evidence does not seem to show the violation"],
+                    evidence_supports_citation: ["ok", "Model: the evidence seems to support the citation"],
+                    insufficient: ["", "Model: the evidence cannot settle it"] };
+  const D_STATUS = { open: "Open", upheld: "Upheld", accepted: "Accepted (citation withdrawn)", moot: "Moot (citation withdrawn)" };
+
+  async function pageDisputes(main, selectId) {
+    main.innerHTML = `<div class="page-head"><h1>Disputes</h1><span class="spacer"></span>
+        <select id="d-filter"><option value="open">Open</option><option value="decided">Decided</option><option value="all">All</option></select></div>
+      <div class="review-grid"><div class="card" id="d-list" style="max-height:78vh;overflow:auto"></div><div id="d-detail"></div></div>`;
+    const filter = $("#d-filter");
+    let items = [], sel = selectId;
+
+    const modelChip = (d) => {
+      const m = d.model && D_MODEL[d.model.assessment];
+      return m ? `<span class="chip ${m[0]}" title="Advisory only">${esc(m[1])}</span>` : `<span class="chip" title="Advisory only">${esc(d.model_label)}</span>`;
+    };
+    const row = (d) => `<div class="feed-item${d.id === sel ? " active" : ""}" data-id="${d.id}" style="cursor:pointer;padding:9px 6px;border-top:1px solid var(--border)">
+        <div><b>${esc(d.citation_no)}</b> ${vcode(d.code || "")} <span class="muted small">${esc(d.plate || "")}</span></div>
+        <div class="small muted">Filed ${esc((d.filed_at || "").replace("T", " "))} · ${esc(D_STATUS[d.status] || d.status)}</div>
+        ${d.status === "open" ? `<div style="margin-top:3px">${modelChip(d)}</div>` : ""}</div>`;
+
+    async function load() {
+      const r = await api(`/api/disputes?status=${filter.value}&limit=200`);
+      items = r.items;
+      $("#d-list").innerHTML = items.length ? items.map(row).join("") : '<div class="empty">No disputes here.</div>';
+      $$("#d-list .feed-item").forEach((el) => el.onclick = () => { sel = +el.dataset.id; go(`#/disputes/${sel}`); });
+      if (sel) await show(sel); else $("#d-detail").innerHTML = '<div class="card empty">Pick a dispute. Those the model thinks the evidence does not support are listed first; the model never decides.</div>';
+      refreshDisputes();
+    }
+    filter.onchange = () => { sel = null; load().catch(fail); };
+
+    async function show(id) {
+      let d;
+      try { d = await api(`/api/disputes/${id}`); } catch (e) { $("#d-detail").innerHTML = `<div class="card errors">${esc(e.message)}</div>`; return; }
+      const c = d.case, ct = d.citation, m = d.model;
+      const imgs = c ? [[c.snapshot, "The scene, vehicle outlined"], [c.crop, "Close-up"], ...(c.evidence || []).map((e) => [e.path, e.label]),
+                        [c.plate_img, "Number plate as read"]].filter((x) => x[0]) : [];
+      const open = d.status === "open";
+      $("#d-detail").innerHTML = `<div class="card">
+        <div class="card-head"><h2>Dispute of ${esc(d.citation_no)}</h2><span class="spacer" style="flex:1"></span>
+          <span class="chip">${esc(D_STATUS[d.status] || d.status)}</span></div>
+        ${c ? `<div class="small"><b>${esc(c.code)} ${esc(c.title)}</b> · ${esc(c.cls || "")} · ${esc(c.plate_text_en || "")} · ${esc(c.wall_time || "")} · ${esc(c.camera_name || "")}
+          · <a href="#/review/${c.id}">open the case</a></div>
+          <div class="small muted" style="margin-top:3px">The rule claims: ${esc(c.code_claim)}</div>` : '<div class="small muted">The case itself is no longer on the server.</div>'}
+        ${ct ? `<div class="small muted" style="margin-top:3px">Citation issued ${esc((ct.issued_at || "").replace("T", " "))} by ${esc(ct.issued_by_name || "")} · status ${esc(ct.status)} · fine ${esc(ct.fine_text)}${c && c.reviewed_by_name ? " · case confirmed by " + esc(c.reviewed_by_name) : ""}</div>` : ""}
+        <div class="ev" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin:12px 0">
+          ${imgs.map(([p, cap]) => `<figure style="margin:0"><a href="${esc(media(p))}" target="_blank" rel="noopener"><img src="${esc(media(p))}" alt="${esc(cap)}" style="width:100%;border-radius:8px" loading="lazy"></a><figcaption class="small muted">${esc(cap)}</figcaption></figure>`).join("")}
+          ${c && c.clip ? `<figure style="margin:0"><video src="${esc(media(c.clip))}" controls muted playsinline preload="metadata" style="width:100%;border-radius:8px"></video><figcaption class="small muted">Video clip</figcaption></figure>` : ""}</div>
+        <div class="vlm-box"><div class="vlm-head"><b>The driver's statement</b><span class="spacer"></span><span class="small muted">filed ${esc((d.filed_at || "").replace("T", " "))}</span></div>
+          <div style="white-space:pre-wrap;margin-top:5px">${esc(d.statement)}</div></div>
+        <div class="vlm-box ${m ? (D_MODEL[m.assessment] || [""])[0] : ""}"><div class="vlm-head"><b>${esc(d.model_label)}</b><span class="spacer"></span>
+            ${m ? `<span class="vlm-conf">confidence ${Math.round(m.confidence * 100)}%</span>` : ""}
+            ${open ? '<button class="btn small" id="recheck">Check again</button>' : ""}</div>
+          ${m ? `<div class="small" style="margin-top:5px"><b>What the model says the images show:</b> ${esc(m.what_the_images_show)}</div>
+            <div class="small" style="margin-top:4px"><b>Does the statement match:</b> ${esc(m.does_the_statement_match_the_images)}</div>
+            ${m.guard_note ? `<div class="small" style="margin-top:4px;color:var(--warning-ink)">${esc(m.guard_note)}</div>` : ""}
+            ${m.statement_addresses_model ? '<div class="small" style="margin-top:4px;color:var(--warning-ink)">The statement seems to address the model rather than describe the incident; it was treated as data and ignored as instructions.</div>' : ""}
+            <div class="small muted" style="margin-top:4px">${esc(m.model)} via ${esc(m.backend)}, ${m.images} image(s), ${m.seconds} s</div>` : (d.model_error ? `<div class="small muted">${esc(d.model_error)}</div>` : "")}
+          <div class="small muted" style="margin-top:6px">${esc(d.model_limits)}</div></div>
+        ${open ? `<div class="vlm-box"><b>Your decision</b>
+            <div class="small muted" style="margin:4px 0">The driver is shown your reason. Accepting withdraws the citation (reason recorded as "dispute accepted: ..."); upholding keeps it.</div>
+            <textarea id="d-reason" maxlength="450" placeholder="Reason, at least 10 characters" style="width:100%;min-height:70px;box-sizing:border-box"></textarea>
+            <div class="row" style="justify-content:flex-end;margin-top:6px"><button class="btn bad" id="d-accept">Accept dispute (withdraw citation)</button>
+              <button class="btn good" id="d-uphold">Uphold citation</button></div></div>`
+          : `<div class="vlm-box"><b>Decided</b>${d.decided_by_name ? " by " + esc(d.decided_by_name) : ""} ${esc((d.decided_at || "").replace("T", " "))}
+            <div class="small" style="margin-top:4px">${esc(d.decision_reason)}</div></div>`}
+        <details style="margin-top:8px"><summary class="small muted">History (${(d.trail || []).length})</summary>
+          ${(d.trail || []).map((a) => `<div class="small muted">${esc(a.at.replace("T", " "))} · ${esc(a.who)} · ${esc(a.action)} · ${esc(a.detail)}</div>`).join("")}</details></div>`;
+      const decide = async (decision) => {
+        const reason = $("#d-reason").value.trim();
+        if (reason.length < 10) { toast("Give a reason of at least 10 characters; the driver is shown it.", "error"); return; }
+        if (decision === "accept" && !(await confirmBox(`This withdraws citation ${esc(d.citation_no)}. The driver sees it as void.`, "Withdraw it"))) return;
+        try { await api(`/api/disputes/${id}/decide`, { method: "POST", body: { decision, reason } });
+              toast(decision === "accept" ? "Dispute accepted; citation withdrawn" : "Citation upheld"); await load(); } catch (e) { fail(e); }
+      };
+      if (open) {
+        $("#d-uphold").onclick = () => decide("uphold");
+        $("#d-accept").onclick = () => decide("accept");
+        $("#recheck").onclick = async () => { try { await api(`/api/disputes/${id}/recheck`, { method: "POST" }); toast("Model check queued"); } catch (e) { fail(e); } };
+      }
+    }
+    listeners.add((msg) => { if (msg.type === "dispute") load().catch(() => {}); });
+    await load();
+  }
+
   async function pageVehicles(root, selected) {
     const fmtTime = (t) => t ? new Date(t * 1000).toLocaleString() : "-";
     root.innerHTML = `<div class="row page-head"><h1>Vehicles across cameras</h1><span class="spacer"></span>
         <span class="small muted" id="v-routes"></span>
-        <button class="btn" id="v-add">${ICON.plus}Add camera views</button>
+        ${isAdmin() ? `<button class="btn" id="v-add">${ICON.plus}Add camera views</button>` : ""}
         <button class="btn primary" id="v-link">${ICON.auto}Match vehicles across cameras</button></div>
       <div class="card" id="v-upload" hidden>
         <div class="card-head"><h2>Several views of one place</h2><span class="spacer"></span>
@@ -1284,7 +1604,7 @@
       $("#v-journey").scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
 
-    $("#v-add").onclick = () => { $("#v-upload").hidden = !$("#v-upload").hidden; };
+    if ($("#v-add")) $("#v-add").onclick = () => { $("#v-upload").hidden = !$("#v-upload").hidden; };
     $("#v-cancel").onclick = () => { $("#v-upload").hidden = true; };
     $("#v-files").onchange = () => {
       const f = [...($("#v-files").files || [])];
@@ -1347,7 +1667,7 @@
     if (!isAdmin()) { root.innerHTML = `<div class="card empty">Administrators only.</div>`; return; }
     const fmt = (t) => t ? new Date(t).toLocaleString() : "-";
     root.innerHTML = `<div class="row page-head"><h1>Accounts</h1><span class="spacer"></span>
-        <span class="seg" id="a-tabs">${["people", "vehicles", "activity"].map((k, i) =>
+        <span class="seg" id="a-tabs">${["people", "vehicles", "impact", "reasoning", "activity"].map((k, i) =>
           `<button data-v="${k}"${i ? "" : ' class="on"'}>${k[0].toUpperCase() + k.slice(1)}</button>`).join("")}</span></div>
       <div id="a-body"></div>`;
     let tab = "people";
@@ -1425,6 +1745,68 @@
         $("#r-add").onclick = async () => {
           try { await api("/api/registry", { method: "POST", body: { plate: $("#r-plate").value,
                   licence_no: $("#r-lic").value } }); render(); } catch (e) { fail(e); }
+        };
+      } else if (tab === "reasoning") {
+        const r = await api("/api/vlm/settings");
+        const S = r.settings, O = r.options, c = r.cascade;
+        const sel = (k) => `<select data-k="${k}">${O[k].map((o) => `<option${S[k] === o ? " selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
+        const txt = (k) => `<input data-k="${k}" value="${esc(String(S[k]))}">`;
+        const num = (k, step) => `<input data-k="${k}" type="number" step="${step}" min="${O[k].min}" max="${O[k].max}" value="${esc(String(S[k]))}">`;
+        const srv = c.reason.server || {};
+        body.innerHTML = `<div class="card"><div class="card-head"><h2>Reasoning models</h2></div>
+          <div class="small secondary">Every case is first looked at by a small screening model (always on). Only the cases it
+            escalates are given to the large reasoning model, which is started when needed and stopped after it has been idle.</div>
+          <table class="kv">
+            <tr><th>Screening model</th><td>${esc(c.screen.model)} · ${c.screen.up ? "running" : c.screen.installed ? "installed, not running" : "not installed"}</td></tr>
+            <tr><th>Reasoning model</th><td>${esc(c.reason.model)} · ${c.reason.installed ? "installed" : "not installed"} · ${esc(srv.state || "off")}${srv.idle_stop_in !== null && srv.idle_stop_in !== undefined ? ` · stops in ${Math.round(srv.idle_stop_in)} s` : ""}
+              <div class="small muted">needs about ${esc(String(c.reason.need_gb))} GB of free memory; ${esc(String(c.reason.free_gb))} GB free now${srv.error ? " · last problem: " + esc(srv.error) : ""}</div></td></tr>
+            <tr><th>In use</th><td>${c.active ? "two-tier cascade" : "single model (the reasoning model is not available)"}</td></tr></table>
+          <div class="grid2">
+            <div><label class="field">Mode ${sel("vlm_mode")}</label>
+              <label class="field">Escalation policy ${sel("vlm_escalation")}</label>
+              <label class="field">Pre-screen score below which a confident “no” may stop a case ${num("vlm_stop_score", 0.05)}</label>
+              <label class="field">A “no” counts as confident from ${num("vlm_no_confidence", 0.05)}</label>
+              <label class="field">Reasoner source ${sel("vlm_reason_backend")}</label></div>
+            <div><label class="field">Screening model name ${txt("vlm_screen_model")}</label>
+              <label class="field">Screening server ${txt("vlm_screen_url")}</label>
+              <label class="field">Reasoning model name ${txt("vlm_reason_model")}</label>
+              <label class="field">Reasoning server ${txt("vlm_reason_url")}</label>
+              <label class="field">Stop the reasoning model after idle seconds ${num("vlm_reason_idle_sec", 30)}</label></div></div>
+          <div class="small muted">Asymmetric: a confident “no” stops only a case whose motion evidence is weak; anything the screen is unsure about,
+            or any rule-decided case, goes to the reasoner. Balanced: any confident “no” stops. Always: the screen only annotates.</div>
+          <div class="row"><button class="btn primary" id="vlm-save">Save</button><span id="vlm-msg" class="small muted"></span></div></div>`;
+        $("#vlm-save").onclick = async () => {
+          const out = {};
+          $$("[data-k]").forEach((el) => { out[el.dataset.k] = el.type === "number" ? Number(el.value) : el.value; });
+          try { await api("/api/vlm/settings", { method: "PUT", body: { settings: out } }); $("#vlm-msg").textContent = "Saved. Applies to the next Explain."; }
+          catch (e) { fail(e); }
+        };
+      } else if (tab === "impact") {
+        const v = await api("/api/impact/validation");
+        const rho = (x) => (x && x.rho !== null && x.rho !== undefined ? `${x.rho.toFixed(2)}${x.ci95 ? ` (95% ${x.ci95[0].toFixed(2)} to ${x.ci95[1].toFixed(2)})` : ""}` : "not defined yet");
+        const wview = (w) => `<b>${esc(w.label)}</b>${w.calibrated ? [["default", w.default], ...Object.entries(w.by_code)].map(([k, ws]) =>
+          `<div class="small">${esc(k === "default" ? "all other types" : k)}: ${esc(ws.source)}, ${ws.n_events} events — ${Object.entries(ws.values).map(([q, x]) => `${QNAMES[q]} ${x.toFixed(2)}`).join(", ")}</div>`).join("") : ""}`;
+        body.innerHTML = `<div class="card"><div class="card-head"><h2>Impact calibration</h2></div>
+          <div class="small secondary">Each case's impact is five departures from normal traffic, combined with weights. Until enough events exist the weights are equal and the score is only
+            good for ranking. Calibration fits the weights to the vehicle-seconds of delay the events caused, and uses them only if they agree with your controllers' severity ratings better than equal weights do
+            (at least ${v.min_graded} rated cases). New weights apply to cases scored from the next camera start.</div>
+          <table class="kv"><tr><th>Cases scored</th><td>${v.n_scored} of ${v.n_impacts}</td></tr><tr><th>Rated by a controller</th><td>${v.n_graded}</td></tr>
+            <tr><th>Agreement with ratings (Spearman ρ), equal weights</th><td>${rho(v.equal)}</td></tr>
+            <tr><th>…with the weights in use</th><td>${rho(v.in_use)}</td></tr>
+            <tr><th>Weights in use</th><td>${wview(v.weights_in_use)}</td></tr></table>
+          <div class="row"><button class="btn primary" id="cal-run">Run calibration</button></div><div id="cal-out"></div>
+          <div class="small muted">Nothing here has been validated on real traffic yet: the machinery is tested on simulated roads only.</div></div>`;
+        $("#cal-run").onclick = async () => {
+          $("#cal-run").disabled = true;
+          try {
+            const r = await api("/api/impact/calibrate", { method: "POST" });
+            const c = r.comparison;
+            $("#cal-out").innerHTML = `<div class="vlm-box ${r.adopted ? "ok" : "warn"}"><div class="vlm-head"><b>${r.adopted ? "Calibrated weights adopted" : "Equal weights kept"}</b></div>
+              <div class="small">${esc(r.reason)}.</div>
+              <div class="small muted">${r.n_events} events fitted${r.n_skipped ? ` (${r.n_skipped} unusable)` : ""} · ${c.n_graded} rated cases compared · ρ fitted ${rho(c.candidate)} vs equal ${rho(c.equal)}</div>
+              <div class="small">In use now: ${wview(r.weights_in_use)}</div></div>`;
+          } catch (e) { fail(e); }
+          $("#cal-run").disabled = false;
         };
       } else {
         const r = await api("/api/audit?limit=300");
@@ -1558,6 +1940,7 @@
     if (state.meta.lan_url) $("#lan-url").innerHTML = `Phone / LAN: <a href="${esc(state.meta.lan_url)}">${esc(state.meta.lan_url.replace("http://", ""))}</a>`;
     connectEvents();
     refreshPending();
+    refreshDisputes();
     route();
   });
 })();

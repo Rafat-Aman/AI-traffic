@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Camera map - Traffic Surveillance</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/map.css">
+</head>
+<body class="map-page">
+  <header class="map-top">
+    <a class="btn small ghost" href="/">&larr; Dashboard</a>
+    <h1>Camera map</h1>
+    <span class="muted small" id="provider-note"></span>
+    <span class="spacer"></span>
+    <label class="small secondary">Speeds from
+      <select id="window">
+        <option value="all">all recorded data</option>
+        <option value="3600">the last hour</option>
+        <option value="86400">the last 24 hours</option>
+        <option value="604800">the last 7 days</option>
+      </select></label>
+    <label class="small secondary hidden" id="traffic-wrap"><input type="checkbox" id="traffic"> Google live traffic</label>
+    <label class="small secondary hidden" id="net-wrap" title="Optimiser network: camera measurements plus Google travel times where no camera looks. Shown only on a Google map (Google terms)."><input type="checkbox" id="net-overlay"> Optimiser network (with Google times)</label>
+    <a class="btn small ghost" href="/city">3D city</a>
+    <span class="small secondary" id="who"></span>
+  </header>
+  <div class="map-body">
+    <div id="map" role="application" aria-label="Map of cameras"></div>
+    <aside class="map-panel" id="panel">
+      <section class="card"><div class="card-head"><h2>Cameras</h2></div><div id="cam-list" class="cam-list"></div>
+        <p class="muted small" id="edit-hint"></p></section>
+      <section class="card hidden" id="editor"></section>
+      <section class="card hidden" id="pair"></section>
+      <section class="card" id="legend"></section>
+      <section class="card hidden" id="settings"></section>
+    </aside>
+  </div>
+  <div id="toast" class="map-toast hidden" role="status"></div>
+  <script src="/static/map.js"></script>
+</body>
+</html>

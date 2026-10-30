@@ -302,6 +302,17 @@ class SimilarityTests(unittest.TestCase):
         self.assertTrue(np.isnan(similarity(None, v)))
         self.assertTrue(np.isnan(similarity(v, None)))
 
+    def test_the_matcher_sees_an_old_and_a_new_vector_as_a_missing_cue(self):
+        """Tracklets stored before the ReID model hold 576 numbers; a new one holds 2048. The matcher must not
+        score them against each other, so that switching models cannot corrupt a window that spans the change."""
+        from surveillance import reid
+        old = reid.Tracklet(1, 1, "Car", 0.0, 2.0, 8.0, "outgoing")
+        new = reid.Tracklet(2, 2, "Car", 15.0, 8.0, 8.0, "incoming")
+        old.embed, new.embed = self.unit(576), self.unit(2048)
+        self.assertTrue(np.isnan(reid.colour_similarity(old, new)[2]))
+        new.embed = self.unit(576)
+        self.assertTrue(np.isfinite(reid.colour_similarity(old, new)[2]))
+
 
 class CameraBiasTests(unittest.TestCase):
     def cameras(self, seed=0, n=60, d=64, shared=1.5):

@@ -1,6 +1,7 @@
 """Web API + dashboard for the traffic surveillance system."""
 
 import asyncio
+import atexit
 import csv
 from html import escape
 import io
@@ -21,16 +22,23 @@ from fastapi import Cookie, Depends, FastAPI, File, Form, HTTPException, Request
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse, RedirectResponse,
                                Response, StreamingResponse)
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from violations.base import MOTORISED, NON_MOTORISED
 from violations.engine import RULES, ViolationEngine
 from violations.zones import (AREA_TYPES, DEFAULT_SPEED_LIMITS, DIRECTIONS, ROAD_CATEGORIES, RoadZone,
                               camera_config_from_dict)
 
+from . import api_map
+from . import api_optimize
+from . import api_query
+from . import api_storage
 from . import auth as auth_mod
 from . import citation as cit
+from . import disputes as disputes_mod
+from . import impact as impact_mod
 from . import vlm as vlm_mod
+from . import vlm_cascade
 from . import webauth
 from .link import LinkJob, OnlineLinker, SiteRun, run_linking
 from .anpr import find_models
@@ -72,9 +80,31 @@ manager = WorkerManager(store, DATA, notify, linker)
 link_jobs = {}        # "current" -> the running / last LinkJob
 
 
+# What an administrator may change from the dashboard (saved in data/vlm_settings.json), with the type of each.
+VLM_ADMIN_KEYS = {
+    "vlm_mode": ("auto", "cascade", "single"),
+    "vlm_screen_url": str, "vlm_screen_model": str,
+    "vlm_reason_backend": ("auto", "local", "cloud"),
+    "vlm_reason_url": str, "vlm_reason_model": str,
+    "vlm_reason_idle_sec": (30, 7200), "vlm_reason_start_sec": (30, 900), "vlm_reason_timeout_sec": (60, 3600),
+    "vlm_escalation": vlm_cascade.POLICIES,
+    "vlm_stop_score": (0.0, 1.0), "vlm_no_confidence": (0.0, 1.0),
+    "vlm_local_url": str, "vlm_local_model": str,
+}
+
+
+def _vlm_saved():
+    try:
+        saved = json.loads((DATA / "vlm_settings.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in saved.items() if k in VLM_ADMIN_KEYS} if isinstance(saved, dict) else {}
+
+
 def vlm_settings(backend=None):
-    """VLM options: defaults, overridden by the environment, then by one request."""
+    """VLM options: defaults, then the administrator's saved choices, then the environment, then one request."""
     s = dict(vlm_mod.DEFAULTS)
+    s.update(_vlm_saved())
     s["vlm_backend"] = backend or os.environ.get("VLM_BACKEND") or s["vlm_backend"]
     if os.environ.get("VLM_URL"):
         s["vlm_local_url"] = os.environ["VLM_URL"]
@@ -88,7 +118,21 @@ def vlm_done(vid, explanation):
     notify({"type": "explanation", "camera_id": v["camera_id"] if v else None, "violation": v})
 
 
-explainer = vlm_mod.Explainer(DATA, vlm_settings(), vlm_done)
+cascade = vlm_cascade.Cascade(DATA, vlm_settings())
+
+
+def vlm_stage(info):
+    """Progress of one explanation, pushed to every open dashboard (stage events precede the final "explanation")."""
+    v = store.violation(info["violation_id"])
+    notify({"type": "explain_stage", "camera_id": v["camera_id"] if v else None, **info})
+
+
+cascade.on_stage = vlm_stage
+explainer = vlm_mod.Explainer(DATA, vlm_settings(), vlm_done, cascade=cascade)
+atexit.register(lambda: cascade._server and cascade._server.stop())     # never leave an 8B behind
+# Re-checks of drivers' disputes by the reasoning tier: advisory, one at a time, on their own thread.
+dispute_checker = disputes_mod.Checker(lambda: cascade, vlm_settings,
+                                       on_done=lambda did: notify({"type": "dispute", "id": did}))
 
 
 sessions = webauth.Sessions(store)
@@ -113,7 +157,10 @@ async def lifespan(_app):
     (DATA / "videos").mkdir(parents=True, exist_ok=True)
     webauth.ensure_admin(store)
     media_key()
+    dispute_checker.resume(store, DATA)     # any open dispute whose model check was lost to a restart
+    storage.queue.start()           # ingest queue: runs uploaded videos max_parallel at a time
     yield
+    storage.queue.stop()
     await asyncio.to_thread(manager.stop_all)
 
 
@@ -163,6 +210,14 @@ def rule_coverage(cam, z):
     return out
 
 
+def with_impact(v):
+    """A case as staff see it: its stored impact (None until scored) and the priority worked out now from that and
+    the plate's confirmed history. Drivers never get either: the portal builds its answers from a whitelist."""
+    v["impact"] = impact_mod.load_impact(store, v["id"])
+    v["priority"] = impact_mod.priority_for(store, v)
+    return v
+
+
 def camera_view(cam):
     z = store.zones(cam["id"])
     auto = (z or {}).get("config", {}).get("auto") if z else None
@@ -184,7 +239,7 @@ PUBLIC_API = {"/api/login", "/api/login/code", "/api/login/verify", "/api/logout
 # What a driver may reach. Their portal is a different surface from the operator dashboard, not a filtered
 # view of it, so the two never share an endpoint.
 DRIVER_API = {"/api/me", "/api/logout", "/api/portal/violations", "/api/portal/vehicles",
-              "/api/portal/violation"}
+              "/api/portal/violation", "/api/portal/citations"}
 
 
 @app.middleware("http")
@@ -410,6 +465,8 @@ def add_camera(body: CameraIn, user=Depends(require(ADMIN))):
 def upload_camera(name: str = Form(...), location: str = Form(""), start_time: str = Form(""),
                   zone_mode: str = Form("manual"), file: UploadFile = File(...),
                   user=Depends(require(ADMIN))):
+    if storage.storage.ingest_paused():
+        raise HTTPException(507, "Disk nearly full: uploads are paused until space is freed (see Storage)")
     ext = Path(file.filename or "").suffix.lower()
     if ext not in VIDEO_EXTS:
         raise HTTPException(400, f"Not a video file: {file.filename}")
@@ -425,7 +482,7 @@ def upload_camera(name: str = Form(...), location: str = Form(""), start_time: s
                            start.isoformat(timespec="seconds") if start else None, how,
                            {**default_settings("file"), "zone_mode": zone_mode})
     if zone_mode == "auto":
-        manager.start_autozone(cid, apply=True, start_after=True)
+        storage.queue.enqueue(cid, label=name)   # learns zones, then analyses, when a slot is free
     return camera_view(store.camera(cid))
 
 
@@ -438,6 +495,8 @@ def upload_site(name: str = Form(""), location: str = Form(""), zone_mode: str =
     They run one after another rather than together on purpose - the detector already uses every core, and
     two analyses at once would simply halve each other's frame rate - and the batch link runs when the last
     one finishes."""
+    if storage.storage.ingest_paused():
+        raise HTTPException(507, "Disk nearly full: uploads are paused until space is freed (see Storage)")
     if len(files) < 1:
         raise HTTPException(400, "Choose at least one video")
     site = name.strip() or f"Site {datetime.now():%H:%M}"
@@ -513,7 +572,7 @@ def delete_camera(cid: int, user=Depends(require(ADMIN))):
 
 
 @app.post("/api/cameras/{cid}/start")
-def start_camera(cid: int, start_sec: float = 0.0):
+def start_camera(cid: int, start_sec: float = 0.0, user=Depends(require(CONTROLLER))):
     cam_or_404(cid)
     if not store.zones(cid):
         raise HTTPException(400, "Set up the zones first: learn them automatically or draw them in the zone editor")
@@ -530,7 +589,7 @@ class AutoZoneIn(BaseModel):
 
 
 @app.post("/api/cameras/{cid}/auto-zones")
-def start_auto_zones(cid: int, body: AutoZoneIn):
+def start_auto_zones(cid: int, body: AutoZoneIn, user=Depends(require(ADMIN))):
     """Learn the zones from the camera's own traffic (surveillance/autozone.py)."""
     cam_or_404(cid)
     try:
@@ -549,13 +608,13 @@ def auto_zones_status(cid: int):
 
 
 @app.delete("/api/cameras/{cid}/auto-zones")
-def cancel_auto_zones(cid: int):
+def cancel_auto_zones(cid: int, user=Depends(require(ADMIN))):
     manager.stop_autozone(cid)
     return {"ok": True}
 
 
 @app.post("/api/cameras/{cid}/stop")
-def stop_camera(cid: int):
+def stop_camera(cid: int, user=Depends(require(CONTROLLER))):
     manager.stop(cid)
     return {"ok": True}
 
@@ -604,6 +663,27 @@ def camera_frame(cid: int, t: float = 0.0):
         raise HTTPException(400, str(e))
     EDITOR_FRAMES[cid] = frame   # zones saved next are drawn on this view: kept as their reference
     return jpeg(frame, 90)
+
+
+@app.get("/api/cameras/{cid}/traffic")
+def camera_traffic(cid: int):
+    """Live traffic state of each road zone of a running camera: queue, mean speed, occupancy, density and waiting
+    time over the last window of video, and whether a time-of-day baseline exists for the zone yet."""
+    cam_or_404(cid)
+    w = manager.get(cid)
+    col = w.traffic if w is not None and w.is_alive() else None
+    if col is None:
+        why = ("The camera is not running." if w is None or not w.is_alive() else
+               "Traffic measuring is switched off for this camera." if not w.cam["settings"].get("impact", True)
+               else "The camera is still starting.")
+        return {"camera_id": cid, "running": False, "message": why, "zones": {}}
+    zones = col.snapshot()
+    for name, z in zones.items():
+        wall = col.wall_at(z["t"]) if z["t"] is not None else None
+        ref = w.baseline.stats(cid, name, wall) if wall is not None and w.baseline is not None else None
+        z["baseline"] = {"source": "history", "days": ref.detail["days"]} if ref else {"source": "none"}
+    return {"camera_id": cid, "running": True, "window_s": col.window, "video_time": w.status.get("video_time"),
+            "zones": zones}
 
 
 @app.get("/api/cameras/{cid}/stream")
@@ -779,6 +859,7 @@ def list_violations(camera_id: Optional[int] = None, code: Optional[str] = None,
                     order: str = "DESC"):
     rows = store.violations(camera_id, code, status, run_id, limit=min(limit, 500), offset=offset, order=order,
                             plate=plate)
+    rows = [with_impact(v) for v in rows]
     total = store.count(camera_id=camera_id, code=code, status=status, run_id=run_id, plate=plate)
     return {"items": rows, "total": total}
 
@@ -788,7 +869,7 @@ def get_violation(vid: int):
     v = store.violation(vid)
     if not v:
         raise HTTPException(404, "Violation not found")
-    return v
+    return with_impact(v)
 
 
 @app.patch("/api/violations/{vid}")
@@ -805,7 +886,74 @@ def review_violation(vid: int, body: ReviewIn, user=Depends(require(CONTROLLER))
                                  "has to withdraw it before the decision can change.")
     store.review(vid, body.status, body.note, by=user)
     store.audit(user, f"violation.{body.status}", "violation", vid, body.note, user.get("address", ""))
-    return store.violation(vid)
+    return with_impact(store.violation(vid))
+
+
+class SeverityIn(BaseModel):
+    grade: Optional[int] = None     # 1 (minor) .. 5 (severe); null takes the rating back
+
+
+@app.post("/api/violations/{vid}/severity")
+def rate_severity(vid: int, body: SeverityIn, user=Depends(require(CONTROLLER))):
+    """A reviewer's own grade of how badly the event hurt traffic: the independent ordering the impact score is
+    validated against (impact.validate). Only a case that has an impact row can be graded - a grade is only
+    useful next to a score."""
+    if not store.violation(vid):
+        raise HTTPException(404, "Violation not found")
+    if body.grade is not None and not 1 <= body.grade <= 5:
+        raise HTTPException(400, "grade must be 1 (minor) to 5 (severe), or null to take the rating back")
+    if impact_mod.load_impact(store, vid) is None:
+        raise HTTPException(409, "This case has no impact measurement yet (it is scored 30 s of video after the "
+                                 "event), so there is nothing for a rating to be compared with.")
+    impact_mod.set_human_severity(store, vid, body.grade)
+    store.audit(user, "violation.severity", "violation", vid, "cleared" if body.grade is None else f"{body.grade}/5",
+                user.get("address", ""))
+    return with_impact(store.violation(vid))
+
+
+def weights_view(w):
+    d = w.to_dict()
+    d["calibrated"] = w.any_calibrated()
+    d["label"] = "calibrated" if d["calibrated"] else "equal weights (uncalibrated)"
+    return d
+
+
+@app.post("/api/impact/calibrate")
+def calibrate_impact(user=Depends(require(ADMIN))):
+    """Fit the five weights to the excess delay of the events scored so far, and adopt them only if they agree with
+    the reviewers' severity grades better than equal weights do (impact.compare_weights). Otherwise equal weights
+    stay in force - or return, if an earlier fit had been adopted - and the answer says why. New weights apply to
+    cases scored from the next camera start."""
+    fitted = impact_mod.calibrate(impact_mod.calibration_rows(store))
+    verdict = impact_mod.compare_weights(impact_mod.graded_rows(store), fitted)
+    before = impact_mod.load_weights(store)
+    if verdict["adopt"]:
+        impact_mod.save_weights(store, fitted)
+        in_use = fitted
+    elif before.any_calibrated():
+        in_use = impact_mod.Weights()
+        impact_mod.save_weights(store, in_use)
+    else:
+        in_use = before
+    store.audit(user, "impact.calibrate", "impact", "weights",
+                f"{'adopted' if verdict['adopt'] else 'kept equal weights'}: {verdict['reason']}; "
+                f"{fitted.n_rows} events", user.get("address", ""))
+    return {"adopted": verdict["adopt"], "reason": verdict["reason"], "n_events": fitted.n_rows,
+            "n_skipped": fitted.skipped, "min_events": fitted.min_events, "comparison": verdict,
+            "candidate": weights_view(fitted), "weights_in_use": weights_view(in_use)}
+
+
+@app.get("/api/impact/validation")
+def impact_validation(user=Depends(require(ADMIN))):
+    """Rank agreement (Spearman rho, bootstrap interval, permutation p) between the impact score and the reviewers'
+    grades, for equal weights and for the weights in force, each applied to the same graded cases."""
+    w = impact_mod.load_weights(store)
+    graded = impact_mod.graded_rows(store)
+    n = store.q("SELECT COUNT(*) AS n, COALESCE(SUM(score IS NOT NULL), 0) AS scored FROM event_impact")[0]
+    return {"n_impacts": n["n"], "n_scored": n["scored"], "n_graded": len(graded),
+            "min_graded": impact_mod.MIN_GRADED,
+            "equal": impact_mod.validate(*impact_mod.score_graded(graded, impact_mod.Weights())),
+            "in_use": impact_mod.validate(*impact_mod.score_graded(graded, w)), "weights_in_use": weights_view(w)}
 
 
 # ---------------------------------------------------------------- citations (e-prosecution)
@@ -870,6 +1018,8 @@ def withdraw_citation(no: str, body: WithdrawIn, user=Depends(require(ADMIN))):
         row, changed = cit.withdraw(store, no, user, body.reason)
     except cit.Refused as e:
         raise HTTPException(e.status, str(e))
+    if changed:
+        disputes_mod.close_as_moot(store, no, user)     # an open dispute of it has nothing left to decide
     return {**cit.view(row), "changed": changed}
 
 
@@ -886,8 +1036,8 @@ def explain_violation(vid: int, body: ExplainIn = ExplainIn()):
     if not v:
         raise HTTPException(404, "Violation not found")
     settings = vlm_settings(body.backend)
-    if vlm_mod.resolve_backend(settings) is None:
-        raise HTTPException(503, "No reasoning model available. Start it with ./tools/vlm_server.sh, "
+    if not cascade.usable(settings) and vlm_mod.resolve_backend(settings) is None:
+        raise HTTPException(503, "No reasoning model available. Start it with ./tools/vlm_server.sh --tier screen, "
                                  "or set ANTHROPIC_API_KEY for the cloud backend.")
     if v.get("vlm_status") == "pending":
         return {"queued": False, "already": "pending", "violation": v}
@@ -908,7 +1058,48 @@ def explain_violation(vid: int, body: ExplainIn = ExplainIn()):
 @app.get("/api/vlm")
 def vlm_status():
     """Which reasoning backend could answer right now (shown in the dashboard)."""
-    return {**vlm_mod.backend_status(vlm_settings()), "busy": explainer.busy()}
+    s = vlm_settings()
+    return {**vlm_mod.backend_status(s), "busy": explainer.busy(), "cascade": cascade.status(s)}
+
+
+class VlmSettingsIn(BaseModel):
+    settings: dict
+
+
+@app.get("/api/vlm/settings")
+def vlm_settings_get(user=Depends(require(ADMIN))):
+    s = vlm_settings()
+    return {"settings": {k: s[k] for k in VLM_ADMIN_KEYS}, "options": {
+        k: (list(v) if isinstance(v, tuple) and isinstance(v[0], str) else
+            {"min": v[0], "max": v[1]} if isinstance(v, tuple) else "text") for k, v in VLM_ADMIN_KEYS.items()},
+        "cascade": cascade.status(s)}
+
+
+@app.put("/api/vlm/settings")
+def vlm_settings_put(body: VlmSettingsIn, user=Depends(require(ADMIN))):
+    """Validate every value against VLM_ADMIN_KEYS, then save; takes effect on the next Explain request."""
+    clean = _vlm_saved()
+    for k, v in body.settings.items():
+        rule = VLM_ADMIN_KEYS.get(k)
+        if rule is None:
+            raise HTTPException(400, f"Unknown VLM setting {k}")
+        if rule is str:
+            if not isinstance(v, str) or not v.strip() or len(v) > 200:
+                raise HTTPException(400, f"{k} must be a short text")
+            if k.endswith("_url") and not v.startswith(("http://127.0.0.1", "http://localhost")):
+                raise HTTPException(400, f"{k} must point at this machine (http://127.0.0.1:PORT)")
+            clean[k] = v.strip()
+        elif isinstance(rule[0], str):
+            if v not in rule:
+                raise HTTPException(400, f"{k} must be one of {', '.join(rule)}")
+            clean[k] = v
+        else:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not rule[0] <= v <= rule[1]:
+                raise HTTPException(400, f"{k} must be between {rule[0]} and {rule[1]}")
+            clean[k] = v
+    (DATA / "vlm_settings.json").write_text(json.dumps(clean, indent=1))
+    store.audit(user, "vlm.settings", "vlm", "settings", ", ".join(sorted(body.settings)), user.get("address", ""))
+    return vlm_settings_get(user)
 
 
 class LinkIn(BaseModel):
@@ -965,6 +1156,71 @@ def vehicle_journey(gid: int):
     return {"global_id": gid, "passes": rows}
 
 
+# ---------------------------------------------------------------- disputes (staff)
+
+def dispute_or_404(did):
+    d = disputes_mod.dispute(store, did)
+    if not d:
+        raise HTTPException(404, "No such dispute")
+    return d
+
+
+@app.get("/api/disputes")
+def list_disputes(status: str = "open", limit: int = 100, offset: int = 0, user=Depends(require(CONTROLLER))):
+    """The dispute queue, open ones first in the order to read them (those the model thinks the evidence does not
+    support go first, then the rest, oldest first). `open` in the answer is the badge count."""
+    if status not in ("open", "decided", "all"):
+        raise HTTPException(400, "status must be open, decided or all")
+    rows, total = disputes_mod.queue_rows(store, status, min(max(limit, 1), 500), max(offset, 0))
+    return {"items": rows, "total": total, "open": disputes_mod.open_count(store)}
+
+
+@app.get("/api/disputes/{did}")
+def get_dispute(did: int, user=Depends(require(CONTROLLER))):
+    d = dispute_or_404(did)
+    c = store.citation(d["citation_no"])
+    v = store.violation(d["violation_id"])
+    case = None
+    if v:
+        case = {k: v.get(k) for k in ("id", "code", "title", "cls", "status", "plate_text_en", "plate_text", "wall_time",
+                                     "video_time_s", "zone", "kph", "details", "camera_name", "snapshot", "crop",
+                                     "clip", "plate_img", "evidence", "reviewed_by_name", "note")}
+        case["code_claim"] = vlm_mod.RULE_CLAIM.get(case["code"] or "", ("", ""))[0]
+    return {**disputes_mod.staff_view(d), "case": case, "citation": cit.view(c, manifest=False) if c else None,
+            "window_days": disputes_mod.WINDOW_DAYS, "trail": store.audit_trail("dispute", d["id"])}
+
+
+class DecideIn(BaseModel):
+    decision: str = ""
+    reason: str = Field("", max_length=5000)
+
+
+@app.post("/api/disputes/{did}/decide")
+def decide_dispute(did: int, body: DecideIn, user=Depends(require(CONTROLLER))):
+    """UPHOLD the citation or ACCEPT the dispute (which withdraws the citation with reason "dispute accepted: ...").
+    A controller or an administrator may decide; the reason is required and is shown to the driver."""
+    dispute_or_404(did)
+    try:
+        d = disputes_mod.decide(store, did, user, body.decision, body.reason)
+    except cit.Refused as e:
+        raise HTTPException(e.status, str(e))
+    notify({"type": "dispute", "id": did})
+    return disputes_mod.staff_view(d)
+
+
+@app.post("/api/disputes/{did}/recheck")
+def recheck_dispute(did: int, user=Depends(require(CONTROLLER))):
+    """Ask the model to look again (for instance after "model check unavailable"). Advisory, like the first."""
+    d = dispute_or_404(did)
+    if d["status"] != "open":
+        raise HTTPException(409, "This dispute is already closed")
+    store.x("UPDATE disputes SET model_state='pending' WHERE id=?", (did,))
+    store.audit(user, "dispute.model_check", "dispute", did, "re-check requested", user.get("address", ""))
+    if not dispute_checker.submit(store, DATA, did):
+        raise HTTPException(429, "A check of this dispute is already queued, or the queue is full")
+    return {"queued": True}
+
+
 # ---------------------------------------------------------------- the driver's own portal
 
 def _driver(request: Request):
@@ -984,7 +1240,14 @@ def shared_link(path):
     return cit.signed_url(path, media_key()) if path and cit.evidence_file(DATA, path) else None
 
 
-def _for_driver(v):
+def _dispute_facts(c, d):
+    """What a driver may know about disputing one citation: the window, whether they can, and their dispute."""
+    ok, why, until = disputes_mod.eligibility(c, d)
+    return {"window_days": disputes_mod.WINDOW_DAYS, "until": until, "can_dispute": ok,
+            "cannot_reason": "" if ok else why, "dispute": disputes_mod.driver_view(d)}
+
+
+def _for_driver(v, dispute=None):
     """A case as its registered keeper may see it: the evidence, and nothing about anyone else.
 
     Internal review material is stripped - the reviewer's name, the operator's note, the camera's
@@ -1007,23 +1270,26 @@ def _for_driver(v):
                         "url": url} for e, url in photos if url]
     out["citation"] = None if not v.get("citation_no") else {
         "number": v["citation_no"], "status": v.get("citation_status"), "issued_at": v.get("citation_issued_at"),
-        "fine_bdt": v.get("citation_fine_bdt"), "fine_text": cit.fine_text(v.get("citation_fine_bdt"))}
+        "fine_bdt": v.get("citation_fine_bdt"), "fine_text": cit.fine_text(v.get("citation_fine_bdt")),
+        **_dispute_facts({"issued_at": v.get("citation_issued_at") or "", "status": v.get("citation_status")},
+                         dispute)}
     return out
 
 
 @app.get("/api/portal/violations")
 def portal_violations(request: Request, limit: int = 50, offset: int = 0):
-    """Confirmed cases against vehicles registered to the signed-in driver.
+    """Cases against the signed-in driver's verified vehicles for which a citation has been issued to them.
 
-    Only confirmed ones, and only verified vehicles: a case still in the review queue has not been decided
-    by anybody yet, and showing it as though it had would be telling someone they are liable for something
-    nobody has looked at."""
+    Only cited cases (team decision 2026-10-30): a case that is confirmed but not cited has not become a
+    liability for anyone yet, and one still in the review queue has not been decided at all. A withdrawn citation
+    stays in the list, marked withdrawn, so the driver sees the outcome."""
     u = _driver(request)
     plates = _my_plate_keys(u["user_id"])
     rows, total = store.violations_for_plates(plates, limit=min(limit, 200), offset=offset)
-    return {"items": [_for_driver(r) for r in rows], "total": total,
+    found = disputes_mod.disputes_for_citations(store, [r["citation_no"] for r in rows])
+    return {"items": [_for_driver(r, found.get(r["citation_no"])) for r in rows], "total": total,
             "vehicles": store.vehicles_of(u["user_id"]),
-            "note": ("These are violations recorded against vehicles registered to you. The system "
+            "note": ("These are citations issued against vehicles registered to you. The system "
                      "identifies vehicles by their number plate, not drivers, so a case shows the vehicle "
                      "that was involved rather than who was at the wheel.")}
 
@@ -1033,15 +1299,53 @@ def portal_violation(vid: int, request: Request):
     u = _driver(request)
     plates = set(_my_plate_keys(u["user_id"]))
     v = store.violation(vid)
-    # An advisory case (speed) is answered exactly like one that does not exist: the list already leaves it out,
-    # and a driver who guesses its number must not be able to tell it is there.
-    if not v or v["status"] != "confirmed" or cit.is_advisory(v["code"]):
+    # An uncited case, and an advisory one (speed), are answered exactly like one that does not exist: the list
+    # already leaves them out, and a driver who guesses a number must not be able to tell it is there.
+    if not v or not v.get("citation_no") or cit.is_advisory(v["code"]):
         raise HTTPException(404, "No such case")
     if auth_mod.normalise_plate(v.get("plate_text_en") or "") not in plates:
         store.audit(u, "portal.denied", "violation", vid, "case is not against a registered vehicle",
                     u.get("address", ""))
         raise HTTPException(404, "No such case")
-    return _for_driver(v)
+    return _for_driver(v, disputes_mod.dispute_for_citation(store, v["citation_no"]))
+
+
+def _my_citation(no, u):
+    """The citation if it is on one of this driver's verified plates, else 404 - the same answer as for a number
+    that does not exist, so another driver's citation cannot be told apart from none."""
+    c = store.citation(no) if cit.NUMBER_RE.match(no or "") else None
+    mine = set(_my_plate_keys(u["user_id"]))
+    if not c or disputes_mod.owner_plate_key(c, store.violation(c["violation_id"])) not in mine:
+        if c:
+            store.audit(u, "portal.denied", "citation", no, "citation is not the driver's", u.get("address", ""))
+        raise HTTPException(404, "No such citation")
+    return c
+
+
+class DisputeIn(BaseModel):
+    statement: str = Field("", max_length=20000)
+
+
+@app.get("/api/portal/citations/{no}/dispute")
+def portal_dispute(no: str, request: Request):
+    """The window, whether this citation can still be disputed, and the driver's dispute if they filed one."""
+    u = _driver(request)
+    c = _my_citation(no, u)
+    return _dispute_facts(c, disputes_mod.dispute_for_citation(store, no))
+
+
+@app.post("/api/portal/citations/{no}/dispute")
+def portal_file_dispute(no: str, body: DisputeIn, request: Request):
+    """Dispute an issued citation: statement of 20-2000 characters, within the window, one per citation. The
+    model re-check starts in the background; a human decides."""
+    u = _driver(request)
+    try:
+        d = disputes_mod.file(store, no, u, body.statement, _my_plate_keys(u["user_id"]))
+    except cit.Refused as e:
+        raise HTTPException(e.status, str(e))
+    dispute_checker.submit(store, DATA, d["id"])
+    notify({"type": "dispute", "id": d["id"]})
+    return disputes_mod.driver_view(d)
 
 
 class PlateClaim(BaseModel):
@@ -1291,10 +1595,15 @@ NOTICE_HTML_FIELDS = ("details", "extra", "sealed")
 
 
 @app.get("/notice/{vid}", response_class=HTMLResponse)
-def notice(vid: int, user=Depends(require(CONTROLLER))):
+def notice(vid: int, user=Depends(current_user)):
     """Printable violation notice for a case (browser: Print -> Save as PDF), with its citation if one was issued.
 
-    Refused for an advisory code: speed is detected and shown to staff but never printed as a notice."""
+    Refused for an advisory code: speed is detected and shown to staff but never printed as a notice.
+    A page, not an API: anonymous visitors go to /login and drivers to their own /portal."""
+    if user is None:
+        return RedirectResponse("/login", status_code=302)
+    if user["role"] == DRIVER:
+        return RedirectResponse("/portal", status_code=302)
     v = store.violation(vid)
     if not v:
         raise HTTPException(404, "Violation not found")
@@ -1408,6 +1717,27 @@ def portal_page(request: Request):
     if user["role"] != DRIVER:
         return RedirectResponse("/", status_code=302)
     return FileResponse(WEB / "portal.html", headers={"Cache-Control": "no-store"})
+
+
+# Camera map: placement + heading, section speeds, Google keys (feature module; owns its own tables and /map page)
+app.include_router(api_map.make_router(store, current_user, require, CONTROLLER, ADMIN, status_fn=manager.status))
+# 3D city + optimiser: network editor, live camera-measured state, signal recommendation, simulation, routing.
+# Google travel times only on request from the Google-provider map, never on the MapLibre view (Google terms).
+app.include_router(api_optimize.make_router(
+    store, current_user, require, CONTROLLER, ADMIN,
+    snapshots_fn=lambda: api_optimize.snapshots_from_workers(manager.workers),
+    status_fn=manager.status))
+# Query panel: persistent segment index (built from stored analytics, never re-detects), Stage A grounding,
+# Stage B descriptive answers from the index or VLM reasoning over a few retrieved segments' frames.
+app.include_router(api_query.make_router(store, current_user, require, CONTROLLER, ADMIN, data_dir=DATA,
+                                         backend_fn=lambda: vlm_mod.resolve_backend(vlm_settings())))
+# Storage: retention (dry run, admin applies), disk monitor, and the ingest queue that uploads go through.
+storage = api_storage.build(store, DATA, current_user, require, CONTROLLER, ADMIN, manager, max_parallel=1)
+app.include_router(storage.router)
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon_ico():
+    return RedirectResponse("/static/favicon.svg", status_code=301)
 
 
 app.mount("/static", StaticFiles(directory=str(WEB)), name="static")

@@ -1,0 +1,209 @@
+{
+ "item": "x6_crosscamera",
+ "title": "X6 Cross-camera association",
+ "provenance": {
+  "command": "tools/evaluate.py x6 --run-reid --reid-seconds 25",
+  "inputs": [
+   {
+    "path": "/home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/research/cityflow/README.md",
+    "bytes": 13303,
+    "sha256_first_1MiB": "1997bb201f52b338"
+   },
+   {
+    "path": "/home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/tools/reid_eval.py",
+    "bytes": 12528,
+    "sha256_first_1MiB": "b6f8ee40da35a03d"
+   }
+  ],
+  "git_commit": "80563e64840e02a82e8033035788c4fb0b1d9904 (+uncommitted changes)",
+  "timestamp_utc": "2026-10-29T19:15:31+00:00",
+  "python": "3.10.12",
+  "machine": "x86_64"
+ },
+ "tables": [
+  {
+   "title": "CityFlowV2 (external benchmark; US roads, NOT Dhaka)",
+   "columns": [
+    "Quantity",
+    "Value",
+    "Status"
+   ],
+   "rows": [
+    [
+     "ReID retrieval, 145 held-out S02 vehicles, cross-camera (ResNet50-IBN-a @320)",
+     "mAP 0.427, rank-1 0.560",
+     "external"
+    ],
+    [
+     "MTMC S02, default settings",
+     "IDF1 40.54 (IDP 34.91, IDR 48.34)",
+     "external"
+    ],
+    [
+     "MTMC S02, tuned on S02 itself (optimistic)",
+     "IDF1 47.84",
+     "external"
+    ],
+    [
+     "MTMC S02, 2-fold tuned/scored on halves",
+     "IDF1 46.50",
+     "external"
+    ]
+   ],
+   "source": "copied from research/cityflow/README.md section 'What it scored' (all numbers there were printed by the team's notebook; not re-run here). Verified present in README by string match: {'mAP **0.427**': True, 'rank-1 **0.560**': True, 'IDF1 **46.50**': True, 'IDF1 **40.54**': True}"
+  },
+  {
+   "title": "Within-camera appearance separation, fresh run (first 25 s of the clip; first block = vs every vehicle, second = same class only)",
+   "columns": [
+    "Embedder run",
+    "Cue",
+    "Separation",
+    "Rank-1",
+    "Status"
+   ],
+   "rows": [
+    [
+     "reid",
+     "colour histogram",
+     "2.22",
+     "66.7%",
+     "measured on Dhaka"
+    ],
+    [
+     "reid",
+     "CIELAB colour",
+     "2.18",
+     "53.8%",
+     "measured on Dhaka"
+    ],
+    [
+     "reid",
+     "appearance (reid)",
+     "4.37",
+     "97.4%",
+     "measured on Dhaka"
+    ],
+    [
+     "reid",
+     "colour histogram",
+     "1.78",
+     "71.8%",
+     "measured on Dhaka"
+    ],
+    [
+     "reid",
+     "CIELAB colour",
+     "2.07",
+     "59.0%",
+     "measured on Dhaka"
+    ],
+    [
+     "reid",
+     "appearance (reid)",
+     "3.51",
+     "97.4%",
+     "measured on Dhaka"
+    ],
+    [
+     "mobilenet",
+     "colour histogram",
+     "2.22",
+     "66.7%",
+     "measured on Dhaka"
+    ],
+    [
+     "mobilenet",
+     "CIELAB colour",
+     "2.18",
+     "53.8%",
+     "measured on Dhaka"
+    ],
+    [
+     "mobilenet",
+     "appearance (mobilenet)",
+     "2.31",
+     "69.2%",
+     "measured on Dhaka"
+    ],
+    [
+     "mobilenet",
+     "colour histogram",
+     "1.78",
+     "71.8%",
+     "measured on Dhaka"
+    ],
+    [
+     "mobilenet",
+     "CIELAB colour",
+     "2.07",
+     "59.0%",
+     "measured on Dhaka"
+    ],
+    [
+     "mobilenet",
+     "appearance (mobilenet)",
+     "1.70",
+     "74.4%",
+     "measured on Dhaka"
+    ]
+   ],
+   "source": "`/home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/.venv/bin/python tools/reid_eval.py /home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/data/videos/20261025_092449_side1_1.mp4 --seconds 25.0 --embedder reid` (962.8 s); `/home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/.venv/bin/python tools/reid_eval.py /home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/data/videos/20261025_092449_side1_1.mp4 --seconds 25.0 --embedder mobilenet` (248.7 s). Early vs late crops of the SAME camera: this under-states cross-camera difficulty"
+  },
+  {
+   "title": "Within-camera appearance cues on this project's footage (copied)",
+   "columns": [
+    "Cue (same class only)",
+    "Separation / rank-1",
+    "Status"
+   ],
+   "rows": [
+    [
+     "Colour histogram",
+     "1.79 / 64.5%",
+     "measured on Dhaka"
+    ],
+    [
+     "CIELAB colour",
+     "1.79 / 43.5%",
+     "measured on Dhaka"
+    ],
+    [
+     "MobileNetV3-Small (ImageNet)",
+     "1.76 / 75.8%",
+     "measured on Dhaka"
+    ],
+    [
+     "ReID network (CityFlow)",
+     "3.35 / 98.4%",
+     "measured on Dhaka"
+    ]
+   ],
+   "source": "copied from research/cityflow/README.md 'Measured on this project's footage' (tools/reid_eval.py on 50 s of data/videos/20261025_092449_side1_1.mp4, 62 vehicles); one camera, early-vs-late halves of the same tracks"
+  }
+ ],
+ "needs": [
+  {
+   "what": "Cross-camera pair precision/recall and MTMC IDF1 on Dhaka",
+   "status": "not measured - needs footage from >=2 cameras with an overlapping set of vehicles, and a hand-made table mapping (camera, local track id) -> global vehicle id for >=40 vehicles seen on both cameras (docs/EVALUATION.md section 6). The footbridge labels named in SUPERVISION X6 are not in the repo. Metrics are implemented and tested (evaluation/retrieval.py: pair_precision_recall, mtmc_idf1)"
+  }
+ ],
+ "notes": [],
+ "raw": {
+  "reid_eval": {
+   "reid": {
+    "cmd": "/home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/.venv/bin/python tools/reid_eval.py /home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/data/videos/20261025_092449_side1_1.mp4 --seconds 25.0 --embedder reid",
+    "returncode": 0,
+    "seconds": 962.8,
+    "stdout": "Appearance model: reid (2048 numbers, reid:reid_resnet50_ibn_a_320_syn_exclS02, input 320 px, mirror averaging off); crops at full size\nTracking 25s of 20261025_092449_side1_1.mp4 ...\n39 vehicles with at least 6 clean crops\n\ncomparing 39 vehicles, each against every other\n\n  colour histogram       same +0.931  different +0.605  separation  2.22  rank-1 66.7%   useful\n  CIELAB colour          same -0.641  different -3.207  separation  2.18  rank-1 53.8%   useful\n  appearance (reid)      same +0.804  different +0.250  separation  4.37  rank-1 97.4%   useful\n\nAgainst vehicles of the same class only - the matcher never links across classes:\n  colour histogram       same +0.931  different +0.748  separation  1.78  rank-1 71.8%   useful\n  CIELAB colour          same -0.641  different -2.369  separation  2.07  rank-1 59.0%   useful\n  appearance (reid)      same +0.804  different +0.362  separation  3.51  rank-1 97.4%   useful\n\nAppearance vector by class (same-class rivals; classes with fewer than 6 vehicles are too few to read):\n  Car (20) appearance              same +0.773  different +0.336  separation  3.61  rank-1 100.0%   useful\n  Car (20) colour histogram        same +0.921  different +0.768  separation  1.67  rank-1 50.0%   useful\n  Motorbike (9) appearance         same +0.843  different +0.451  separation  4.00  rank-1 88.9%   useful\n  Motorbike (9) colour histogram   same +0.943  different +0.621  separation  2.73  rank-1 100.0%   useful\n  MPV            4 vehicles  too few\n  CNG            4 vehicles  too few\n  Bus            2 vehicles  too few\n\n  two random vehicles share a class 32% of the time - that is how much work class alone does\n  cost: 5476 ms (best 4859) to embed one vehicle of 10 crops with reid on this CPU, load average 23.1\n",
+    "stderr": ""
+   },
+   "mobilenet": {
+    "cmd": "/home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/.venv/bin/python tools/reid_eval.py /home/rafat/Storage/STUDY/spring26/spring26/499B/AI-Traffic-Surveillance-System-for-Dhaka-City/data/videos/20261025_092449_side1_1.mp4 --seconds 25.0 --embedder mobilenet",
+    "returncode": 0,
+    "seconds": 248.7,
+    "stdout": "Appearance model: mobilenet (576 numbers, mobilenet:v3-small-imagenet1k); crops at full size\nTracking 25s of 20261025_092449_side1_1.mp4 ...\n39 vehicles with at least 6 clean crops\n\ncomparing 39 vehicles, each against every other\n\n  colour histogram       same +0.931  different +0.605  separation  2.22  rank-1 66.7%   useful\n  CIELAB colour          same -0.641  different -3.207  separation  2.18  rank-1 53.8%   useful\n  appearance (mobilenet) same +0.871  different +0.544  separation  2.31  rank-1 69.2%   useful\n\nAgainst vehicles of the same class only - the matcher never links across classes:\n  colour histogram       same +0.931  different +0.748  separation  1.78  rank-1 71.8%   useful\n  CIELAB colour          same -0.641  different -2.369  separation  2.07  rank-1 59.0%   useful\n  appearance (mobilenet) same +0.871  different +0.692  separation  1.70  rank-1 74.4%   useful\n\nAppearance vector by class (same-class rivals; classes with fewer than 6 vehicles are too few to read):\n  Car (20) appearance              same +0.848  different +0.722  separation  1.43  rank-1 60.0%   useful\n  Car (20) colour histogram        same +0.921  different +0.768  separation  1.67  rank-1 50.0%   useful\n  Motorbike (9) appearance         same +0.883  different +0.543  separation  3.13  rank-1 88.9%   useful\n  Motorbike (9) colour histogram   same +0.943  different +0.621  separation  2.73  rank-1 100.0%   useful\n  MPV            4 vehicles  too few\n  CNG            4 vehicles  too few\n  Bus            2 vehicles  too few\n\n  two random vehicles share a class 32% of the time - that is how much work class alone does\n  cost: 32 ms (best 16) to embed one vehicle of 10 crops with mobilenet on this CPU, load average 17.7\n",
+    "stderr": ""
+   }
+  }
+ }
+}
