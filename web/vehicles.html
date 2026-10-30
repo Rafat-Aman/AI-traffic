@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Passed vehicles - Traffic Surveillance</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/vehicles.css">
+</head>
+<body class="vehicles-page">
+  <header class="v-top">
+    <a class="btn small ghost" href="/">&larr; Dashboard</a>
+    <h1>Passed vehicles</h1>
+    <span class="spacer"></span>
+    <a class="btn small ghost" href="/query">Ask</a>
+    <a class="btn small ghost" href="/storage">Storage</a>
+  </header>
+  <main class="v-main">
+    <section class="card" aria-labelledby="find-h">
+      <h2 id="find-h" class="sr">Search</h2>
+      <div class="v-pickers">
+        <label>Camera <select id="camera"><option value="">All cameras</option></select></label>
+        <label>Run <select id="run" disabled><option value="">Newest</option></select></label>
+        <label>Plate status <select id="status"><option value="">Any</option></select></label>
+      </div>
+      <form id="search" class="v-search" autocomplete="off">
+        <input id="q" type="search" maxlength="120" placeholder="plate, class, colour, #track or g12 for a global id" aria-label="Search">
+        <button class="btn primary" type="submit">List</button>
+        <button class="btn" id="find" type="button" title="Search every camera and say where each vehicle was last seen">Find anywhere</button>
+        <a class="btn" id="csv" href="#" download>CSV</a>
+      </form>
+      <p class="muted small" id="note">Loading&hellip;</p>
+      <div class="v-chips" id="status-chips" aria-label="Plate results in this selection"></div>
+    </section>
+
+    <section class="card hidden" id="found-card" aria-live="polite">
+      <div class="card-head"><h2>Found across the network</h2><span class="spacer"></span>
+        <button class="btn small ghost" id="found-close" type="button">Close</button></div>
+      <div id="found"></div>
+    </section>
+
+    <section class="v-cols">
+      <div class="card flush v-list-card">
+        <table class="list v-table" id="table" aria-label="Passed vehicles">
+          <thead><tr><th>Photo</th><th>Vehicle</th><th>Class</th><th>Colour</th><th>Plate</th><th>First seen</th><th>Last seen</th><th>Global id</th></tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <div class="v-pager"><button class="btn small" id="prev" type="button">Previous</button>
+          <span class="muted small" id="page-note"></span>
+          <button class="btn small" id="next" type="button">Next</button></div>
+      </div>
+      <aside class="card hidden" id="detail" aria-live="polite"></aside>
+    </section>
+  </main>
+  <div id="toast" class="v-toast hidden" role="status"></div>
+  <script src="/static/vehicles.js"></script>
+</body>
+</html>

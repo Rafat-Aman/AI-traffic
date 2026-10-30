@@ -109,7 +109,7 @@ most of `violations/` are byte-identical; the differences below are what each si
 - Their test clip uses test thresholds and test zones (V3 after 7 s, a lane line that is not painted on the road),
   so its case counts are not real-world rates. Their README says so.
 
-## Worth porting (not started; for the team to accept or decline)
+## Worth porting — all six ported on 2026-10-30 (see SUPERVISION.md WP15–WP19)
 
 | # | Port | Effort | Why |
 |---|---|---|---|

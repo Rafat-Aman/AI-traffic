@@ -285,6 +285,8 @@ def verify_summary(result):
 
 # ------------------------------------------------------------------ eligibility and the operations on the store
 
+on_issued = []      # callbacks f(citation row, case) run after a NEW citation is issued (the notice email hooks in here)
+
 _issue_lock = threading.Lock()     # one citation is issued at a time: hashing and transcoding are slow, and two
                                    # requests for the same case must not both write the same delivery file
 
@@ -376,6 +378,11 @@ def _issue(store, vid, user, data_dir, delivery, schedule, advisory, issued_at, 
         store.audit(user, "citation.issue", "citation", row["citation_no"],
                     f"case TV-{vid} {v['code']} plate {v.get('plate_text_en') or '-'}; bundle {bundle}; "
                     f"fine {fine_text(fine)}", user.get("address", ""))
+        for callback in on_issued:
+            try:
+                callback(row, v)
+            except Exception as e:      # a notice that cannot be sent never undoes a citation that is issued
+                print(f"[citation] on_issued callback failed: {e}")
     return row, created, warnings
 
 

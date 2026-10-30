@@ -376,7 +376,7 @@ class Cascade:
         self._hist = {}
 
     # Typical seconds per step on the CPU-only dev machine, used until a step has been timed once.
-    DEFAULT_ETA = {"screen": 15, "load_reasoner": 90, "reason": 150}
+    DEFAULT_ETA = {"screen": 15, "visual_check": 8, "load_reasoner": 90, "reason": 150}
 
     def eta(self, step):
         h = self._hist.get(step) or []
@@ -501,7 +501,16 @@ class Cascade:
                                  f"reasoned verdict.", st["model"], st["backend"])
 
         self._stage(on_stage, violation, "escalated", "Escalated to the large reasoning model: " + why, reason=why)
-        return self._reason(violation, images, stages, st, why, s, t_all)
+        check = None
+        if (violation.get("code") or "").upper() in vlm.VISUAL_CHECKS:
+            self._stage(on_stage, violation, "visual_check", "Asking the small model one closed question about the "
+                        "close-up", step="visual_check")
+            check = vlm.visual_check(self.screen_backend(s), violation, images)
+            stages.append({"stage": "visual_check", "answer": check["answer"] if check else "unavailable",
+                           "seconds": check["seconds"] if check else 0.0})
+            if check:
+                self._timed("visual_check", check["seconds"])
+        return self._reason(violation, images, stages, st, why, s, t_all, check)
 
     def _run_screen(self, violation, images, pre, s):
         backend = self.screen_backend(s)
@@ -526,7 +535,7 @@ class Cascade:
         st["seconds"] = round(time.perf_counter() - t0, 1)
         return None, st
 
-    def _reason(self, violation, images, stages, screen_stage, why, s, t_all):
+    def _reason(self, violation, images, stages, screen_stage, why, s, t_all, check=None):
         rs = {"stage": "reason", "model": "", "backend": "", "verdict": "", "seconds": 0.0, "load_seconds": 0.0,
               "started_server": False, "error": ""}
         stages.append(rs)
@@ -561,7 +570,7 @@ class Cascade:
                     model=backend.model)
         t0 = time.perf_counter()
         try:
-            reply = backend.ask(vlm.SYSTEM, vlm.build_prompt(violation, images), images)
+            reply = backend.ask(vlm.SYSTEM, vlm.build_prompt(violation, images, check), images)
         except urllib.error.HTTPError as e:
             rs["error"] = f"{backend.name} backend returned HTTP {e.code}: {e.read()[:200].decode(errors='replace')}"
         except Exception as e:
@@ -574,7 +583,7 @@ class Cascade:
             return self._unavailable(stages, screen_stage, why, rs, len(images), t_all)
         self._timed("reason", rs["seconds"])
         ex = vlm.to_explanation(vlm.parse_reply(reply), backend.model, backend.name, rs["seconds"], len(images),
-                                violation.get("cls") or "")
+                                vlm.guard_subject(violation), (violation.get("code") or ""))
         if not ex.ok:                                   # unusable reply: the screen result stays, nothing invented
             rs["error"] = ex.error
             return self._unavailable(stages, screen_stage, why, rs, len(images), t_all,

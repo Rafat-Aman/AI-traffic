@@ -209,6 +209,8 @@ DEFAULT_SETTINGS = {
     "realtime": False,            # files: play at real speed, like a live camera
     "auto_roi": True,
     "anpr": True,                 # read number plates of violating vehicles (needs the plate models)
+    "passed": True,               # record every vehicle that passes (class, colour, photo; PASSED_RETENTION_DAYS)
+    "anpr_all": False,            # also read every passing vehicle's plate: ~0.5 s CPU each, up to 9% fewer fps
     "reid": True,                 # summarise each vehicle's pass so it can be linked across cameras
     "impact": True,               # measure queue / speed / occupancy per road zone and score each violation's effect
     "helmet": True,               # V6 no-helmet detection (needs the helmet model)
@@ -502,12 +504,20 @@ class Store:
 
     # ------------------------------------------------------------ tracklets (cross-camera Re-ID)
     def add_tracklet(self, camera_id, run_id, t):
-        """Store one vehicle's pass through one camera. `t` is a surveillance.reid.Tracklet."""
+        """Store one vehicle's pass through one camera. `t` is a surveillance.reid.Tracklet.
+
+        When the camera has gates drawn (surveillance.topology), the gate its entry and exit points fall in is
+        worked out here and written on both the row and `t`, so the worker needs no knowledge of gates."""
+        from . import topology
+        topology.ensure_schema(self)
+        topology.assign_gates(self, camera_id, t)
+        xy_in, xy_out = getattr(t, "entry_xy", None), getattr(t, "exit_xy", None)
         return self.x(
             "INSERT INTO tracklets (camera_id, run_id, track_id, cls, class_conf, zone, t_cross, video_t,"
             " lateral, speed, width, direction, extrap_m, hist, lab, embed, embed_model,"
-            " embed_reid, embed_reid_model, global_id, link_source, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " embed_reid, embed_reid_model, global_id, link_source, created_at,"
+            " entry_x, entry_y, exit_x, exit_y, t_enter, t_exit, entry_gate, exit_gate)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (camera_id, run_id, t.track_id, t.cls, getattr(t, "class_conf", None), t.zone, t.t_cross,
              getattr(t, "video_t", None), t.lateral, t.speed, t.width, t.direction, t.extrap_m,
              None if t.hist is None else t.hist.astype("float32").tobytes(),
@@ -516,7 +526,11 @@ class Store:
              getattr(t, "embed_model", None) if getattr(t, "embed", None) is not None else None,
              None if getattr(t, "embed_reid", None) is None else t.embed_reid.astype("float32").tobytes(),
              getattr(t, "embed_reid_model", None) if getattr(t, "embed_reid", None) is not None else None,
-             t.global_id, getattr(t, "link_source", ""), now()))
+             t.global_id, getattr(t, "link_source", ""), now(),
+             None if xy_in is None else float(xy_in[0]), None if xy_in is None else float(xy_in[1]),
+             None if xy_out is None else float(xy_out[0]), None if xy_out is None else float(xy_out[1]),
+             getattr(t, "t_enter", None), getattr(t, "t_exit", None),
+             getattr(t, "entry_gate", None), getattr(t, "exit_gate", None)))
 
     def set_tracklet_reid(self, tracklet_id, vec, model):
         """Attach the ReID vector (made after the row was written) to a stored tracklet."""

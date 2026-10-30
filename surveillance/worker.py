@@ -18,12 +18,18 @@ from .camera_motion import load_reference
 from .clips import ClipRecorder
 from .detector import MODELS_DIR, Detector, HelmetDetector, find_helmet_model
 from .impact import ImpactTracker, load_impact, load_weights, priority_for, save_impact
+from .passed import PassedPlateWorker, PassedRecorder
 from .pipeline import Pipeline
 from .reid import TrackletCollector, reid_worker
 from .sources import FileSource, LiveSource
 from .traffic_state import Baseline, TrafficStateCollector
 
 JPEG_QUALITY = 80
+# Reading the plate of EVERY passing vehicle is off unless a camera asks for it (setting "anpr_all"). Measured on
+# the 12-thread CPU dev machine (docs/VEHICLES.md): ~58 ms per crop with no plate, so ~0.5 s of reader time per
+# vehicle, and a reader running flat out slowed the detector by 9%. Passing drivers broke no rule, so the default
+# is the cheaper and more private one.
+ANPR_ALL_DEFAULT = False
 
 
 class CameraWorker(threading.Thread):
@@ -42,7 +48,9 @@ class CameraWorker(threading.Thread):
                        "inactive": {}, "speed_paused": False, "backend": "", "video_time": 0.0}
         self.pipeline = None
         self.plates = None
+        self.passed = None     # PassedRecorder: a record for every vehicle that crosses, plate read only if anpr_all
         self.tracklets = None
+        self._viol_tid = {}    # violation id -> tracker id, so a violator's plate can also reach its passed record
         self.run_id = None
         self.out_dir = None
         self._index_last = time.time()      # first live build after LIVE_INDEX_S
@@ -76,9 +84,14 @@ class CameraWorker(threading.Thread):
             helmet_path = s.get("helmet_model") or (find_helmet_model() if s.get("helmet", True) else None)
             helmet = HelmetDetector(helmet_path) if helmet_path else None
             plate_model, char_model = find_models(MODELS_DIR)
-            if s.get("anpr", True) and plate_model and char_model:
+            reader = None
+            if (s.get("anpr", True) or s.get("anpr_all", ANPR_ALL_DEFAULT)) and plate_model and char_model:
                 self._set(message="Loading number-plate models...")
-                self.plates = PlateCollector(PlateReader(plate_model, char_model), self._plate_result)
+                reader = PlateReader(plate_model, char_model)
+            if reader is not None and s.get("anpr", True):
+                self.plates = PlateCollector(reader, self._plate_result)
+            if s.get("passed", True):
+                self._start_passed(reader if s.get("anpr_all", ANPR_ALL_DEFAULT) else None)
             start_time = None
             if cam["kind"] == "file" and cam.get("start_time"):
                 start_time = datetime.fromisoformat(cam["start_time"])
@@ -90,14 +103,18 @@ class CameraWorker(threading.Thread):
                                      auto_roi=s["auto_roi"], plates=self.plates,
                                      reference=load_reference(self.data_dir, cam["id"], zones["version"]),
                                      stabilize=s.get("stabilize", True), tracklets=self.tracklets,
-                                     traffic=self.traffic)
+                                     traffic=self.traffic, passed=self.passed)
             clips = ClipRecorder(s["clip_pre_sec"], s["clip_post_sec"])
             run_id = self.store.start_run(cam["id"], zones["id"], "live" if source.is_live else
                                           ("realtime" if s["realtime"] else "full"))
             self.run_id = run_id
+            if self.passed is not None:
+                self.passed.run_id = run_id
             out_dir = self.out_dir = self.data_dir / "evidence" / f"cam{cam['id']}" / f"run{run_id}"
             self._set(state="running", message="", backend=f"{detector.backend.upper()} {detector.imgsz}px",
                       features={"anpr": self.plates is not None, "helmet": helmet is not None,
+                                "passed": self.passed is not None,
+                                "anpr_all": self.passed is not None and self.passed.worker is not None,
                                 "impact": self.impacts is not None},
                       inactive=self.pipeline.engine.inactive, run_id=run_id, roi=self.pipeline.roi,
                       frame_size=frame_size)
@@ -138,7 +155,7 @@ class CameraWorker(threading.Thread):
                           frames=frames, tracks=res.tracks, video_time=round(t, 1),
                           speed_paused=self.pipeline.speed_paused, view=self.pipeline.view_status(),
                           state="running", message="", reconnects=getattr(source, "reconnects", 0),
-                          **self._embed_status())
+                          **self._embed_status(), **self._passed_status())
                 self._index_live(source.is_live)
                 if time.time() - last_learn > 5:
                     self._save_learning()
@@ -160,6 +177,7 @@ class CameraWorker(threading.Thread):
                 self.plates.flush()
                 self._set(message="Finished: full video analysed" if self.status["state"] == "done" else
                           self.status["message"] if self.status["state"] == "error" else "Stopped")
+            self._finish_passed()
             if clips:
                 clips.close()
             if self.pipeline:
@@ -231,6 +249,7 @@ class CameraWorker(threading.Thread):
                                        rel(snap), rel(crop), rel(clip), "pending" if self.plates else "", extra)
         if self.plates:
             self.plates.request(ev.obs.tid, vid, t)
+            self._viol_tid[vid] = ev.obs.tid
         self._schedule_impact(vid, ev)
         self.status["violations"] += 1
         self.notify({"type": "violation", "camera_id": self.cam["id"], "violation": self.store.violation(vid)})
@@ -280,6 +299,35 @@ class CameraWorker(threading.Thread):
                 self.traffic.close()
         except Exception as e:
             print(f"traffic impact not finished: {e}")
+
+    # ---- passed vehicles: a side record, so each step answers for its own faults
+    def _start_passed(self, reader):
+        """The recorder, and - only when `reader` is given (anpr_all) - a bounded background plate reader that
+        waits for the violators' reader whenever it has work."""
+        try:
+            self.passed = PassedRecorder(self.store, self.cam["id"], self.data_dir)
+            if reader is not None:
+                busy = (lambda: self.plates.jobs.unfinished_tasks > 0 or bool(self.plates.wanted)) if self.plates \
+                    else None
+                self.passed.worker = PassedPlateWorker(reader, self.passed.plate_done, busy_fn=busy)
+        except Exception as e:
+            print(f"passed vehicles switched off: {e}")
+            self.passed = None
+
+    def _passed_status(self):
+        return {"passed": self.passed.stats()} if self.passed is not None else {}
+
+    def _finish_passed(self):
+        if self.passed is None:
+            return
+        before = self.status["message"]
+        try:
+            self._set(message="Recording the last passing vehicles...")
+            self.passed.close()
+        except Exception as e:
+            print(f"passed vehicles not finished: {e}")
+        finally:
+            self._set(message=before)
 
     def _tracklet_done(self, tl):
         """A vehicle has left this camera: store its pass, and link it straight away if another camera
@@ -337,6 +385,12 @@ class CameraWorker(threading.Thread):
             cv2.imwrite(str(path), result.image, [cv2.IMWRITE_JPEG_QUALITY, 95])
             img = str(path.relative_to(self.data_dir))
         self.store.set_plate(vid, result.status, result.text_bn, result.text_en, result.confidence, img)
+        tid = self._viol_tid.pop(vid, None)
+        if self.passed is not None and tid is not None:
+            try:
+                self.passed.violator_plate(tid, result)
+            except Exception as e:
+                print(f"violator plate not shared with its passed record: {e}")
         self.notify({"type": "plate", "camera_id": self.cam["id"], "violation": self.store.violation(vid)})
 
     def _save_learning(self):

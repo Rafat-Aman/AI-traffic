@@ -50,3 +50,19 @@ body.map-page { height: 100vh; display: flex; flex-direction: column; overflow: 
   .map-body { grid-template-columns: 1fr; grid-template-rows: 55vh 1fr; }
   .map-panel { border-left: 0; border-top: 1px solid var(--border); }
 }
+
+/* Network topology: gates drawn on a frame, links between cameras (WP19) */
+.gate-stage { position: relative; width: 100%; background: var(--surface-2); border-radius: 6px; overflow: hidden; line-height: 0;
+              cursor: crosshair; user-select: none; }
+.gate-stage img { width: 100%; display: block; }
+.gate-stage svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+.gate-stage polygon { fill-opacity: .22; stroke-width: 2; vector-effect: non-scaling-stroke; }
+.gate-stage polyline { fill: none; stroke: #fff; stroke-width: 2; stroke-dasharray: 5 4; vector-effect: non-scaling-stroke; }
+.gate-stage circle { fill: #fff; stroke: #000; stroke-width: 1; vector-effect: non-scaling-stroke; }
+.gate-in { fill: var(--good); stroke: var(--good); } .gate-out { fill: var(--critical); stroke: var(--critical); }
+.gate-both { fill: var(--accent); stroke: var(--accent); }
+.topo-row { display: flex; align-items: center; gap: 6px; font-size: 12.5px; margin: 4px 0; flex-wrap: wrap; }
+.topo-row .grow { flex: 1; min-width: 0; }
+.topo-row input[type=number] { width: 64px; padding: 3px 5px; }
+.topo-sub { font-size: 12px; color: var(--text-muted); margin: 8px 0 2px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+.chip-kind { font-size: 11px; padding: 0 6px; border-radius: 8px; border: 1px solid var(--border-strong); }

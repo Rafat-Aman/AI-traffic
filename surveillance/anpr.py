@@ -37,6 +37,11 @@ MIN_PLATE_PX = 110      # narrower plates are never read (2-4% wrong numbers at 
 MIN_AGREE = 3           # crops that must give exactly the same six digits
 MIN_DIGIT_CONF = 0.7    # every digit of an agreeing crop must be at least this confident
 MIN_WORD_CONF = 0.6     # city / class letter: confidence needed in the agreeing crops
+# The agreeing reads of a "read"/"partial" result must themselves come from a plate at least this wide. The team's
+# system found three false "confirmed" numbers on 25-44 px plates (a blurred 25 px plate read as 12-0412). Here
+# MIN_PLATE_PX already keeps narrower plates out, so this changes nothing for the default; it is the guard that
+# stays in force if a caller lowers `min_plate_px` (e.g. to read more of the passing traffic).
+CONFIRM_MIN_PX = 50
 
 
 @dataclass
@@ -132,11 +137,12 @@ class PlateResult:
     readings: int = 0           # crops in which a full 6-digit number was read
     agreeing: int = 0           # of those, how many agree with the final number
     plate_px: int = 0           # widest plate seen
+    plates_seen: int = 0        # crops in which a plate was found at all (0: no plate anywhere in the views)
     image: Optional[np.ndarray] = None   # best plate crop (always kept as evidence)
 
 
 def vote(reads, min_plate_px=MIN_PLATE_PX, min_agree=MIN_AGREE, min_digit_conf=MIN_DIGIT_CONF,
-         min_word_conf=MIN_WORD_CONF):
+         min_word_conf=MIN_WORD_CONF, confirm_min_px=CONFIRM_MIN_PX):
     """Combine readings of one vehicle. Each reading is weighted by its confidence and plate width.
 
     A number is reported only if `min_agree` readings give exactly the same six digits, each digit read with at
@@ -151,7 +157,8 @@ def vote(reads, min_plate_px=MIN_PLATE_PX, min_agree=MIN_AGREE, min_digit_conf=M
         for r in usable:
             c[r.digits[i]] += weight(r) * r.digit_conf[i]
         number.append(c.most_common(1)[0][0])
-    agreeing = [r for r in usable if r.digits == number and min(r.digit_conf) >= min_digit_conf]
+    agreeing = [r for r in usable if r.digits == number and min(r.digit_conf) >= min_digit_conf
+                and r.plate_px >= confirm_min_px]
     # City and class letter are reported only when enough of the agreeing crops read the same one confidently;
     # otherwise the result is "partial" (number only) and the officer reads them from the plate image.
     def agreed(attr, conf_attr):
@@ -203,6 +210,35 @@ class PlateReader:
             dets = [(names[int(k)], float(cf), *map(float, b)) for k, cf, b in
                     zip(c.boxes.cls.tolist(), c.boxes.conf.tolist(), c.boxes.xyxy.tolist())]
             return parse_plate(dets, plate.shape[1], plate.shape[0], pw), plate
+
+
+def read_crops(reader, jpgs, max_crops=None, give_up_after=None, pause=None, **vote_kw):
+    """Read one vehicle's plate from its crops (JPEG bytes, largest first) and vote. Returns a PlateResult whose
+    `image` is the widest plate crop found and whose `plates_seen` counts the crops that showed a plate.
+
+    max_crops: read at most this many. give_up_after: if none of the first this-many crops shows a plate, stop there
+    (a vehicle with no visible plate costs 8 reads, not 10). Both are None for the violators' reader, which reads
+    every crop it was given. pause: called before each crop (the passing-traffic reader waits there while a violator's
+    plate is being read)."""
+    reads, best_img, best_px, seen = [], None, -1, 0
+    for i, jpg in enumerate(jpgs if max_crops is None else jpgs[:max_crops]):
+        if give_up_after is not None and i >= give_up_after and not seen:
+            break
+        if pause is not None:
+            pause()
+        img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            continue
+        pr, plate = reader.read(img)
+        if pr is None:
+            continue
+        seen += 1
+        reads.append(pr)
+        if pr.plate_px > best_px:
+            best_img, best_px = plate, pr.plate_px
+    result = vote(reads, **vote_kw)
+    result.image, result.plates_seen = best_img, seen
+    return result
 
 
 class PlateCollector:
@@ -278,17 +314,7 @@ class PlateCollector:
         while True:
             key, crops = self.jobs.get()
             try:
-                reads, best_img, best_px = [], None, -1
-                for jpg in crops:
-                    img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
-                    pr, plate = self.reader.read(img)
-                    if pr is None:
-                        continue
-                    reads.append(pr)
-                    if pr.plate_px > best_px:
-                        best_img, best_px = plate, pr.plate_px
-                result = vote(reads)
-                result.image = best_img
+                result = read_crops(self.reader, crops)
                 self.on_result(key, result)
             except Exception as e:  # never kill the reader thread
                 print(f"ANPR error: {e}")

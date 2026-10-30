@@ -70,3 +70,4 @@ models/bd_vehicles_*.onnx
 
 # Per-instance VLM settings written by the admin page
 data/vlm_settings.json
+data/outbox/

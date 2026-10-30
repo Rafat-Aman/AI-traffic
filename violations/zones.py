@@ -49,6 +49,13 @@ AREA_TYPES = ("no_parking", "bus_stop", "intersection", "signal", "parking", "ut
 AREA_COLORS = {"bus_stop": (0, 200, 0), "signal": (0, 220, 255), "parking": (255, 120, 0), "uturn": (200, 0, 200),
                "no_parking": (60, 60, 230), "intersection": (230, 230, 230), "bus_lane": (190, 210, 0)}
 BUS_STOP_MAX_AFTER_M = 120.0   # a far-side bus stop starts within this distance after the intersection
+# Kerb-side areas are often drawn (or found by Auto zones) just OUTSIDE a road zone's edge, where vehicles stand
+# off the moving traffic. A vehicle standing in one is on that road: it is measured in the road's coordinates
+# (beyond its width), so the standing rules (V1, V3, V7) see it. An area belongs to the road zone it overlaps or
+# comes within KERB_TOUCH x frame width of. bus_lane is not a kerb area: it is part of the carriageway (V9).
+# Ported from Shihab's Kakoli check, 2026-10-28.
+KERB_AREAS = ("no_parking", "bus_stop", "parking")
+KERB_TOUCH = 0.02
 ROAD_COLOR = (255, 200, 0)
 LINE_COLOR = (255, 255, 255)
 
@@ -221,6 +228,7 @@ class AreaZone:
         self.approved = bool(approved)
         self.hours = clean_hours(hours, f"area '{name}'") if kind == "bus_lane" else None   # None = all day
         self.valid, self.reason = True, ""    # bus stops: set by CameraConfig.check_bus_stops()
+        self.road = None                      # kerb-side area: the road zone it lies along (set by CameraConfig)
 
     def contains(self, pt):
         return cv2.pointPolygonTest(self.poly, (float(pt[0]), float(pt[1])), False) >= 0
@@ -304,10 +312,28 @@ class CameraConfig:
             self.speed_limits.setdefault(cat, {}).update(table)
         self.rules = rules or {}
         self.frame_size = frame_size
+        for a in self.areas:
+            a.road = self._kerb_road(a) if a.kind in KERB_AREAS else None
         self.check_bus_stops()
 
     def road_at(self, pt):
-        return next((r for r in self.roads if r.contains(pt)), None)
+        road = next((r for r in self.roads if r.contains(pt)), None)
+        if road is None:  # standing in a kerb strip / bay drawn beside the road zone: on that road
+            road = next((a.road for a in self.areas if a.road is not None and a.contains(pt)), None)
+        return road
+
+    def _kerb_road(self, area):
+        """The road zone a kerb-side area lies along: the one it overlaps or touches, else None."""
+        if not self.roads:
+            return None
+        width = (self.frame_size or [0])[0] or float(max(r.poly[:, 0].max() for r in self.roads))
+        pts = [tuple(map(float, p)) for p in area.poly] + [tuple(map(float, area.poly.mean(axis=0)))]
+        best, best_d = None, -KERB_TOUCH * width
+        for r in self.roads:
+            d = max(cv2.pointPolygonTest(r.poly, p, True) for p in pts)  # > 0 inside, < 0 outside (pixels)
+            if d >= best_d:
+                best, best_d = r, d
+        return best
 
     def areas_at(self, pt):
         return frozenset(a.tag for a in self.areas if a.contains(pt))

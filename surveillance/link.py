@@ -13,6 +13,12 @@ online  `OnlineLinker` answers while the cameras are still running, using the ro
         will revisit it anyway.
 
 Both write the same `global_id` onto the tracklet rows; `link_source` records which path set it.
+
+Camera topology (surveillance.topology, WP19). Where an admin has drawn gates and links between cameras, the
+pair of cameras is matched through them - only vehicles that left the linked gate inside the link's travel-time
+window are candidates, with a two-link fallback and out-of-order handling - by the SAME decision function in
+both paths, so the batch answer equals the online one on in-order data. Any camera pair where either camera has
+no links keeps the flow-based matching above, unchanged.
 """
 
 import threading
@@ -23,6 +29,7 @@ from collections import defaultdict
 import numpy as np
 
 from . import reid
+from . import topology
 
 ONLINE_WINDOW_SEC = 600.0     # how far back the online path looks on the other cameras
 
@@ -36,6 +43,13 @@ def to_tracklet(row):
         width=row["width"] if row["width"] is not None else float("nan"),
         extrap_m=row["extrap_m"] or 0.0, zone=row["zone"] or "", run_id=row["run_id"],
         id=row["id"], global_id=row["global_id"])
+    # where it entered / left the view (WP19); absent on rows older than the columns
+    if row.get("entry_x") is not None and row.get("entry_y") is not None:
+        t.entry_xy = (row["entry_x"], row["entry_y"])
+    if row.get("exit_x") is not None and row.get("exit_y") is not None:
+        t.exit_xy = (row["exit_x"], row["exit_y"])
+    t.t_enter, t.t_exit = row.get("t_enter"), row.get("t_exit")
+    t.entry_gate, t.exit_gate = row.get("entry_gate"), row.get("exit_gate")
     t.hist = np.frombuffer(row["hist"], np.float32) if row["hist"] else None
     t.lab = np.frombuffer(row["lab"], np.float32) if row["lab"] else None
     t.embed = np.frombuffer(row["embed"], np.float32) if row.get("embed") else None
@@ -63,6 +77,10 @@ def run_linking(store, since=None, until=None, log=lambda m: None):
                 "message": "Only one camera has tracklets; cross-camera linking needs at least two."}
 
     links, groups = reid.link_all(tracklets, log=log)
+    topo = topology.load(store)
+    if topo.active():
+        # cameras with gates and links are matched through them; every other pair keeps the flow-based answer
+        links, groups = topology.combine(tracklets, links, topo, log=log)
     # keep global ids stable across runs by reusing the smallest existing id in each group
     assignments, next_id = [], store.next_global_id()
     used = set()
@@ -80,7 +98,7 @@ def run_linking(store, since=None, until=None, log=lambda m: None):
     multi = sum(1 for g in groups.values() if len(g) > 1)
     return {
         "tracklets": len(tracklets), "cameras": sorted(cameras), "linked": len(links),
-        "vehicles": len(groups), "multi_camera": multi,
+        "vehicles": len(groups), "multi_camera": multi, "topology": topo.active(),
         "flows": [{"name": f.name, "from_camera": f.src[0], "from_direction": f.src[1],
                    "to_camera": f.dst[0], "to_direction": f.dst[1], "gap_m": round(f.gap_m, 1),
                    "significance": round(f.significance, 1),
@@ -125,12 +143,24 @@ class OnlineLinker:
     def __init__(self, store, window_sec=ONLINE_WINDOW_SEC):
         self.store, self.window = store, window_sec
         self.params = {}          # (src key, dst key) -> fitted parameters
+        self.topo = None          # the camera topology (gates + links), reloaded when an admin changes it
+        self.topo_llr = None      # colour / embedding LLRs for topology candidates
         self.lock = threading.Lock()
+
+    def topology(self):
+        """The current topology, or None when no camera has links. Re-read only when its revision changes."""
+        rev = topology.revision(self.store)
+        if self.topo is None or self.topo.rev != rev:
+            self.topo = topology.load(self.store)
+        return self.topo if self.topo.active() else None
 
     def learn_from(self, store=None, since=None):
         """Pick up the routes and parameters from the stored tracklets (after a batch run, or at startup)."""
         store = store or self.store
         tracklets = load(store, since=since)
+        topo = self.topology()
+        if topo is not None and len(tracklets) >= 20:
+            self.topo_llr = topology.fit_llr(tracklets, topo)
         if len(tracklets) < 20:
             return 0
         flows, by = reid.discover_flows(tracklets, log=lambda m: None)
@@ -149,14 +179,22 @@ class OnlineLinker:
 
     def link(self, tracklet):
         """Give this tracklet a global id if one candidate clearly stands out. Returns the id or None."""
+        topo = self.topology()
+        on_topology = topo is not None and tracklet.camera_id in topo.cameras
+        if on_topology:
+            gid = topology.link_online(self.store, topo, tracklet, self.topo_llr)
+            if gid:
+                return gid
         with self.lock:
             params = dict(self.params)
         if not params:
             return None
         rows = self.store.tracklets(since=tracklet.t_cross - self.window,
                                     until=tracklet.t_cross + self.window)
+        # a pair of cameras that both have topology is linked through the topology or not at all
         recent = [to_tracklet(r) for r in rows
-                  if r["camera_id"] != tracklet.camera_id and r["id"] != tracklet.id]
+                  if r["camera_id"] != tracklet.camera_id and r["id"] != tracklet.id
+                  and not (on_topology and r["camera_id"] in topo.cameras)]
         if not recent:
             return None
         best = reid.match_online(tracklet, recent, params)

@@ -7,10 +7,29 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .zones import draw_label
+from .zones import FONT, draw_label
 
 FIELDS = ["id", "code", "violation", "track_id", "class", "class_confidence", "video_time_s", "started_s",
           "wall_time", "zone", "areas", "kph", "details", "snapshot", "crop", "clip"]
+
+
+def label_text(code, title, cls, tid):
+    """The text drawn above the violator in the snapshot."""
+    return f"{code} {title}: {cls} #{tid}"
+
+
+def label_org(bbox, frame_h):
+    """Where save_images puts that label, and its scale (the frame height before any downsizing)."""
+    return (int(bbox[0]), int(bbox[1]) - 8), 0.7 * frame_h / 1080
+
+
+def label_rect(text, org, scale):
+    """The box zones.draw_label fills for `text` at `org`: (x1, y1, x2, y2). Used to draw and to hide the label
+    (surveillance/vlm.py paints it out before a model sees the picture), so the two cannot drift apart."""
+    thickness = max(1, round(scale * 3))
+    (tw, th), base = cv2.getTextSize(text, FONT, scale, thickness)
+    x, y = int(org[0]), max(th + 4, int(org[1]))
+    return x - 3, y - th - 4, x + tw + 3, y + base
 
 
 def save_images(ev, frame, folder, stem, when_text, max_width=1920):
@@ -32,7 +51,8 @@ def save_images(ev, frame, folder, stem, when_text, max_width=1920):
                      max(1, round((1 + 3 * i / len(pts)) * ui)), cv2.LINE_AA)
         cv2.circle(snap, tuple(pts[0]), max(3, round(5 * ui)), (0, 255, 255), -1, cv2.LINE_AA)
     cv2.rectangle(snap, (x1, y1), (x2, y2), (0, 0, 255), max(2, round(3 * ui)))
-    draw_label(snap, f"{ev.code} {ev.title}: {o.cls} #{o.tid}", (x1, y1 - 8), (0, 0, 255), 0.7 * ui)
+    org, scale = label_org(o.bbox, h)
+    draw_label(snap, label_text(ev.code, ev.title, o.cls, o.tid), org, (0, 0, 255), scale)
     draw_label(snap, when_text, (15, int(35 * ui)), (255, 255, 255), 0.7 * ui)
     if w > max_width:
         snap = cv2.resize(snap, (max_width, round(h * max_width / w)), interpolation=cv2.INTER_AREA)

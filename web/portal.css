@@ -1,0 +1,37 @@
+/* Driver portal (citations, dispute, payment). Colours come from the dashboard tokens in app.css. */
+.p-wrap { max-width: 900px; margin: 0 auto; padding: 18px 16px 60px; }
+.p-head { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; flex-wrap: wrap; }
+.p-head h1 { font-size: 20px; margin: 0; }
+.p-note { font-size: 12.5px; color: var(--text-muted); line-height: 1.55; margin-bottom: 16px; }
+.plate { display: inline-flex; align-items: center; gap: 7px; padding: 5px 10px; border-radius: 6px;
+         background: var(--surface-3); font-weight: 600; font-size: 13px; }
+.plate.pending { opacity: .62; font-weight: 400; }
+.plates { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.case { display: grid; grid-template-columns: 148px 1fr; gap: 14px; padding: 14px 0;
+        border-top: 1px solid var(--border); cursor: pointer; }
+.case:first-child { border-top: 0; }
+.case img { width: 148px; height: 100px; object-fit: cover; border-radius: 7px; background: var(--surface-3); }
+.case h3 { margin: 0 0 3px; font-size: 14.5px; }
+.case .meta { font-size: 12.5px; color: var(--text-muted); line-height: 1.6; }
+.ev { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; margin: 12px 0; }
+.ev img, .ev video { width: 100%; border-radius: 8px; background: #000; }
+.ev figcaption { font-size: 11.5px; color: var(--text-muted); margin-top: 4px; }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11.5px; font-weight: 600;
+         background: var(--surface-3); margin-left: 6px; }
+.badge.void { background: #f3d6d6; color: #8a1f1f; }
+.badge.review { background: #fff0c9; color: #7a5600; }
+.badge.ok { background: #d9efd9; color: #1d5c25; }
+.dispute textarea { width: 100%; min-height: 110px; box-sizing: border-box; font: inherit; padding: 8px;
+                    border-radius: 8px; border: 1px solid var(--border); background: var(--surface); color: inherit; }
+.dispute .quote { white-space: pre-wrap; border-left: 3px solid var(--border); padding: 4px 10px; margin: 6px 0; }
+@media (max-width: 560px) { .case { grid-template-columns: 1fr; } .case img { width: 100%; height: 170px; } }
+
+/* payment (WP18) */
+.pay-box { margin: 10px 0; }
+.pay-amount { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.pay-banner { padding: 9px 12px; border-radius: 8px; margin-bottom: 14px; font-size: 13.5px; border: 1px solid var(--border-strong); }
+.pay-banner.ok { background: #d9efd9; color: #1d5c25; } .pay-banner.bad { background: #f3d6d6; color: #8a1f1f; }
+.pay-test { display: inline-block; padding: 2px 9px; border-radius: 10px; background: #fff0c9; color: #7a5600; font-size: 12px; font-weight: 600; }
+.pay-actions { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
+.pay-actions .btn { width: 100%; padding: 12px; }
+@media (max-width: 420px) { .pay-amount { font-size: 19px; } }

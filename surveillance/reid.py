@@ -184,6 +184,15 @@ class Tracklet:
     embed_reid_model: Optional[str] = None
     plate: str = ""
     global_id: Optional[int] = None
+    # Where the vehicle came into and left the picture (WP19). Points are the road-contact point (bottom
+    # centre of the box) as a fraction of the frame; times are wall clock. None when the frame size or the
+    # clock was not known. The gates are filled in when the tracklet is stored, from the camera's drawn gates.
+    entry_xy: Optional[tuple] = None
+    exit_xy: Optional[tuple] = None
+    t_enter: Optional[float] = None
+    t_exit: Optional[float] = None
+    entry_gate: Optional[int] = None
+    exit_gate: Optional[int] = None
 
     @property
     def group(self):
@@ -810,6 +819,14 @@ class TrackletCollector:
         m = self.meta.setdefault(tid, {})
         m.update(cls=cls, zone=road.name, y_ref=y_ref, wall_at=wall_t, t_at=t)
         m.setdefault("width_samples", [])
+        try:         # first and last road-contact point, as a fraction of the frame (gates are matched on these)
+            fh, fw = frame.shape[:2]
+            pt = (min(1.0, max(0.0, (box[0] + box[2]) / 2.0 / fw)), min(1.0, max(0.0, box[3] / float(fh))))
+            if "first_pt" not in m:
+                m["first_pt"], m["first_t"] = pt, t
+            m["last_pt"] = pt
+        except Exception:
+            pass
         if heading:
             m["heading"] = heading
         if xy is not None:
@@ -927,6 +944,11 @@ class TrackletCollector:
             direction="incoming" if heading > 0 else "outgoing" if heading < 0 else "unknown",
             width=float(np.median(widths)) if widths else float("nan"),
             extrap_m=extrap, zone=m.get("zone", ""), hist=hist, lab=lab)
+        if "first_pt" in m:
+            tl.entry_xy, tl.exit_xy = m["first_pt"], m["last_pt"]
+            if m.get("wall_at") is not None:
+                tl.t_exit = float(m["wall_at"])
+                tl.t_enter = float(m["wall_at"] - (m["t_at"] - m["first_t"]))
         if self.embed:
             from .embed import Embedder
             tl.embed, tl.embed_model = Embedder.encode_with("mobilenet", kept)    # 8 ms, always

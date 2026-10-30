@@ -78,6 +78,28 @@ dashboard process stops its 8B at exit.
 For V10/V11 the "contact" frame (both vehicles boxed) goes first, so the default `vlm_max_images = 2` keeps it: contact
 frame, then close-up. Other codes keep close-up, scene, extra moments, plate.
 
+### Prompt fixes ported from the teammate's service (WP16)
+
+- **The drawn label is hidden.** The snapshot carries a red label above the vehicle (`V3 <title>: <class> #<track>`);
+  a model reads "#20 2 km/h" as a speed and argues with it. `vlm.gather_images` paints the strip out
+  (`cv2.inpaint`, TELEA) before any model sees the scene photo (2B, 8B, Explain, dispute re-check). The geometry
+  comes from `violations/evidence.py` (`label_text`, `label_org`, `label_rect`), which also draws it, so the two
+  cannot drift. The stored row keeps no box, so `vlm.find_label` draws the label again at the expected size and
+  matches it in the picture (tries the 1x, 2x, 1.33x and 2.13x shrink of a wide frame; a stored speed appended to
+  the text is tried too, for older cases). If the row has `bbox` and `frame_size` the geometry is exact. A label
+  that cannot be found leaves the image as it is. Only the scene photo is touched; the close-up has no label.
+- **V6 closed question.** Before the main question, one short call on the close-up: what is on the head of the person
+  driving, one word, helmet / hair / cap / unclear (JSON enum, 12 tokens). The answer is added to the facts and sets the
+  verdict: helmet = contradicted, hair or cap = supported, unclear (or any unreadable answer) = insufficient. Asked of the
+  2B, only when the case escalates, as stage `visual_check` (with an ETA); a failed call is skipped, never invented.
+- **V2.** A still image can neither confirm nor contradict a measured speed: only "the red box is not on a motor
+  vehicle" counts against it. A different vehicle type is a concern and does not trigger the class guard.
+- **Speed talk.** Speeds are left out of the facts (also `details` keys with kph/speed) for every rule except V2, V10,
+  V11, and the answer check drops sentences with km/h or "speed" for those rules. For moving rules (V2, V4, V5, V9) it
+  also drops sentences saying the vehicle was stopped or slow. V9 is a moving rule. V10/V11 are kinematic candidates
+  whose measured numbers are the finding, and V11 can end with both vehicles standing, so they are exempt from both.
+  The "other cameras" text is not filtered: its speeds are given data.
+
 ## Measured on this machine
 
 i5-11400H (6 cores / 12 threads, AVX-512 + VNNI), 23 GB RAM, llama.cpp b11856, `--load-mode mmap+mlock`,

@@ -93,16 +93,19 @@ class FrameResult:
 class Pipeline:
     def __init__(self, detector, camera, frame_size, start_time=None, is_live=False, helmet=None,
                  overrides=None, only=None, min_frames=3, auto_roi=True, display_width=1280, min_speed_fps=6.0,
-                 plates=None, reference=None, stabilize=True, tracklets=None, traffic=None):
+                 plates=None, reference=None, stabilize=True, tracklets=None, traffic=None, passed=None):
         """plates: optional surveillance.anpr.PlateCollector - keeps each motor vehicle's best full-resolution
         crops so the plates of violating vehicles can be read.
         tracklets: optional surveillance.reid.TrackletCollector - summarises each vehicle's pass in road-plane
         metres so it can be recognised on another camera.
         traffic: optional surveillance.traffic_state.TrafficStateCollector - measures queue, speed, occupancy, density
         and waiting time per road zone, from the same observations the rules get.
+        passed: optional surveillance.passed.PassedRecorder - one record per vehicle that crosses the camera (class,
+        colour, thumbnail, times, and - when the camera asks for it - the plate), whether or not it broke a rule.
         reference: the clean frame the zones were drawn on (BGR); without it the first frame is taken as the view
         the zones belong to. stabilize: follow camera movement (surveillance/camera_motion.py)."""
         self.det, self.camera, self.plates, self.tracklets = detector, camera, plates, tracklets
+        self.passed, self._passed_fault = passed, False
         self.traffic, self._traffic_fault = traffic, False
         self.W, self.H = frame_size
         self.roi_ref = zones_roi(camera, self.W, self.H) if auto_roi else (0, 0, self.W, self.H)
@@ -170,6 +173,7 @@ class Pipeline:
 
         t1 = time.perf_counter()
         observations, shown, tracklet_rows = [], [], []
+        wall_t = wall.timestamp() if wall else None
         hidden_foot = bottom_occluded([b for b, _, _ in tracks])
         for k, ((bx1, by1, bx2, by2), tid, cname) in enumerate(tracks):
             bx1, bx2, by1, by2 = bx1 + x0, bx2 + x0, by1 + y0, by2 + y0
@@ -213,6 +217,8 @@ class Pipeline:
             shown.append((tid, major, n, box, kph))
             if self.plates is not None and road is not None and major in MOTORISED and by2 < y1 - 2:
                 self.plates.observe(tid, frame, box, t)
+            if self.passed is not None:
+                self._passed_call("observe", tid, frame, box, major, road is not None, t, wall_t)
             if self.tracklets is not None and road is not None:
                 # the reference line each vehicle's crossing is timed at: the middle of the stretch of this
                 # zone where positions are reliable, so every vehicle is measured at the same place
@@ -225,7 +231,6 @@ class Pipeline:
                     areas=frozenset() if view_lost else self.camera.areas_at(point), heading=heading,
                     xy_coarse=coarse))
         self._boxes = [b for _, _, _, b, _ in shown]
-        wall_t = wall.timestamp() if wall else None
         if self.tracklets is not None:
             # after the loop, so every box of this frame is known: a crop is only worth keeping for colour
             # when no other vehicle overlaps it
@@ -253,6 +258,8 @@ class Pipeline:
             self.plates.tick(t, {tid for tid, *_ in shown})
         if self.tracklets is not None:
             self.tracklets.tick(t, {tid for tid, *_ in shown})
+        if self.passed is not None:
+            self._passed_call("tick", t, {tid for tid, *_ in shown})
         for tid in [k for k, s in self.last_seen.items() if t - s > FORGET_SEC]:
             del self.last_seen[tid]
             self.votes.pop(tid, None)
@@ -266,6 +273,15 @@ class Pipeline:
         display = self.draw(frame, shown, t, wall)
         timings["draw_ms"] = (time.perf_counter() - t2) * 1e3
         return FrameResult(display, events, len(tracks), self.fps, timings)
+
+    def _passed_call(self, method, *args):
+        """The passed-vehicle recorder is a side record: a fault in it must never stop the rules. Say so once."""
+        try:
+            getattr(self.passed, method)(*args)
+        except Exception as e:
+            if not self._passed_fault:
+                print(f"passed vehicles not recorded: {type(e).__name__}: {e}")
+            self._passed_fault = True
 
     def _foot_hidden(self, tid, t, bx1, by1, bx2, by2, cut):
         """Whether the box's bottom edge is hidden although no nearer box was detected over it (the vehicle in

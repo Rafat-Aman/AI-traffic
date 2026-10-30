@@ -4,10 +4,26 @@ A classifier (models/helmet_cls.*) looks at a full-resolution crop of each movin
 a few times per second and gives the probability that someone on it is bare-headed. See models/README.md for its
 training data and measured accuracy.
 
-The decision is made once per motorbike, when it leaves the view, over all its sightings: at least 3 confident
-bare-head sightings that are at least half of all confident sightings. Deciding early (at the first few frames)
+The decision is made once per motorbike, when it leaves the view, over all its sightings: at least 4 confident
+bare-head sightings that are at least 3/4 of all confident sightings. Deciding early (at the first few frames)
 let blur and occlusion through; deciding over the whole track did not, on the footage it was tuned on. The
 evidence image is the frame with the strongest bare-head sighting.
+
+Ported from Shihab's Kakoli check, 2026-10-28 (every motorbike track of Part-1 and three Part-2 stretches; tracks the
+rule reported were labelled by eye from their crops: helmet / bare-headed / cannot tell): the earlier settings (3
+sightings, half of them, helmet below P 0.3, both directions) reported 85 motorbikes in Part-1 (18 min), of which
+48 clearly wore helmets and 1 was clearly bare-headed, and 7 in the Part-2 stretches (4 helmeted, 2 bare-headed
+pillions). Motorbikes going AWAY from the camera are seen from behind: the driver is hidden by the pillion and a
+black helmet looks like black hair, and none of their reports was a confirmed bare head (13 helmeted, 15 unclear).
+So the rule judges only motorbikes coming toward the camera (`directions`) and asks for 4 sightings, 3/4 of
+them bare, with P <= 0.5 counting as helmet: Part-1 16 reports (7 helmeted, 1 bare-headed, 8 unclear), Part-2
+stretches 3 (both bare-headed pillions, 1 helmeted rider whose crop held the bare head of the next bike's rider).
+Cost: bare-headed riders going away are no longer caught. The settings were chosen on these same tracks, so expect
+a little worse elsewhere. Motorbikes in a kerb strip outside the road zone itself (V3 measures those, see
+zones.KERB_AREAS) are not judged: they crawl through pavement crowds there and bare-headed pedestrians fill the
+crop (5 of 8 cases on the full Part-2 before this check). A fine-tuned classifier with this camera's helmeted crops
+and the Indonesian bare heads learned "this camera = helmet" and caught nothing; the local VLM answered "helmet"
+for every crop, bare-headed ones included: neither is used.
 """
 
 import cv2
@@ -30,21 +46,28 @@ class NoHelmet(BaseViolation):
         "expand_top": 0.45,          # the motorbike box often ends at the riders' shoulders: extend it so heads are inside
         "expand_side": 0.08,
         "bare_prob": 0.8,            # a sighting counts as "bare head" at or above this probability...
-        "helmet_prob": 0.3,          # ...and as "helmets on" at or below this; in between it is ignored
-        "min_votes": 3,              # bare-head sightings needed over the track
-        "min_ratio": 0.5,            # bare-head sightings / all confident sightings over the track
+        "helmet_prob": 0.5,          # ...and as "helmets on" at or below this; in between it is ignored (was 0.3)
+        "min_votes": 4,              # bare-head sightings needed over the track (was 3)
+        "min_ratio": 0.75,           # bare-head sightings / all confident sightings over the track (was 0.5)
+        # only motorbikes moving this way are judged ("toward_camera" / "away_from_camera"): from behind the driver
+        # is hidden by the pillion and black helmets look like hair (see the module notes)
+        "directions": ["toward_camera"],
     }
+    HEADINGS = {"toward_camera": 1, "away_from_camera": -1}
 
     def __init__(self, settings=None, camera=None, detector=None):
         """`detector(crop_bgr) -> probability (0-1) that someone on the motorbike has no helmet`."""
         super().__init__(settings, camera)
         self.detector = detector
+        self.headings = {self.HEADINGS[d] for d in self.cfg["directions"]}
         self.tracks = {}  # tid -> {"bare", "helmet", "last", "best_p", "best_obs", "best_frame"}
 
     def update(self, obs, ctx):
         if self.detector is None or obs.cls not in self.cfg["classes"] or obs.road is None:
             return None
-        if obs.purity < self.cfg["min_purity"]:
+        if obs.purity < self.cfg["min_purity"] or obs.heading not in self.headings:  # heading 0 = not known yet
+            return None
+        if not obs.road.contains(obs.point):  # in a kerb strip beside the road: pavement crowds fill the crop
             return None
         st = self.tracks.setdefault(obs.tid, {"bare": 0, "helmet": 0, "last": -1e9, "best_p": 0.0,
                                               "best_obs": None, "best_frame": None})

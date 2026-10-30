@@ -145,7 +145,7 @@ Both run on full-resolution crops, so recorded videos are now analysed at full r
 settings: *Analysis resolution*). Model sources, licences and the full evaluation are in `models/README.md`.
 
 **Helmets (V6).** A classifier looks at each moving motorbike 4 times per second and estimates whether anyone on it
-is bare-headed. It decides once per motorbike, when it leaves the view: 3 confident bare-head sightings, at least half of all its confident sightings. Sightings are skipped when the motorbike is parked,
+is bare-headed. It decides once per motorbike, when it leaves the view: 4 confident bare-head sightings, at least 3/4 of all its confident sightings (helmet at P <= 0.5). Only motorbikes coming toward the camera and standing on the road zone itself (not in a kerb strip) are judged (rule setting `directions`); from behind the driver is hidden by the pillion. Measured on Kakoli Part-1 this cut reports from 85 to 16 and helmeted false positives from 48 to 7, at the cost of bare-headed riders going away. Sightings are skipped when the motorbike is parked,
 too far away (box under 100 px), or right behind another bike, where the next bike's riders' heads would be in the
 crop. Public helmet data did not transfer to a Dhaka overpass camera (the best public model flagged 82% of helmeted
 riders), so the classifier was also trained on 1,232 motorbikes from this camera. On held-out Dhaka riders it

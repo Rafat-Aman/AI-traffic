@@ -26,5 +26,8 @@ fi
 export MEDIA_SECRET
 export OTP_DELIVERY="${OTP_DELIVERY:-echo}"
 export INSECURE_COOKIES="${INSECURE_COOKIES:-1}"
+# Links in emails and payment return URLs are built from this, never from the request's Host header. Locally the
+# emails land in data/outbox/ (no SMTP_HOST) and payments use the built-in test gateway (no SSLCommerz keys).
+export PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-http://localhost:8000}"
 
 exec ./.venv/bin/python app.py "$@"

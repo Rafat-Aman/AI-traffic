@@ -184,6 +184,39 @@ def distance_m(a: dict, b: dict) -> float:
     return haversine_m(a["lat"], a["lon"], b["lat"], b["lon"])
 
 
+# ---------------------------------------------------------------- travel-time window for a camera link (WP19)
+
+WINDOW_FAST_KPH = 60.0      # quickest plausible free-flow speed on an urban road: sets the earliest arrival
+WINDOW_SLOW_KPH = 5.0       # a crawl in a Dhaka jam: sets the latest arrival
+WINDOW_CIRCUITY = 1.4       # road length / straight line; the same ASSUMPTION section_speed.py makes
+WINDOW_SLACK_S = 10.0       # clock and exit-point jitter, added to the late end
+WINDOW_MAX_S = 1800.0       # the same ceiling section_speed.py puts on a believable camera-to-camera trip
+
+
+def link_window(a: dict, b: dict, fast_kph: float = WINDOW_FAST_KPH, slow_kph: float = WINDOW_SLOW_KPH,
+                circuity: float = WINDOW_CIRCUITY) -> dict:
+    """Suggested [min_s, max_s] for a vehicle leaving camera `a` and appearing at camera `b`, from the map alone.
+
+    Why these numbers. The time that matters is from the vehicle LEAVING a's view to ENTERING b's view, so
+    the distance is the camera-to-camera distance less what each camera already covers (each one's view
+    range, an upper bound on how much of the road it spans). The earliest arrival is that shortened straight
+    line at 60 km/h (a road is never shorter than a straight line); the latest is the full straight line times
+    1.4 (the assumed road factor) at 5 km/h, plus 10 s of slack. 5-60 km/h is deliberately wide: a link
+    window is a FILTER, and a window that is too narrow silently drops the real vehicle while one that is too
+    wide only costs a few more candidates for the appearance score to rule out. The admin can edit it, and
+    should once the real travel times are known. Capped at 30 minutes."""
+    d = distance_m(a, b)
+    covered = float(a.get("range_m") or 0) + float(b.get("range_m") or 0)
+    near = max(0.0, d - covered)
+    lo = math.floor(near / (fast_kph / 3.6))
+    hi = math.ceil((d * circuity / (slow_kph / 3.6) + WINDOW_SLACK_S) / 5.0) * 5.0
+    capped = hi > WINDOW_MAX_S
+    hi = min(hi, WINDOW_MAX_S)
+    return {"min_s": float(min(lo, hi - 1)), "max_s": float(hi), "distance_m": round(d, 1), "capped": capped,
+            "basis": (f"{round(d)} m apart; earliest {fast_kph:g} km/h over the {round(near)} m not already in view, "
+                      f"latest {slow_kph:g} km/h over {circuity:g} x the straight line + {WINDOW_SLACK_S:g} s")}
+
+
 # ---------------------------------------------------------------- the optimiser's input
 
 def node_id(camera_id) -> str:

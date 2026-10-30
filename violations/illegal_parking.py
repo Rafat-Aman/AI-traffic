@@ -10,6 +10,8 @@ V7."""
 
 from datetime import time as dtime
 
+import numpy as np
+
 from .base import MOTORISED, NON_MOTORISED, BaseViolation
 from .stationary import StandRule, StationaryMonitor
 
@@ -35,6 +37,7 @@ class IllegalParking(StandRule, BaseViolation):
         "classes": sorted((MOTORISED | NON_MOTORISED) - {"Bus"}),
         "dwell_sec": 20.0,
         "radius_m": 2.0,
+        "creep_m": 10.0,             # a row of waiting CNGs moves up as the front one leaves: same stand
         "min_passed": 3,
         "max_queued_share": 1.0,     # a row of vehicles parked at the kerb is not a traffic queue
         "busy_vehicles": 15,         # heavy traffic: at least this many vehicles in the road zone on average...
@@ -48,7 +51,7 @@ class IllegalParking(StandRule, BaseViolation):
         if camera is not None and "peak_hours" not in (settings or {}):
             self.cfg["peak_hours"] = camera.peak_hours
         self.classes = set(self.cfg["classes"])
-        self.monitor = StationaryMonitor()
+        self.monitor = StationaryMonitor(creep_m=self.cfg["creep_m"])
         self.density = {}  # road id -> [last time, mean vehicles in the zone]
 
     def _busy(self, road, ctx):
@@ -93,5 +96,7 @@ class IllegalParking(StandRule, BaseViolation):
             return None
         st, dwell = got
         names = [n for n in (self.camera.area_names_at(obs.point) if self.camera else [])]
+        moved = float(np.linalg.norm(st.position() - st.origin))
         return self._stand_event(obs, st, dwell, {"enforced_because": why,
+                                                  **({"moved_up_m": round(moved, 1)} if moved > 1 else {}),
                                                   **({"area": ", ".join(names)} if names else {})})

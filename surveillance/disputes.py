@@ -427,6 +427,7 @@ class Checker:
 
 # ------------------------------------------------------------------ the human decision
 
+on_decided = []      # callbacks f(dispute row) run after a human decision (uphold or accept) is recorded
 _decide_lock = threading.Lock()      # one decision at a time: "accept" withdraws a citation and closes a dispute
 
 
@@ -463,7 +464,13 @@ def decide(store, did, user, decision, reason):
         store.audit(user, "dispute.decide", "dispute", did,
                     f"{decision} citation {d['citation_no']}: {reason} | model: "
                     f"{model['assessment'] if model else d['model_state']}", user.get("address", ""))
-    return dispute(store, did)
+    closed = dispute(store, did)
+    for callback in on_decided:     # e.g. the "dispute decided" email; a failure here never undoes the decision
+        try:
+            callback(closed)
+        except Exception as e:
+            print(f"[disputes] on_decided callback failed: {e}")
+    return closed
 
 
 def close_as_moot(store, citation_no, user):

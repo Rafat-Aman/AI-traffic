@@ -10,6 +10,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import cv2
 import numpy as np
@@ -318,6 +319,222 @@ class BackendTests(unittest.TestCase):
     def test_status_shape(self):
         st = vlm.backend_status({"vlm_backend": "off"})
         self.assertEqual(set(st), {"enabled", "backend", "model", "local_up", "cloud_key", "local_url"})
+
+
+# ---------------------------------------------------------------- WP16: label hiding, closed pre-question, V2, speed talk
+
+from types import SimpleNamespace  # noqa: E402
+
+from violations import evidence  # noqa: E402
+
+
+def drawn_scene(folder, frame_wh=(1920, 1080), bbox=(700, 400, 900, 560), code="V3", cls="Motorbike", tid=20):
+    """A snapshot written by the real violations.evidence.save_images on a textured frame. -> (path, violation)."""
+    w, h = frame_wh
+    rng = np.random.default_rng(1)
+    frame = cv2.GaussianBlur(rng.integers(60, 200, (h, w, 3), dtype=np.uint8), (0, 0), 3)
+    k = h / 1080
+    bbox = tuple(round(v * k) for v in bbox)
+    ev = SimpleNamespace(code=code, title="No-parking stop", path=[], obs=SimpleNamespace(bbox=bbox, cls=cls, tid=tid))
+    snap, _ = evidence.save_images(ev, frame, folder, "x", "2026-03-04 17:42:11")
+    v = case(code=code, title="No-parking stop", cls=cls, track_id=tid, kph=2.0)
+    return snap, v, bbox, h
+
+
+class HideLabelTests(unittest.TestCase):
+    def check(self, frame_wh):
+        with tempfile.TemporaryDirectory() as d:
+            snap, v, bbox, h = drawn_scene(d, frame_wh)
+            img = cv2.imread(str(snap))
+            org, scale = evidence.label_org(bbox, h)
+            rect = evidence.label_rect(evidence.label_text("V3", "No-parking stop", "Motorbike", 20), org, scale)
+            k = img.shape[1] / frame_wh[0]
+            x1, y1, x2, y2 = (round(c * k) for c in rect)
+            out = vlm.hide_label(img, v)
+            strip = (slice(y1 + 2, y2 - 2), slice(x1 + 2, x2 - 2))
+            self.assertGreater(np.abs(out[strip].astype(int) - img[strip]).mean(), 10)      # the strip changed
+            # the dark label fill is gone: the strip now looks like its surroundings, not like (20, 20, 20)
+            self.assertGreater(out[strip].mean(), img[strip].mean() + 20)
+            outside = np.ones(img.shape[:2], bool)
+            outside[max(0, y1 - 8):y2 + 8, max(0, x1 - 8):x2 + 8] = False
+            self.assertTrue((out[outside] == img[outside]).all())                            # nothing else moved
+            self.assertEqual(out.shape, img.shape)
+
+    def test_label_is_painted_out_and_the_rest_is_untouched(self):
+        self.check((1920, 1080))
+
+    def test_downsized_snapshot_of_a_4k_frame(self):
+        self.check((3840, 2160))
+
+    def test_geometry_round_trip_with_the_drawing_helper(self):
+        """Where the drawing helper says the strip is, the picture has the label's dark fill; where the matcher finds it
+        is the same box."""
+        with tempfile.TemporaryDirectory() as d:
+            snap, v, bbox, h = drawn_scene(d)
+            img = cv2.imread(str(snap))
+            org, scale = evidence.label_org(bbox, h)
+            x1, y1, x2, y2 = evidence.label_rect(evidence.label_text("V3", "No-parking stop", "Motorbike", 20),
+                                                 org, scale)
+            self.assertLess(img[y1 + 1:y1 + 3, x1 + 1:x2 - 1].mean(), 40)
+            fx1, fy1, fx2, fy2 = vlm.find_label(img, v)
+            self.assertLessEqual(max(abs(fx1 - x1), abs(fy1 - y1), abs(fx2 - x2), abs(fy2 - y2)), 2)
+            exact = vlm.find_label(img, {**v, "bbox": bbox, "frame_size": (1920, 1080)})   # a row that keeps its box
+            self.assertEqual(exact, (x1, y1, x2, y2))
+
+    def test_old_label_with_a_speed_appended_is_hidden_too(self):
+        with tempfile.TemporaryDirectory() as d:
+            w, h = 1920, 1080
+            frame = cv2.GaussianBlur(np.random.default_rng(2).integers(60, 200, (h, w, 3), dtype=np.uint8), (0, 0), 3)
+            text = evidence.label_text("V3", "No-parking stop", "Motorbike", 20) + " 2 km/h"
+            org, scale = evidence.label_org((700, 400, 900, 560), h)
+            from violations.zones import draw_label
+            draw_label(frame, text, org, (0, 0, 255), scale)
+            x1, y1, x2, y2 = evidence.label_rect(text, org, scale)
+            v = case(code="V3", title="No-parking stop", cls="Motorbike", track_id=20, kph=2.0)
+            out = vlm.hide_label(frame, v)
+            self.assertGreater(out[y1 + 2:y2 - 2, x2 - 40:x2 - 5].mean(), frame[y1 + 2:y2 - 2, x2 - 40:x2 - 5].mean() + 20)
+
+    def test_unfound_label_leaves_the_image_alone(self):
+        img = np.full((540, 960, 3), 100, np.uint8)
+        out = vlm.hide_label(img, case(code="V3", cls="Motorbike", track_id=20))
+        self.assertTrue((out == img).all())
+
+    def test_gather_images_hides_the_label_only_in_the_scene_photo(self):
+        with tempfile.TemporaryDirectory() as d:
+            snap, v, bbox, h = drawn_scene(d)
+            shutil_crop = Path(d) / "x_crop.jpg"
+            cv2.imwrite(str(Path(d) / "c.jpg"), np.full((100, 100, 3), 70, np.uint8))
+            v.update(snapshot=snap.name, crop="c.jpg")
+            seen = []
+            real = vlm.hide_label
+            with mock.patch.object(vlm, "hide_label", side_effect=lambda im, vv: seen.append(1) or real(im, vv)):
+                out = vlm.gather_images(v, d, 4, 1920)
+            self.assertEqual(len(out), 2)
+            self.assertEqual(len(seen), 1)
+
+
+class ClosedQuestionTests(unittest.TestCase):
+    class Fake:
+        def __init__(self, reply=None, boom=False):
+            self.reply, self.boom, self.calls = reply, boom, []
+
+        def ask(self, system, text, images, **kw):
+            self.calls.append((text, images, kw))
+            if self.boom:
+                raise OSError("down")
+            return self.reply
+
+    imgs = [("close-up of the vehicle", b"jpg"), ("the whole scene", b"jpg2")]
+
+    def test_each_answer_sets_the_verdict_fact(self):
+        want = {"helmet": "contradicted", "hair": "supported", "cap": "supported", "unclear": "insufficient"}
+        for word, verdict in want.items():
+            for reply in (word, word.upper() + ".", json.dumps({"head": word})):
+                f = self.Fake(reply)
+                chk = vlm.visual_check(f, case(code="V6", cls="Motorbike"), self.imgs)
+                self.assertEqual((chk["answer"], chk["verdict"]), (word, verdict), reply)
+                p = vlm.build_prompt(case(code="V6", cls="Motorbike"), self.imgs, chk)
+                self.assertIn(f'The verdict is therefore "{verdict}"', p)
+
+    def test_garbage_is_unclear(self):
+        for reply in ("", None, "maybe a turban?", "{}", "{not json", "42"):
+            chk = vlm.visual_check(self.Fake(reply), case(code="V6"), self.imgs)
+            self.assertEqual(chk["answer"], "unclear", reply)
+            self.assertEqual(chk["verdict"], "insufficient")
+
+    def test_one_short_call_with_only_the_closeup(self):
+        f = self.Fake("hair")
+        vlm.visual_check(f, case(code="V6"), self.imgs)
+        self.assertEqual(len(f.calls), 1)
+        text, images, kw = f.calls[0]
+        self.assertEqual(images, self.imgs[:1])
+        self.assertLessEqual(kw["max_tokens"], 16)
+        self.assertIn("helmet, hair, cap or unclear", text)
+
+    def test_other_rules_and_failures_ask_nothing_or_nothing_is_invented(self):
+        f = self.Fake("helmet")
+        self.assertIsNone(vlm.visual_check(f, case(code="V1"), self.imgs))
+        self.assertEqual(f.calls, [])
+        self.assertIsNone(vlm.visual_check(f, case(code="V6"), [("the whole scene", b"x")]))
+        self.assertIsNone(vlm.visual_check(self.Fake(boom=True), case(code="V6"), self.imgs))
+        self.assertNotIn("close-up check", vlm.build_prompt(case(code="V6"), self.imgs, None))
+
+    def test_explain_now_asks_the_closed_question_first(self):
+        with tempfile.TemporaryDirectory() as d:
+            cv2.imwrite(str(Path(d) / "c.jpg"), np.full((100, 100, 3), 70, np.uint8))
+            f = self.Fake("helmet")
+            replies = ["helmet", json.dumps({"assessment": "contradicted", "confidence": 0.8, "summary": "s"})]
+            f.ask = lambda system, text, images, **kw: (f.calls.append(text), replies.pop(0))[1]
+            f.model, f.name = "m", "local"
+            ex = vlm.Explainer.__new__(vlm.Explainer)
+            ex.data_dir, ex.cascade, ex.settings = Path(d), None, {**vlm.DEFAULTS}
+            with mock.patch.object(vlm, "resolve_backend", return_value=f):
+                res = vlm.Explainer.explain_now(ex, case(code="V6", cls="Motorbike", crop="c.jpg"))
+            self.assertEqual(res.assessment, "contradicted")
+            self.assertIn("helmet, hair, cap or unclear", f.calls[0])
+            self.assertIn("close-up check", f.calls[1])
+
+
+class OverSpeedTests(unittest.TestCase):
+    def test_a_still_cannot_confirm_or_contradict_a_speed(self):
+        p = vlm.build_prompt(case(code="V2", cls="Car", kph=88.0), [("close-up", b"x")])
+        self.assertIn("can neither confirm nor contradict a measured speed", p)
+        self.assertIn("not on a motor vehicle", p)
+        self.assertIn("a concern, not a contradiction", p)
+        self.assertIn("88.0 km/h", p)                          # the measurement is still given as a fact
+        self.assertIn("motor vehicle in the red box", p)       # the question is about the box, not the recorded class
+
+    def test_a_different_type_does_not_overrule_a_supported_v2(self):
+        obj = {"visible": "A white bus on a wide road.", "present": True, "assessment": "supported", "confidence": 0.8,
+               "summary": "s"}
+        ex = vlm.to_explanation(obj, "m", "b", 1, 1, vlm.guard_subject(case(code="V2", cls="Car")), "V2")
+        self.assertEqual(ex.assessment, "supported")
+        ex = vlm.to_explanation(obj, "m", "b", 1, 1, vlm.guard_subject(case(code="V4", cls="Car")), "V4")
+        self.assertEqual(ex.assessment, "insufficient")        # other rules keep the class guard
+
+
+class SpeedTalkTests(unittest.TestCase):
+    obj = {"event": "The motorbike crosses the line. It travels at about 40 km/h. It is slow here.",
+           "cause": "Avoiding a pothole. The speed looks low.", "summary": "Crossed a line at a low speed.",
+           "visible": "A road. The vehicle seems stopped.", "other_cameras": "Seen at 30 km/h earlier.",
+           "assessment": "insufficient", "confidence": 0.5}
+
+    def run_code(self, code):
+        return vlm.to_explanation(dict(self.obj), "m", "b", 1, 1, "", code)
+
+    def test_speed_sentences_removed_for_non_speed_rules(self):
+        for code in ("V1", "V3", "V4", "V5", "V6", "V7", "V8", "V9"):
+            ex = self.run_code(code)
+            self.assertNotRegex(ex.event + ex.cause + ex.summary + ex.visible, r"km/h|speed", code)
+            self.assertIn("crosses the line", ex.event)
+        self.assertEqual(self.run_code("V5").cause, "Avoiding a pothole.")
+        self.assertEqual(self.run_code("V1").other_cameras, "Seen at 30 km/h earlier.")   # journey facts are given data
+
+    def test_stopped_or_slow_claims_removed_for_moving_rules_only(self):
+        for code in ("V2", "V4", "V5", "V9"):
+            ex = self.run_code(code)
+            self.assertNotRegex(ex.visible, "stopped")
+            self.assertNotRegex(ex.event, "slow")
+        self.assertIn("stopped", self.run_code("V7").visible)           # standing rules may say it
+        self.assertIn("stopped", self.run_code("V1").visible)
+
+    def test_speed_rule_keeps_its_speed_talk(self):
+        ex = self.run_code("V2")
+        self.assertIn("40 km/h", ex.event)
+        self.assertIn("speed looks low", ex.cause)
+        self.assertEqual(self.run_code("V10").event.count("km/h"), 1)    # advisory kinematic rules keep their numbers
+
+    def test_no_code_no_stripping(self):
+        ex = vlm.to_explanation(dict(self.obj), "m", "b", 1, 1)
+        self.assertIn("40 km/h", ex.event)
+
+    def test_speed_left_out_of_the_prompt_facts_of_other_rules(self):
+        for code in ("V1", "V3", "V4", "V5", "V6", "V7", "V8", "V9"):
+            p = vlm.build_prompt(case(code=code, kph=12.0, details={"kph": 12.0, "max_kph": 15, "dwell_s": 30}), [])
+            self.assertNotRegex(p.split("MEASUREMENTS")[1].split("Now answer")[0], r"km/h|kph|speed", code)
+            self.assertIn("dwell s: 30", p)
+        for code in ("V2", "V10", "V11"):
+            self.assertIn("12.0 km/h", vlm.build_prompt(case(code=code, kph=12.0), []))
 
 
 if __name__ == "__main__":

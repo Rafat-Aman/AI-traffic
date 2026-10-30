@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import socket
+import sqlite3
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -31,12 +32,16 @@ from violations.zones import (AREA_TYPES, DEFAULT_SPEED_LIMITS, DIRECTIONS, ROAD
 
 from . import api_map
 from . import api_optimize
+from . import api_payments
 from . import api_query
 from . import api_storage
+from . import api_vehicles
 from . import auth as auth_mod
 from . import citation as cit
 from . import disputes as disputes_mod
 from . import impact as impact_mod
+from . import registry as registry_mod
+from . import topology
 from . import vlm as vlm_mod
 from . import vlm_cascade
 from . import webauth
@@ -159,7 +164,11 @@ async def lifespan(_app):
     media_key()
     dispute_checker.resume(store, DATA)     # any open dispute whose model check was lost to a restart
     storage.queue.start()           # ingest queue: runs uploaded videos max_parallel at a time
+    pay.mailer.start()              # sends (or files in the outbox) notices and receipts, retrying failures
+    vehicles.purge.start()          # daily: passed-vehicle records older than PASSED_RETENTION_DAYS go
     yield
+    vehicles.purge.stop()
+    pay.mailer.stop()
     storage.queue.stop()
     await asyncio.to_thread(manager.stop_all)
 
@@ -235,7 +244,11 @@ def camera_view(cam):
 
 # Paths reachable without a session. Everything else under /api/ needs one: the check below fails shut, so
 # a route added later is protected until someone deliberately lists it here.
-PUBLIC_API = {"/api/login", "/api/login/code", "/api/login/verify", "/api/logout", "/api/me"}
+PUBLIC_API = {"/api/login", "/api/login/code", "/api/login/verify", "/api/logout", "/api/me",
+              # SSLCommerz's browser returns and its server-to-server IPN carry no session. They never trust
+              # their parameters: a payment counts only after SSLCommerz's validation API confirms it.
+              "/api/payments/sslcommerz/success", "/api/payments/sslcommerz/fail",
+              "/api/payments/sslcommerz/cancel", "/api/payments/sslcommerz/ipn"}
 # What a driver may reach. Their portal is a different surface from the operator dashboard, not a filtered
 # view of it, so the two never share an endpoint.
 DRIVER_API = {"/api/me", "/api/logout", "/api/portal/violations", "/api/portal/vehicles",
@@ -1139,13 +1152,24 @@ def linking_status():
 @app.get("/api/vehicles")
 def list_vehicles(min_cameras: int = 2, limit: int = 100):
     """Vehicles recognised on more than one camera."""
-    return {"items": store.vehicles(limit=min(limit, 500), min_cameras=min_cameras),
-            "tracklets": store.q("SELECT COUNT(*) AS n FROM tracklets")[0]["n"]}
+    items = store.vehicles(limit=min(limit, 500), min_cameras=min_cameras)
+    for v in items:
+        v["display_id"] = topology.display_id(v["global_id"])
+    return {"items": items, "tracklets": store.q("SELECT COUNT(*) AS n FROM tracklets")[0]["n"]}
 
 
-@app.get("/api/vehicles/{gid}")
-def vehicle_journey(gid: int):
-    """Every camera one vehicle passed, in order, with how long it took between them."""
+@app.get("/api/vehicles/{vehicle}")
+def vehicle_journey(vehicle: str):
+    """Every camera one vehicle passed, in order, with how long it took between them. Takes "DV-000123", "dv123"
+    or "123"; an id that was later merged into another vehicle (records that arrived out of order) opens that one."""
+    gid = topology.parse_display_id(vehicle)
+    if gid is None:
+        raise HTTPException(404, "No such vehicle")
+    try:
+        gid = topology.resolve(store, gid) or gid
+        merged = topology.merged_from(store, gid)
+    except sqlite3.OperationalError:     # no merge table yet: nothing was ever merged
+        merged = []
     rows = store.journey(gid)
     if not rows:
         raise HTTPException(404, "No such vehicle")
@@ -1153,7 +1177,7 @@ def vehicle_journey(gid: int):
         gap = (b["t_cross"] or 0) - (a["t_cross"] or 0)
         b["seconds_from_previous"] = round(gap, 1)
         b["kmh_between"] = round(3.6 * (a["speed"] or 0), 1) if gap > 0 else None
-    return {"global_id": gid, "passes": rows}
+    return {"global_id": gid, "display_id": topology.display_id(gid), "merged_ids": merged, "passes": rows}
 
 
 # ---------------------------------------------------------------- disputes (staff)
@@ -1230,8 +1254,11 @@ def _driver(request: Request):
     return u
 
 
-def _my_plate_keys(uid):
-    return [v["plate_key"] for v in store.vehicles_of(uid, verified_only=True)]
+def _my_plate_keys(user):
+    """Plates a driver may see, dispute and pay: their verified vehicles plus the owner contacts that carry their
+    licence number. Both are set by an administrator (driver accounts are admin-created), and payments use the
+    same function, so what a driver can see and what they can pay never disagree."""
+    return sorted(registry_mod.driver_plate_keys(store, user))
 
 
 def shared_link(path):
@@ -1284,7 +1311,7 @@ def portal_violations(request: Request, limit: int = 50, offset: int = 0):
     liability for anyone yet, and one still in the review queue has not been decided at all. A withdrawn citation
     stays in the list, marked withdrawn, so the driver sees the outcome."""
     u = _driver(request)
-    plates = _my_plate_keys(u["user_id"])
+    plates = _my_plate_keys(u)
     rows, total = store.violations_for_plates(plates, limit=min(limit, 200), offset=offset)
     found = disputes_mod.disputes_for_citations(store, [r["citation_no"] for r in rows])
     return {"items": [_for_driver(r, found.get(r["citation_no"])) for r in rows], "total": total,
@@ -1297,7 +1324,7 @@ def portal_violations(request: Request, limit: int = 50, offset: int = 0):
 @app.get("/api/portal/violation/{vid}")
 def portal_violation(vid: int, request: Request):
     u = _driver(request)
-    plates = set(_my_plate_keys(u["user_id"]))
+    plates = set(_my_plate_keys(u))
     v = store.violation(vid)
     # An uncited case, and an advisory one (speed), are answered exactly like one that does not exist: the list
     # already leaves them out, and a driver who guesses a number must not be able to tell it is there.
@@ -1314,7 +1341,7 @@ def _my_citation(no, u):
     """The citation if it is on one of this driver's verified plates, else 404 - the same answer as for a number
     that does not exist, so another driver's citation cannot be told apart from none."""
     c = store.citation(no) if cit.NUMBER_RE.match(no or "") else None
-    mine = set(_my_plate_keys(u["user_id"]))
+    mine = set(_my_plate_keys(u))
     if not c or disputes_mod.owner_plate_key(c, store.violation(c["violation_id"])) not in mine:
         if c:
             store.audit(u, "portal.denied", "citation", no, "citation is not the driver's", u.get("address", ""))
@@ -1340,7 +1367,7 @@ def portal_file_dispute(no: str, body: DisputeIn, request: Request):
     model re-check starts in the background; a human decides."""
     u = _driver(request)
     try:
-        d = disputes_mod.file(store, no, u, body.statement, _my_plate_keys(u["user_id"]))
+        d = disputes_mod.file(store, no, u, body.statement, _my_plate_keys(u))
     except cit.Refused as e:
         raise HTTPException(e.status, str(e))
     dispute_checker.submit(store, DATA, d["id"])
@@ -1734,6 +1761,12 @@ app.include_router(api_query.make_router(store, current_user, require, CONTROLLE
 # Storage: retention (dry run, admin applies), disk monitor, and the ingest queue that uploads go through.
 storage = api_storage.build(store, DATA, current_user, require, CONTROLLER, ADMIN, manager, max_parallel=1)
 app.include_router(storage.router)
+pay = api_payments.build(store, DATA, current_user, require, CONTROLLER, ADMIN, DRIVER)
+app.include_router(pay.router)
+cit.on_issued.append(pay.on_issued)              # citation notice to the registered owner's email
+disputes_mod.on_decided.append(pay.on_decided)   # payment paused / cancelled / due again, and the decision email
+vehicles = api_vehicles.build(store, DATA, current_user, require, CONTROLLER, ADMIN)
+app.include_router(vehicles.router)
 
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon_ico():

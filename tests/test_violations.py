@@ -35,12 +35,13 @@ def make_camera(direction="both", banned=(), areas=(), lines=(), peak_hours=None
 class Sim:
     """Feeds vehicles moving on the road plane through the engine exactly as violation_tracker.py does."""
 
-    def __init__(self, camera, only=None, overrides=None, helmet=None, start=None, keep_every=1):
+    def __init__(self, camera, only=None, overrides=None, helmet=None, start=None, keep_every=1, heading=0):
         self.cam = camera
         self.engine = ViolationEngine(camera, overrides, only, helmet)
         self.frame = 0
         self.first = {}
         self.start = start
+        self.heading = heading  # +1 toward the camera, -1 away, 0 unknown (what the pipeline would measure)
         self.keep_every = keep_every  # >1 simulates a live camera dropping frames when the computer is behind
 
     def step(self, vehicles, purity=1.0):
@@ -63,7 +64,7 @@ class Sim:
             w = 60
             bbox = (int(point[0] - w), int(point[1] - 2 * w), int(point[0] + w), int(point[1]))
             obs.append(Observation(tid, self.frame, t, cls, purity, 100, bbox, point, r, xy_m,
-                                   kph, section, self.cam.areas_at(point)))
+                                   kph, section, self.cam.areas_at(point), self.heading))
         wall = None
         if self.start:
             from datetime import timedelta
@@ -402,24 +403,24 @@ class HelmetTests(unittest.TestCase):
     def run_with(self, probs, seconds=3):
         """The motorbike is seen for `seconds`, then leaves the view (the rule decides when it is gone)."""
         seq = iter(probs)
-        sim = Sim(make_camera(), only=["V6"], helmet=lambda crop: next(seq, probs[-1]))
+        sim = Sim(make_camera(), only=["V6"], helmet=lambda crop: next(seq, probs[-1]), heading=1)
         v = 20 / 3.6
         return sim.run(seconds + 2, lambda t: [(1, "Motorbike", (3.0, 20 + v * t), 20.0)] if t < seconds else [])
 
     def test_decided_when_it_leaves_with_the_best_frame(self):
-        ev = self.run_with([0.9, 0.97, 0.85])
+        ev = self.run_with([0.9, 0.97, 0.85, 0.9])
         self.assertEqual(codes(ev), ["V6"])
         self.assertIsNotNone(ev[0].frame)  # evidence = the frame of the strongest sighting
         self.assertEqual(ev[0].details["max_probability"], 0.97)
 
     def test_unsure_vehicle_class(self):
-        sim = Sim(make_camera(), only=["V6"], helmet=lambda c: 0.99)
+        sim = Sim(make_camera(), only=["V6"], helmet=lambda c: 0.99, heading=1)
         v = 20 / 3.6
         ev = sim.run(5, lambda t: [(1, "Motorbike", (3.0, 20 + v * t), 20.0)] if t < 3 else [], purity=0.7)
         self.assertEqual(ev, [])
 
     def test_bare_head(self):
-        self.assertEqual(codes(self.run_with([0.9])), ["V6"])
+        self.assertEqual(codes(self.run_with([0.9] * 4)), ["V6"])
 
     def test_helmet(self):
         self.assertEqual(self.run_with([0.05]), [])
@@ -431,19 +432,19 @@ class HelmetTests(unittest.TestCase):
         self.assertEqual(self.run_with([0.9, 0.9] + [0.1] * 20), [])
 
     def test_mostly_bare(self):
-        self.assertEqual(codes(self.run_with([0.9, 0.1, 0.9, 0.9, 0.95])), ["V6"])
+        self.assertEqual(codes(self.run_with([0.9, 0.9, 0.1, 0.9, 0.95])), ["V6"])
 
     def test_too_small_to_judge(self):
-        sim = Sim(make_camera(), only=["V6"], overrides={"helmet": {"min_box_px": 200}}, helmet=lambda c: 0.99)
+        sim = Sim(make_camera(), only=["V6"], overrides={"helmet": {"min_box_px": 200}}, helmet=lambda c: 0.99, heading=1)
         self.assertEqual(sim.run(5, lambda t: [(1, "Motorbike", (3.0, 20 + 5 * t), 20.0)] if t < 3 else []), [])
 
     def test_parked_motorbike_is_not_riding(self):
-        sim = Sim(make_camera(), only=["V6"], helmet=lambda c: 0.99)
+        sim = Sim(make_camera(), only=["V6"], helmet=lambda c: 0.99, heading=1)
         self.assertEqual(sim.run(5, lambda t: [(1, "Motorbike", (3.0, 70.0), 0.0)] if t < 3 else []), [])
 
     def test_bike_right_behind_makes_sightings_ambiguous(self):
         # A second motorbike just behind (above in the image) - its riders' heads would be in the crop.
-        sim = Sim(make_camera(), only=["V6"], helmet=lambda c: 0.99)
+        sim = Sim(make_camera(), only=["V6"], helmet=lambda c: 0.99, heading=1)
         v = 20 / 3.6
         ev = sim.run(5, lambda t: [(1, "Motorbike", (3.0, 40 + v * t), 20.0), (2, "Motorbike", (3.0, 37 + v * t), 20.0)]
                      if t < 3 else [])

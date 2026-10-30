@@ -831,6 +831,8 @@
                 <span class="hint">960 px sees smaller, farther vehicles and measures more of each zone reliably (~30 FPS on an M5). 640 px runs ~60 FPS: best for live cameras.</span></label>
               <label class="field">Analysis resolution<select id="maxw">${[[0, "Full resolution (needed for helmets and plates)"], [1920, "1920 px (faster on 4K video)"], [1280, "1280 px (fastest)"]].map(([v, l]) => `<option value="${v}" ${s.max_width === v ? "selected" : ""}>${l}</option>`).join("")}</select></label>
               <label class="row small"><input type="checkbox" id="anpr" ${s.anpr ? "checked" : ""} ${state.meta.features.anpr ? "" : "disabled"}> Read number plates of violators${state.meta.features.anpr ? "" : " (plate models not installed)"}</label>
+              <label class="row small"><input type="checkbox" id="passed" ${s.passed !== false ? "checked" : ""}> Record every passing vehicle (class, colour, photo; kept 30 days)</label>
+              <label class="row small"><input type="checkbox" id="anpr_all" ${s.anpr_all ? "checked" : ""} ${state.meta.features.anpr ? "" : "disabled"}> Also read the plate of every passing vehicle (about 0.5 s of CPU per vehicle, up to 9% fewer frames/s)</label>
               <label class="row small"><input type="checkbox" id="impact" ${s.impact !== false ? "checked" : ""}> Measure the traffic impact of each violation (queue, speed, occupancy)</label>
               <label class="row small"><input type="checkbox" id="helmet" ${s.helmet ? "checked" : ""} ${state.meta.features.helmet ? "" : "disabled"}> Detect riders without helmet (V6)${state.meta.features.helmet ? "" : " (helmet model not installed)"}</label>
               ${cam.kind === "file" ? `
@@ -852,7 +854,7 @@
     let imgsz = s.imgsz;
     $$("#imgsz button").forEach((b) => b.onclick = () => { imgsz = +b.dataset.v; $$("#imgsz button").forEach((x) => x.classList.toggle("on", x === b)); });
     if (isAdmin()) $("#save-set").onclick = async () => {
-      const body = { settings: { imgsz, max_width: +$("#maxw").value, anpr: $("#anpr").checked, helmet: $("#helmet").checked, impact: $("#impact").checked } };
+      const body = { settings: { imgsz, max_width: +$("#maxw").value, anpr: $("#anpr").checked, passed: $("#passed").checked, anpr_all: $("#anpr_all").checked, helmet: $("#helmet").checked, impact: $("#impact").checked } };
       if (cam.kind === "file") {
         body.settings.analysis_fps = +$("#afps").value;
         body.settings.realtime = $("#realtime").checked;
@@ -1583,7 +1585,7 @@
       }
       body.innerHTML = `<div class="card"><table class="kv wide"><tr><th>Vehicle</th><th>Class</th>
         <th>Cameras</th><th>Passes</th><th>First seen</th><th>Last seen</th></tr>
-        ${r.items.map((v) => `<tr class="vrow" data-gid="${v.global_id}"><td><b>V-${v.global_id}</b></td>
+        ${r.items.map((v) => `<tr class="vrow" data-gid="${v.global_id}"><td><b>${esc(v.display_id || "V-" + v.global_id)}</b></td>
           <td>${esc((v.classes || "").split(",")[0])}</td><td>${v.cameras}</td><td>${v.passes}</td>
           <td class="small">${esc(fmtTime(v.first_seen))}</td><td class="small">${esc(fmtTime(v.last_seen))}</td></tr>`).join("")}
         </table></div><div id="v-journey"></div>`;
@@ -1593,7 +1595,7 @@
 
     async function showJourney(gid) {
       const j = await api(`/api/vehicles/${gid}`);
-      $("#v-journey").innerHTML = `<div class="card"><div class="card-head"><h2>Vehicle V-${gid}</h2>
+      $("#v-journey").innerHTML = `<div class="card"><div class="card-head"><h2>Vehicle ${esc(j.display_id || "V-" + gid)}${(j.merged_ids || []).length ? ` <span class="small muted">(also ${j.merged_ids.map((m) => "DV-" + String(m).padStart(6, "0")).join(", ")})</span>` : ""}</h2>
         <span class="spacer"></span><span class="small muted">${j.passes.length} camera(s), in order</span></div>
         <div class="timeline">${j.passes.map((p, i) => `<div><span class="tl-dot${i ? "" : " hot"}"></span>
           <b>${esc(p.camera_name)}</b>
@@ -1935,6 +1937,7 @@
     $("#who-name").textContent = state.me.name || state.me.username || "";
     $("#who-role").textContent = state.me.role === "admin" ? "Administrator" : "Traffic controller";
     $("#nav-admin").hidden = !isAdmin();
+    $("#nav-payments").hidden = !isAdmin();
     $("#signout").onclick = async () => { await api("/api/logout", { method: "POST" }); location.href = "/login"; };
     try { state.meta = await api("/api/meta"); } catch (e) { $("#main").innerHTML = `<div class="card errors">Server not reachable: ${esc(e.message)}</div>`; return; }
     if (state.meta.lan_url) $("#lan-url").innerHTML = `Phone / LAN: <a href="${esc(state.meta.lan_url)}">${esc(state.meta.lan_url.replace("http://", ""))}</a>`;

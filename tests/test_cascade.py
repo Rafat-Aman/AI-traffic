@@ -515,5 +515,71 @@ class ImageChoice(Env, unittest.TestCase):
         self.assertEqual(len(self.labels(v, 2)), 2)
 
 
+class SeqBackend(FakeBackend):
+    """Answers from a list, one reply per call."""
+
+    def __init__(self, replies, **kw):
+        super().__init__(None, **kw)
+        self.replies = list(replies)
+
+    def ask(self, system, user_text, images, **kw):
+        super().ask(system, user_text, images, **kw)
+        return self.replies.pop(0)
+
+
+class HelmetQuestionFlow(Env, unittest.TestCase):
+    def setUp(self):
+        self.setUpEnv()
+        self.addCleanup(self.tmp.cleanup)
+
+    def run_v6(self, answer, events=None):
+        screen = SeqBackend([screen_reply("yes"), answer], model="qwen3-vl-2b")
+        reason = FakeBackend(reason_reply(visible="a red motorbike with a rider"), model="qwen3-vl-8b")
+        c = vc.Cascade(self.dir, {}, screen=screen, reason=reason)
+        ex = c.run(self.case("V6", cls="Motorbike", title="Motorbike rider without helmet"), on_stage=events.append
+                   if events is not None else None)
+        return ex, screen, reason
+
+    def test_the_answer_reaches_the_reasoner_as_a_fact_that_sets_the_verdict(self):
+        want = {"helmet": "contradicted", "hair": "supported", "cap": "supported", "unclear": "insufficient"}
+        for word, verdict in want.items():
+            ex, screen, reason = self.run_v6(word)
+            self.assertEqual(len(screen.calls), 2, word)                       # the screen, then one short question
+            self.assertEqual(screen.calls[1]["n_images"], 1)
+            self.assertLessEqual(screen.calls[1]["max_tokens"], 16)
+            self.assertIn(f'The verdict is therefore "{verdict}"', reason.calls[0]["text"], word)
+            self.assertEqual([g["stage"] for g in ex.stages], ["prescreen", "screen", "visual_check", "reason"])
+            self.assertEqual(ex.stages[2]["answer"], word)
+
+    def test_garbage_answer_is_unclear(self):
+        ex, screen, reason = self.run_v6("a nice day")
+        self.assertEqual(ex.stages[2]["answer"], "unclear")
+        self.assertIn('"insufficient"', reason.calls[0]["text"])
+
+    def test_failed_question_does_not_block_the_case(self):
+        screen = SeqBackend([screen_reply("yes")], model="qwen3-vl-2b")
+        orig = screen.ask
+        def ask(system, text, images, **kw):
+            if len(screen.calls) >= 1:
+                screen.calls.append({})
+                raise OSError("down")
+            return orig(system, text, images, **kw)
+        screen.ask = ask
+        reason = FakeBackend(reason_reply())
+        ex = vc.Cascade(self.dir, {}, screen=screen, reason=reason).run(self.case("V6", cls="Motorbike"))
+        self.assertEqual(ex.decided_by, "reasoner")
+        self.assertEqual(ex.stages[2]["answer"], "unavailable")
+        self.assertNotIn("close-up check", reason.calls[0]["text"])
+
+    def test_stage_event_with_eta_and_no_question_for_other_rules(self):
+        events = []
+        self.run_v6("hair", events)
+        e = next(x for x in events if x["stage"] == "visual_check")
+        self.assertGreater(e["eta_s"], 0)
+        screen = SeqBackend([screen_reply("yes")])
+        vc.Cascade(self.dir, {}, screen=screen, reason=FakeBackend(reason_reply())).run(self.case("V1"))
+        self.assertEqual(len(screen.calls), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

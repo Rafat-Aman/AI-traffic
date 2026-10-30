@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fines and payments - Traffic Surveillance</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/payments.css">
+</head>
+<body class="pay-page">
+  <header class="pay-top">
+    <a class="btn small ghost" href="/">&larr; Dashboard</a>
+    <h1>Fines and payments</h1>
+    <span class="spacer"></span>
+    <span class="small secondary" id="who"></span>
+  </header>
+  <main class="pay-body">
+    <nav class="tabs" id="tabs" role="tablist">
+      <button data-tab="fines" class="on">Fines</button>
+      <button data-tab="registry">Owner contacts</button>
+      <button data-tab="payments">Payments</button>
+      <button data-tab="outbox">Outbox</button>
+    </nav>
+    <section id="pane" class="card"></section>
+  </main>
+  <div id="toast" class="pay-toast hidden" role="status"></div>
+  <script src="/static/payments.js"></script>
+</body>
+</html>

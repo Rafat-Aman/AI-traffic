@@ -454,6 +454,9 @@ class StorageManager:
                           "reason": f"{row['n']} tracklet rows older than {pol['embed_days']} days: drop appearance vectors, "
                                     "keep the rows (class, time, speed, colour, vehicle id)",
                           "rows": row["n"], "cutoff": cutoff})
+        item = self._passed_item()
+        if item:
+            items.append(item)
         for i, it in enumerate(items):
             it["n"] = i
         totals = {"files": sum(1 for i in items if i["action"] == "delete_file"),
@@ -468,6 +471,20 @@ class StorageManager:
                             json.dumps(items), json.dumps(kept)))
         return {"id": pid, "created_at": ctx["now"], "status": "planned", "items": items, "kept": kept,
                 "totals": totals, "by_rule": by_rule, "policy": pol, "dry_run": True}
+
+    def _passed_item(self) -> Optional[dict]:
+        """Passed-vehicle records (vehicles that broke no rule) older than PASSED_RETENTION_DAYS, as a plan item.
+        surveillance/passed.PurgeLoop deletes the same rows daily; this makes them visible in the dry run too."""
+        try:
+            from . import passed
+            r = passed.purge(self.store, self.data_dir, now=self.now(), dry_run=True)
+        except Exception:                                   # the table or folder may not exist yet
+            return None
+        if not r["rows"] and not r["files"]:
+            return None
+        return {"action": "purge_passed", "path": "db:passed_vehicles", "bytes": r["bytes"], "rule": "passed_retention",
+                "reason": f"{r['rows']} records of passing vehicles older than {r['days']:g} days (PASSED_RETENTION_DAYS) "
+                          f"and {r['files']} thumbnails: they broke no rule", "rows": r["rows"], "days": r["days"]}
 
     def get_plan(self, pid: int) -> Optional[dict]:
         r = self.store.q("SELECT * FROM storage_plans WHERE id=?", (pid,))
@@ -539,6 +556,14 @@ class StorageManager:
                 self.store.audit(user, "storage.delete", "file", it["path"],
                                  f"plan {plan_id}; rule {rule}; {st.st_size} bytes; {reason}", addr)
                 self._prune_empty(p.parent)
+            elif it["action"] == "purge_passed":
+                from . import passed
+                r = passed.purge(self.store, self.data_dir, days=it["days"], now=now)
+                freed += r["bytes"]
+                deleted.append(f"db:passed_vehicles ({r['rows']} rows, {r['files']} thumbnails)")
+                self.store.audit(user, "storage.purge_passed", "passed_vehicles", "",
+                                 f"plan {plan_id}; {r['rows']} records older than {r['days']:g} days, "
+                                 f"{r['files']} thumbnails, {r['bytes']} bytes", addr)
             elif it["action"] == "compact_tracklets":
                 n = self.store.q("SELECT COUNT(*) n FROM tracklets WHERE created_at < ? AND (embed IS NOT NULL OR"
                                  " embed_reid IS NOT NULL)", (it["cutoff"],))[0]["n"]

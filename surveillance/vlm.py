@@ -50,6 +50,9 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from violations.evidence import label_org, label_rect, label_text
+from violations.zones import draw_label
+
 # ---------------------------------------------------------------- what each rule claims
 
 # code -> (what the engine decided, the innocent explanation that would overturn it)
@@ -59,8 +62,10 @@ RULE_CLAIM = {
            "The whole road is stopped (red light, jam or a blocked junction ahead), so the bus had nowhere to "
            "go; or it is in fact pulled over at a stop, lay-by or kerb and out of the running lane."),
     "V2": ("The vehicle's measured ground speed was over the limit for this road.",
-           "The box outlined is not the vehicle that was measured, or it is so far away or so blurred that no "
-           "judgement about it is possible from these pictures."),
+           "The red box is not on a motor vehicle at all. A still photograph can neither confirm nor contradict a "
+           "measured speed, so do not argue with the speed and do not call the finding contradicted because the "
+           "vehicle looks slow, stopped or far away. If the vehicle type differs from the recorded class, say so in "
+           "\"visible\" or \"cause\": that is a concern, not a contradiction, and the measurement stands."),
     "V3": ("The vehicle stood at a kerb marked no-parking, long enough to count as parking rather than a "
            "momentary halt.",
            "It is held in a queue of stopped traffic rather than parked, or it is picking up and setting down "
@@ -240,7 +245,7 @@ class Explanation:
 
 # ---------------------------------------------------------------- evidence images
 
-def encode_image(path, max_side, quality=85):
+def encode_image(path, max_side, quality=85, prepare=None):
     """JPEG bytes of an evidence photo, scaled down so the vision encoder is not asked to read a 4K frame.
 
     Image size is the dominant cost on a CPU backend: every extra pixel becomes vision tokens that must be
@@ -248,12 +253,96 @@ def encode_image(path, max_side, quality=85):
     img = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if img is None:
         return None
+    if prepare is not None:
+        img = prepare(img)
     h, w = img.shape[:2]
     if max(h, w) > max_side:
         s = max_side / max(h, w)
         img = cv2.resize(img, (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA)
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
     return buf.tobytes() if ok else None
+
+
+# ---------------------------------------------------------------- hiding the drawn label
+
+LABEL_FOUND = 0.55      # normalised correlation above which a rendered label counts as found in the snapshot
+
+
+def label_candidates(violation):
+    """Texts the snapshot's red label may carry. Today: "V3 <title>: <class> #<track>". Cases stored with a speed
+    appended ("... #20 2 km/h") are looked for too, on every rule, since older images had it for all of them."""
+    base = label_text((violation.get("code") or "").upper(), violation.get("title") or "",
+                      violation.get("cls") or "", violation.get("track_id"))
+    out = [base]
+    if violation.get("kph") is not None:
+        out.append(f"{base} {violation['kph']:.0f} km/h")
+    return out
+
+
+def _label_template(text, scale, shrink=1.0):
+    """The label as zones.draw_label paints it (dark box, red text), cut out on its own. `shrink` > 1 draws it at
+    `scale` * shrink and reduces it by that factor, as a frame wider than 1920 px is when the snapshot is saved."""
+    scale = scale * shrink
+    thickness = max(1, round(scale * 3))
+    (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+    canvas = np.full((160, tw + 40, 3), 128, np.uint8)
+    org = (10, 80)
+    draw_label(canvas, text, org, (0, 0, 255), scale)
+    x1, y1, x2, y2 = label_rect(text, org, scale)
+    tpl = canvas[y1:y2, x1:x2]
+    if shrink != 1.0:
+        tpl = cv2.resize(tpl, (max(1, round(tpl.shape[1] / shrink)), max(1, round(tpl.shape[0] / shrink))),
+                         interpolation=cv2.INTER_AREA)
+    return tpl
+
+
+# Frames wider than 1920 px are shrunk when the snapshot is saved: 1440p, 4K and DCI 4K are the usual ones.
+LABEL_SHRINKS = (1.0, 2.0, 4 / 3, 4096 / 1920)
+
+
+def find_label(img, violation):
+    """(x1, y1, x2, y2) of the drawn label in the stored snapshot, or None.
+
+    The row keeps no box, so the label is found by drawing it again with the same helper and text and matching.
+    Where the row does carry `bbox` and `frame_size` (the frame it was drawn on) the geometry is exact."""
+    h, w = img.shape[:2]
+    texts = label_candidates(violation)
+    bbox, fsize = violation.get("bbox"), violation.get("frame_size")
+    if bbox and fsize:
+        org, scale = label_org(bbox, fsize[1])
+        k = w / fsize[0]
+        return tuple(round(v * k) for v in label_rect(texts[0], org, scale))
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    best = (LABEL_FOUND, None)
+    for shrink in LABEL_SHRINKS:                    # drawn at 0.7 * frame_h/1080, then shrunk by `shrink`
+        s0 = 0.7 * h / 1080
+        for text in reversed(texts):               # longest first: it also matches inside the shorter label's box
+            tpl = cv2.cvtColor(_label_template(text, s0, shrink), cv2.COLOR_BGR2GRAY)
+            th, tw = tpl.shape[:2]
+            if th >= h or tw >= w or th < 4:
+                continue
+            _, score, _, loc = cv2.minMaxLoc(cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED))
+            if score > best[0] + (0.01 if best[1] is not None else 0):
+                best = (score, (loc[0], loc[1], loc[0] + tw, loc[1] + th))
+        if best[1] is not None and best[0] >= 0.85:
+            break
+    return best[1]
+
+
+def hide_label(img, violation):
+    """The snapshot with the red label above the vehicle painted out from its surroundings. A model that reads
+    "#20 2 km/h" there treats it as a measured speed and argues with it. Nothing outside the label strip changes.
+    A snapshot whose label cannot be found is returned as it is."""
+    rect = find_label(img, violation)
+    if rect is None:
+        return img
+    h, w = img.shape[:2]
+    x1, y1, x2, y2 = rect
+    mask = np.zeros((h, w), np.uint8)
+    mask[max(0, y1 - 2):max(0, y2 + 2), max(0, x1 - 2):max(0, x2 + 2)] = 255
+    if not mask.any():
+        return img
+    return cv2.inpaint(img, mask, 5, cv2.INPAINT_TELEA)
 
 
 CONTACT_CODES = ("V10", "V11")
@@ -292,19 +381,41 @@ def gather_images(violation, data_dir, max_images, max_side):
         p = data_dir / rel
         if not p.exists():
             continue
-        jpg = encode_image(p, max_side)
+        jpg = encode_image(p, max_side, prepare=(lambda im: hide_label(im, violation))
+                           if rel == violation.get("snapshot") else None)
         if jpg:
             out.append((label, jpg))
     return out
 
 
+# Speed is evidence only where the finding is about it. V2 is the speed rule. V10 (swerve while moving at speed) and V11
+# (closing speed, hard braking) are kinematic candidates whose measured numbers ARE the finding and are advisory, so
+# they keep theirs and may be discussed. Every other rule (V1 V3 V4 V5 V6 V7 V8 V9) leaves speed out of the prompt and
+# the answer: a model handed "12 km/h" for a lane-line case argues about it.
+SPEED_RULES = ("V2", "V10", "V11")
+# Rules about a vehicle that is moving: a still photograph or a few frames cannot show it stopped or slow, so a
+# sentence saying so is dropped from the answer. V9 (driving along a bus lane) is one; V10/V11 are exempt because V11
+# is partly about vehicles that stopped after contact.
+MOVING_RULES = ("V2", "V4", "V5", "V9")
+SPEED_TALK = re.compile(r"km/h|kph|\bspeed|\bmph\b", re.I)
+STILL_TALK = re.compile(r"\bstop(ped|s|ping)?\b|stationary|standing still|not moving|\bslow(ly)?\b|\bparked\b|"
+                        r"at rest|\bidle\b|\bhalted\b|\bcrawl(ing)?\b", re.I)
+_SPEED_KEY = re.compile(r"kph|speed|km/h|mps", re.I)
+
+
+def is_speed_rule(code):
+    return (code or "").upper() in SPEED_RULES
+
+
 def describe_facts(violation):
-    """The rule engine's own numbers, written out for the prompt. Only what was actually measured."""
+    """The rule engine's own numbers, written out for the prompt. Only what was actually measured; speeds only for
+    the rules that are about speed (see SPEED_RULES)."""
     v, lines = violation, []
     add = lines.append
+    speed_ok = is_speed_rule(v.get("code"))
     add(f"- vehicle: {v.get('cls') or 'unknown'} (classifier agreed on this class for "
         f"{round(100 * (v.get('class_conf') or 0))}% of the frames it was tracked)")
-    if v.get("kph") is not None:
+    if v.get("kph") is not None and speed_ok:
         add(f"- measured ground speed at the moment of the event: {v['kph']} km/h")
     if v.get("zone"):
         add(f"- road zone: {v['zone']}")
@@ -315,6 +426,8 @@ def describe_facts(violation):
     d = v.get("details") or {}
     if isinstance(d, dict):
         for k, val in d.items():
+            if not speed_ok and _SPEED_KEY.search(str(k)):
+                continue
             add(f"- {str(k).replace('_', ' ')}: {val}")
     if v.get("plate_text_en"):
         add(f"- number plate read by the system: {v['plate_text_en']} (do not repeat this unless asked)")
@@ -350,15 +463,81 @@ def describe_journey(violation):
             + "\n".join(lines))
 
 
-def build_prompt(violation, images):
+def guard_subject(violation):
+    """The vehicle class the answer guards compare the model's description with. Empty for V2: a different type
+    from the recorded class is a concern there, not a reason to overrule a verdict."""
+    return "" if (violation.get("code") or "").upper() == "V2" else (violation.get("cls") or "")
+
+
+def build_prompt(violation, images, check=None):
+    """`check`: the answer to a closed pre-question (see visual_check), added to the facts as a given."""
     code = (violation.get("code") or "").upper()
     claim, innocent = RULE_CLAIM.get(code, ("The system flagged this vehicle.", "Nothing visible supports it."))
     photos = "\n".join(f"{i + 1}. {label}" for i, (label, _) in enumerate(images)) or "none available"
-    subject = (violation.get("cls") or "vehicle").lower()
+    subject = "motor vehicle in the red box" if code == "V2" else (violation.get("cls") or "vehicle").lower()
+    facts = describe_facts(violation)
+    if check:
+        facts += "\n- close-up check, asked on its own and settled: " + check["fact"]
     return USER_TEMPLATE.format(vid=violation.get("id", "?"), code=code or "?",
                                 title=violation.get("title") or "", claim=claim, innocent=innocent,
-                                facts=describe_facts(violation), journey=describe_journey(violation),
+                                facts=facts, journey=describe_journey(violation),
                                 photos=photos, subject=subject)
+
+
+# ---------------------------------------------------------------- closed pre-questions
+
+# Rules that one look at the close-up decides. Asked first and on its own, because in the long answer a small model
+# describes the helmet correctly and still "supports" the violation. A choice of one word instead of yes/no (small
+# models lean to yes). The answer is passed into the main prompt as a fact that sets the verdict.
+VISUAL_CHECKS = {
+    "V6": ("Look at this close-up of a motorbike. What is on the head of the person driving it (the front rider)? "
+           "Answer with one word: helmet, hair, cap or unclear.",
+           {"helmet": ("the person driving wears a helmet. The verdict is therefore \"contradicted\": the "
+                       "violation is not shown.", "contradicted"),
+            "hair": ("the person driving has a bare head (no helmet). The verdict is therefore \"supported\" "
+                     "if the vehicle is a motorbike.", "supported"),
+            "cap": ("the person driving wears a cap, not a helmet. The verdict is therefore \"supported\" "
+                    "if the vehicle is a motorbike.", "supported"),
+            "unclear": ("the close-up does not show clearly whether the person driving wears a helmet. The "
+                        "verdict is therefore \"insufficient\".", "insufficient")}),
+}
+CHECK_SCHEMA = {"type": "object",
+                "properties": {"head": {"type": "string", "enum": ["helmet", "hair", "cap", "unclear"]}},
+                "required": ["head"], "additionalProperties": False}
+
+
+def parse_check(code, text):
+    """-> {"answer", "fact", "verdict"} for a closed pre-question's reply; anything unrecognised is "unclear"."""
+    outcomes = VISUAL_CHECKS[code][1]
+    obj = parse_reply(text) if text and "{" in text else None
+    raw = str(next(iter(obj.values()), "")) if obj else (text or "")
+    words = re.findall(r"[a-z]+", raw.lower())
+    word = words[0] if words else ""
+    if word not in outcomes:
+        word = "unclear"
+    fact, verdict = outcomes[word]
+    return {"answer": word, "fact": fact, "verdict": verdict}
+
+
+def visual_check(backend, violation, images, max_tokens=12):
+    """Ask the one closed question for this rule on the close-up. Returns parse_check's dict plus "seconds", or None
+    when the rule has none, there is no close-up, or the backend failed (the main question then runs without it:
+    a failed side question never blocks or invents anything)."""
+    code = (violation.get("code") or "").upper()
+    if code not in VISUAL_CHECKS:
+        return None
+    closeup = [im for im in images if im[0].startswith("close-up")][:1]
+    if not closeup:
+        return None
+    t0 = time.perf_counter()
+    try:
+        reply = backend.ask("Answer with one JSON object and nothing else.", VISUAL_CHECKS[code][0], closeup,
+                            max_tokens=max_tokens, schema=CHECK_SCHEMA)
+    except Exception:
+        return None
+    out = parse_check(code, reply)
+    out["seconds"] = round(time.perf_counter() - t0, 1)
+    return out
 
 
 # ---------------------------------------------------------------- parsing
@@ -384,7 +563,27 @@ def parse_reply(text):
     return obj if isinstance(obj, dict) else None
 
 
-def to_explanation(obj, model, backend, seconds, images, subject=""):
+def _sentences(text):
+    return [x for x in re.split(r"(?<=[.!?])\s+", text.strip()) if x]
+
+
+def tidy_text(text, code):
+    """Removes what the model should not say for this rule: sentences about speed (km/h, "speed") unless the rule is
+    about speed, and sentences claiming the vehicle was stopped or slow when the rule is about a moving vehicle."""
+    code = (code or "").upper()
+    if not code or not text:
+        return text
+    patterns = []
+    if not is_speed_rule(code):
+        patterns.append(SPEED_TALK)
+    if code in MOVING_RULES:
+        patterns.append(STILL_TALK)
+    for pat in patterns:
+        text = " ".join(x for x in _sentences(text) if not pat.search(x))
+    return text
+
+
+def to_explanation(obj, model, backend, seconds, images, subject="", code=""):
     """Validate the model's object. Anything unrecognised degrades to a decline, never to a false
     'supported': an unparsable answer must not read as agreement."""
     ex = Explanation(model=model, backend=backend, seconds=round(seconds, 1), images=images)
@@ -393,7 +592,8 @@ def to_explanation(obj, model, backend, seconds, images, subject=""):
         return ex
     for k in ("pre_event", "event", "aftermath", "cause", "summary", "visible", "other_cameras"):
         val = obj.get(k)
-        setattr(ex, k, " ".join(str(val).split())[:600] if val not in (None, "") else "")
+        val = " ".join(str(val).split())[:600] if val not in (None, "") else ""
+        setattr(ex, k, val if k == "other_cameras" else tidy_text(val, code))
     a = str(obj.get("assessment", "")).strip().lower()
     ex.assessment = next((v for v in ASSESSMENTS if v in a), "insufficient")
     ex.present = obj.get("present", True) not in (False, "false", "False", "no", 0)
@@ -635,8 +835,9 @@ class Explainer:
         if not images:
             return Explanation(ok=False, error="No evidence photographs were saved for this case.")
         t0 = time.perf_counter()
+        check = visual_check(backend, violation, images)
         try:
-            reply = backend.ask(SYSTEM, build_prompt(violation, images), images)
+            reply = backend.ask(SYSTEM, build_prompt(violation, images, check), images)
         except urllib.error.HTTPError as e:
             detail = e.read()[:300].decode(errors="replace")
             return Explanation(ok=False, backend=backend.name, model=backend.model,
@@ -645,7 +846,8 @@ class Explainer:
             return Explanation(ok=False, backend=backend.name, model=backend.model,
                                error=f"{backend.name} backend unreachable: {e}")
         return to_explanation(parse_reply(reply), backend.model, backend.name,
-                              time.perf_counter() - t0, len(images), violation.get("cls") or "")
+                              time.perf_counter() - t0, len(images), guard_subject(violation),
+                              (violation.get("code") or ""))
 
     def _run(self):
         while True:

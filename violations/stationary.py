@@ -24,6 +24,10 @@ MAX_BLIND_SEC = 1.0    # only decide while the position is measured: a car drivi
 MOVING_KPH = 5.0       # a vehicle slower than this is standing (for queue / passing decisions)
 HANDOFF_RETRY_SEC = 1.5  # a new track ID keeps trying to take over a nearby orphaned stand this long: its first
                          # positions are often off (the vehicle is still partly hidden when it reappears)
+DUPLICATE_M = 1.5        # a stand that began this close to where a reported one began...
+DUPLICATE_GAP_SEC = 30.0  # ...at most this long after that vehicle was last seen is the same vehicle (a parked
+                          # motorbike hidden by a crowd for 20 s comes back with a new track ID)
+REPORTED_KEEP_SEC = 120.0  # reported stands are remembered this long for that comparison
 # The detector often swaps these look-alikes on one vehicle; for an ID-switch hand-over they are the same vehicle.
 SAME_KIND = [{"Motorbike", "Bicycle"}, {"CNG", "Easybike", "Leguna"}, {"Car", "MPV"}, {"Pickup", "Truck"},
              {"Rickshaw", "Van"}]
@@ -38,6 +42,7 @@ class StandState:
         self.road, self.cls = road, cls
         self.recent = deque([(t, xy)])
         self.anchor = np.float64(xy)
+        self.origin = np.float64(xy)   # where it first stopped (the anchor follows a vehicle inching up)
         self.start_s = t
         self.last_s = t
         self.flow_s = 0.0          # seconds during which other traffic in the zone was moving
@@ -72,12 +77,16 @@ class StationaryMonitor:
     - When the tracker loses a standing vehicle and gives it a new ID (common when a bus is occluded, or a parked
       motorbike behind a crowd), the new track inherits the timer if it appears within `handoff_radius_m` of the
       same spot within `handoff_sec`, the old ID is no longer visible and the class is the same or a look-alike.
+    - `creep_m`: a vehicle that inches up (a CNG row at a kerb stand moves up a car length each time the front one
+      leaves) keeps its stand while it stays within `creep_m` of where it first stopped; without it (None), every
+      move beyond `radius_m` starts a new stand. Ported from Shihab's Kakoli check, 2026-10-28.
     """
 
     def __init__(self, smooth_sec=0.5, handoff_sec=8.0, handoff_radius_m=2.5, queue_gap_m=9.0, lane_half_m=1.6,
-                 flow_kph=10.0):
+                 flow_kph=10.0, creep_m=None):
         self.smooth_sec, self.handoff_sec, self.handoff_radius_m = smooth_sec, handoff_sec, handoff_radius_m
         self.queue_gap_m, self.lane_half_m, self.flow_kph = queue_gap_m, lane_half_m, flow_kph
+        self.creep_m = creep_m
         self.states = {}  # tid -> StandState
 
     def drop(self, tid):
@@ -157,9 +166,13 @@ class StationaryMonitor:
             if old is not None:
                 old.recent, old.last_s, old.seen_s = st.recent, t, t
                 st = self.states[obs.tid] = old
-        if np.linalg.norm(st.position() - st.anchor) > radius_m:  # it moved: a new stand starts here
-            st = StandState(obs.road, obs.cls, st.position(), t)
-            self.states[obs.tid] = st
+        if np.linalg.norm(st.position() - st.anchor) > radius_m:  # it moved
+            if self.creep_m is not None and np.linalg.norm(st.position() - st.origin) <= self.creep_m:
+                st.anchor = st.position()   # inched up: still the same stand
+                self._neighbours(st, obs, scene, dt)
+            else:                           # drove off: a new stand starts here
+                st = StandState(obs.road, obs.cls, st.position(), t)
+                self.states[obs.tid] = st
         else:
             self._neighbours(st, obs, scene, dt)
         return st
@@ -181,6 +194,10 @@ class StandRule:
         "min_purity": 0.6,
     }
 
+    def __init__(self, settings=None, camera=None):
+        super().__init__(settings, camera)
+        self.reported_stands = []    # StandStates already reported (see _same_as_reported)
+
     def _stand_update(self, obs, ctx):
         """Returns (StandState, dwell) when the stand qualifies now, else None."""
         st = self.monitor.update(obs, self.cfg["radius_m"], ctx.scene, ctx.scene.present)
@@ -193,11 +210,27 @@ class StandRule:
         if (dwell >= self.cfg["dwell_sec"] and obs.time_s - st.seen_s <= MAX_BLIND_SEC
                 and len(st.passed) >= self.cfg["min_passed"]
                 and st.queued_s <= self.cfg["max_queued_share"] * dwell):
+            if self._same_as_reported(st, obs):
+                st.reported = True
+                return None
             return st, dwell
         return None
 
+    def _same_as_reported(self, st, obs):
+        """A vehicle already reported, under another track ID: the detector boxes a parked motorbike and the man
+        sitting on it separately, the tracker gives a vehicle a new ID while the old one is still alive (the
+        hand-over only takes stands whose ID is gone), or the vehicle was hidden longer than the hand-over time.
+        Same spot, same kind of vehicle, and this stand began while the reported one was still seen there or
+        shortly after = the same vehicle. (A CNG moving up into the spot the one in front left began its stand
+        further back, so it still counts as a different one.) Ported from Shihab's Kakoli check, 2026-10-28."""
+        self.reported_stands = [s for s in self.reported_stands if obs.time_s - s.last_s <= REPORTED_KEEP_SEC]
+        return any(s is not st and s.road is st.road and same_kind(s.cls, obs.cls)
+                   and st.start_s <= s.last_s + DUPLICATE_GAP_SEC
+                   and float(np.linalg.norm(s.origin - st.origin)) <= DUPLICATE_M for s in self.reported_stands)
+
     def _stand_event(self, obs, st, dwell, extra=None):
         st.reported = True
+        self.reported_stands.append(st)
         x_m = float(obs.xy[0] if obs.xy is not None else st.position()[0])
         kerb_m = min(x_m, obs.road.width_m - x_m)
         details = {"dwell_s": round(dwell, 1), "vehicles_passed": len(st.passed),
